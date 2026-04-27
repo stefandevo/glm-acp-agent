@@ -13,6 +13,7 @@ import type {
   AuthenticateResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  CloseSessionRequest,
   PROTOCOL_VERSION,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
@@ -53,6 +54,9 @@ export class GlmAcpAgent implements Agent {
       },
       agentCapabilities: {
         loadSession: false,
+        sessionCapabilities: {
+          close: {},
+        },
       },
     };
   }
@@ -139,6 +143,12 @@ export class GlmAcpAgent implements Agent {
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId);
     session?.abortController?.abort();
+  }
+
+  async closeSession(params: CloseSessionRequest): Promise<void> {
+    const session = this.sessions.get(params.sessionId);
+    session?.abortController?.abort();
+    this.sessions.delete(params.sessionId);
   }
 
   // ---------------------------------------------------------------------------
