@@ -200,13 +200,64 @@ export class ToolExecutor {
   ): Promise<ToolResult> {
     const path = String(args["path"] ?? ".");
 
-    // list_files is implemented as a terminal command to `ls -la`
-    return this.runTerminalCommand(
-      toolCallId,
-      `ls -la ${JSON.stringify(path)}`,
-      `List files: ${path}`,
-      args
-    );
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `List files: ${path}`,
+        kind: "read",
+        status: "pending",
+        locations: [{ path }],
+        rawInput: args,
+      },
+    });
+
+    let terminal;
+    try {
+      // Use ls as the command with the path as a direct argument to avoid shell injection
+      terminal = await this.connection.createTerminal({
+        sessionId: this.sessionId,
+        command: "ls",
+        args: ["-la", path],
+      });
+
+      await terminal.waitForExit();
+      const outputResponse = await terminal.currentOutput();
+      const output = outputResponse.output;
+
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          content: [
+            {
+              type: "terminal",
+              terminalId: terminal.id,
+            },
+          ],
+          rawOutput: { output },
+        },
+      });
+
+      return { content: output };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "error",
+          rawOutput: { error: message },
+        },
+      });
+      return { content: `Error listing files: ${message}` };
+    } finally {
+      await terminal?.release();
+    }
   }
 
   private async runCommand(
