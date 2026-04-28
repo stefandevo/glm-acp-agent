@@ -70,9 +70,11 @@ export class SessionStore {
   save(session: PersistedSession): void {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const path = this.pathFor(session.sessionId);
+    // Write the schema version *after* the spread so the constant always wins,
+    // even if a caller accidentally sets `schemaVersion` on the input.
     const body: PersistedSession = {
-      schemaVersion: SESSION_SCHEMA_VERSION,
       ...session,
+      schemaVersion: SESSION_SCHEMA_VERSION,
     };
     writeFileSync(path, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
   }

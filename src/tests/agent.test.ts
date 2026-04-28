@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import type { GlmStreamChunk } from "../llm/glm-client.js";
+import { SessionStore } from "../protocol/session-store.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
 // Defence in depth: even though every test below opts out via `sessionStore: null`,
@@ -696,9 +697,6 @@ test("invalid maxTurns falls back to the default", async () => {
 // ---------------------------------------------------------------------------
 // Session persistence (loadSession / fork / resume)
 // ---------------------------------------------------------------------------
-
-import { rmSync } from "node:fs";
-import { SessionStore } from "../protocol/session-store.js";
 
 function makeTempStore(): { store: SessionStore; cleanup: () => void } {
   const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-"));
