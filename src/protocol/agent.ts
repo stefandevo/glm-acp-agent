@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join as pathJoin } from "node:path";
 import type {
   Agent,
   AgentSideConnection,
@@ -41,6 +43,16 @@ import {
 import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { buildSystemPrompt } from "./system-prompt.js";
+
+/**
+ * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
+ * Caps the input-token cost of a single project's context. Z.AI prompt
+ * caching will absorb repeated reads across turns of the same session, but
+ * this still bounds the worst case for projects that ship enormous spec
+ * files in their AGENTS.md.
+ */
+const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
 
 /** Per-session state */
 interface SessionState {
@@ -202,17 +214,13 @@ export class GlmAcpAgent implements Agent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const sessionId = randomUUID();
 
-    const tools = this.availableToolNames().join(", ");
-
     const systemPrompt: GlmMessage = {
       role: "system",
-      content:
-        "You are an expert software engineer and coding assistant. " +
-        "You help users read, write, and modify code across their projects. " +
-        `Use the available tools (${tools}) to interact with the client's ` +
-        "file system, terminal, and the web. " +
-        "Always explain what you are doing before taking any action. " +
-        `Working directory: ${params.cwd}`,
+      content: buildSystemPrompt({
+        cwd: params.cwd,
+        tools: this.availableToolNames(),
+        agentsMd: loadProjectContext(params.cwd),
+      }),
     };
 
     const model = getDefaultModel();
@@ -882,6 +890,31 @@ function stringifyUserMessage(content: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+/**
+ * Read an `AGENTS.md` (preferred) or `CLAUDE.md` from the session's cwd, returning
+ * its contents capped to {@link PROJECT_CONTEXT_CAP_CHARS} characters. Read errors
+ * (file missing, no permission, directory missing) are intentionally swallowed —
+ * project context is optional, and a missing file is the common case.
+ *
+ * Called once at `newSession` time (not per prompt) so the project context is
+ * stable across the conversation.
+ */
+function loadProjectContext(cwd: string): string | undefined {
+  for (const filename of ["AGENTS.md", "CLAUDE.md"] as const) {
+    let contents: string;
+    try {
+      contents = readFileSync(pathJoin(cwd, filename), { encoding: "utf-8" });
+    } catch {
+      continue;
+    }
+    if (contents.length > PROJECT_CONTEXT_CAP_CHARS) {
+      contents = contents.slice(0, PROJECT_CONTEXT_CAP_CHARS);
+    }
+    return contents;
+  }
+  return undefined;
 }
 
 /** sessionUpdate that swallows transport errors during error reporting. */

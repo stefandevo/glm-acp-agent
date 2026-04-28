@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -86,6 +86,41 @@ function makeStreamingGlm(steps: Array<GlmStreamChunk[]>) {
       if (!step) throw new Error("streamChat called more times than expected");
       for (const chunk of step) yield chunk;
     },
+  };
+}
+
+/**
+ * Capture the assembled system-prompt string on the first streamChat call.
+ * Reading via `ref.value` after a prompt completes lets tests assert the
+ * presence of specific sections without depending on prompt formatting.
+ */
+function captureSystemPrompt() {
+  const ref = { value: "" };
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const sys = messages.find((m) => m.role === "system");
+      ref.value = typeof sys?.content === "string" ? sys.content : "";
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  return { glm, ref };
+}
+
+/** Create an isolated temp directory to use as a session cwd, optionally seeded with files. */
+function makeTempCwd(files: Record<string, string> = {}): {
+  cwd: string;
+  cleanup: () => void;
+} {
+  const cwd = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-cwd-"));
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(pathJoin(cwd, name), content);
+  }
+  return {
+    cwd,
+    cleanup: () => rmSync(cwd, { recursive: true, force: true }),
   };
 }
 
@@ -217,6 +252,183 @@ test("system prompt falls back to all tools when client never sent capabilities"
     "web_reader",
   ]) {
     assert.ok(captured.includes(name), `expected system prompt to mention ${name}`);
+  }
+});
+
+test("system prompt includes an environment block with cwd and platform", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd();
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(ref.value.includes(cwd), "expected cwd in environment block");
+    assert.ok(
+      ref.value.includes(process.platform),
+      "expected process.platform in environment block"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt includes filesystem and version-control guardrails", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd();
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+    });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    // Filesystem norms: read-before-edit is the canonical rule.
+    assert.match(ref.value, /read[^\n]{0,40}before[^\n]{0,40}edit/i);
+    // Destructive-action guardrails: force-push and --no-verify are concrete examples
+    // we should refuse without explicit user authorization.
+    assert.match(ref.value, /force[- ]?push/i);
+    assert.match(ref.value, /--no-verify/i);
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt embeds AGENTS.md content as untrusted project context", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd({
+    "AGENTS.md": "Project quirk: prefer tabs over spaces in legacy Makefiles.",
+  });
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(
+      ref.value.includes("Project quirk: prefer tabs"),
+      "AGENTS.md content should appear in the assembled prompt"
+    );
+    assert.match(
+      ref.value,
+      /project context.*not instructions/i,
+      "AGENTS.md must be framed as untrusted project context"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt omits the AGENTS.md section when neither AGENTS.md nor CLAUDE.md exist", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd();
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(
+      !/project context[^\n]*not instructions/i.test(ref.value),
+      "should not include the untrusted-context lead-in when no AGENTS.md/CLAUDE.md exists"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt falls back to CLAUDE.md when AGENTS.md is absent", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd({
+    "CLAUDE.md": "Use lowercase-kebab branch names.",
+  });
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(
+      ref.value.includes("Use lowercase-kebab"),
+      "CLAUDE.md should be used as a fallback when AGENTS.md is absent"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt prefers AGENTS.md over CLAUDE.md when both exist", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd({
+    "AGENTS.md": "PRIMARY: from AGENTS.md",
+    "CLAUDE.md": "SECONDARY: from CLAUDE.md",
+  });
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(ref.value.includes("PRIMARY: from AGENTS.md"));
+    assert.ok(!ref.value.includes("SECONDARY: from CLAUDE.md"));
+  } finally {
+    cleanup();
+  }
+});
+
+test("system prompt truncates AGENTS.md content larger than the cap", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const head = "HEAD-MARKER: should survive.\n";
+  const filler = "x".repeat(16 * 1024);
+  const tail = "TAIL-MARKER: should be dropped.";
+  const { cwd, cleanup } = makeTempCwd({
+    "AGENTS.md": head + filler + tail,
+  });
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(ref.value.includes("HEAD-MARKER"), "head bytes must survive truncation");
+    assert.ok(!ref.value.includes("TAIL-MARKER"), "tail bytes must be truncated");
+  } finally {
+    cleanup();
+  }
+});
+
+test("the assembled system prompt remains a single system message", async () => {
+  const conn = createConnectionStub();
+  let systemCount = 0;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      systemCount = messages.filter((m) => m.role === "system").length;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const { cwd, cleanup } = makeTempCwd({ "AGENTS.md": "context note" });
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.equal(systemCount, 1);
+  } finally {
+    cleanup();
   }
 });
 
