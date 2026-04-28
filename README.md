@@ -149,9 +149,36 @@ npm run dev        # tsc --watch
 
 ## Connecting to an ACP Client
 
-### Zed
+### Zed (recommended for local testing)
 
-`~/.config/zed/settings.json`:
+[Zed](https://zed.dev) is currently the most polished editor for trying out ACP agents locally — it spawns the agent process over stdio and surfaces it in the agent panel. This is the fastest way to iterate on `glm-acp-agent` before publishing it to the ACP registry or to npm.
+
+#### 1. Prerequisites
+
+- A recent build of [Zed](https://zed.dev/download) that supports the `agent_servers` setting
+- Node.js 20 or later on your `PATH` (`node --version`)
+- A Z.AI API key — create one at <https://z.ai/manage-apikey/apikey-list>
+
+#### 2. Build the agent
+
+```bash
+git clone https://github.com/stefandevo/glm-acp-agent.git
+cd glm-acp-agent
+npm install
+npm run build
+```
+
+Take note of the absolute path to the freshly built entry point — Zed needs it (no `~`, no `$HOME` shortcuts):
+
+```bash
+echo "$(pwd)/dist/index.js"
+```
+
+#### 3. Wire it into Zed
+
+Open (or create) `~/.config/zed/settings.json` and add an `agent_servers` entry. Pick **one** of the two API-key strategies below.
+
+**Option A — inline `env` block (simplest):**
 
 ```json
 {
@@ -164,6 +191,63 @@ npm run dev        # tsc --watch
   }
 }
 ```
+
+**Option B — credentials file (no key in your editor settings):**
+
+Run the interactive setup once. From the project directory:
+
+```bash
+node dist/index.js --setup
+```
+
+…or, if you `npm install -g .`'d the package:
+
+```bash
+glm-acp-agent --setup
+```
+
+The key is written to `~/.config/glm-acp-agent/credentials.json` with `0600` permissions. Then drop the `env` block from the Zed entry — the agent will read the file on launch:
+
+```json
+{
+  "agent_servers": {
+    "glm": {
+      "command": "node",
+      "args": ["/absolute/path/to/glm-acp-agent/dist/index.js"]
+    }
+  }
+}
+```
+
+If `Z_AI_API_KEY` is set in the environment **and** a credentials file exists, the environment variable wins.
+
+#### 4. Verify it works
+
+1. Save `settings.json`. Zed reloads settings automatically.
+2. Open the **agent panel** (use the command palette: `agent panel: toggle focus`).
+3. In the agent picker, select **glm** — Zed labels external agents by their `agent_servers` key.
+4. Start a new thread and send a small prompt that exercises a tool, e.g. `Read package.json and tell me the project name.`
+5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.1`) reasoning surfaced as a separate thought block.
+
+#### 5. Iterating on the agent
+
+After editing the source, rebuild:
+
+```bash
+npm run build
+```
+
+Zed spawns a fresh agent process per thread, so the easiest way to pick up changes is to **start a new thread** with the glm agent. If you see stale behavior, fully quit and reopen Zed — that guarantees no in-flight process is reused.
+
+For a tighter inner loop, run `npm run dev` in a terminal so `dist/` rebuilds on every save; you only need to start a new Zed thread to test the latest code.
+
+#### 6. Troubleshooting
+
+- **The "glm" agent doesn't appear in the picker.** — `settings.json` likely has a JSON parse error, or your Zed build is older than `agent_servers` support. Open the Zed log via the command palette (`zed: open log`) and look for settings errors.
+- **`Error: Cannot find module '/.../dist/index.js'`** — you skipped `npm run build`, or the path in `args` is wrong. It must be absolute and point at a file that exists.
+- **`No API key found.`** — neither `Z_AI_API_KEY` nor `~/.config/glm-acp-agent/credentials.json` is set. Use Option A or Option B in step 3.
+- **`HTTP 401: Invalid API key`** — your key is wrong, expired, or for the wrong region. Rotate it on <https://z.ai/manage-apikey/apikey-list>.
+- **`client does not advertise the … capability`** — Zed didn't expose that capability to the agent (e.g. `terminal` for `run_command`/`list_files`). Ask the model to use a different tool, or upgrade Zed.
 
 ### Neovim / VS Code / JetBrains / any ACP client
 
