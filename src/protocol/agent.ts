@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   Agent,
   AgentSideConnection,
+  ClientCapabilities,
   InitializeRequest,
   InitializeResponse,
   NewSessionRequest,
@@ -16,10 +17,13 @@ import type {
   CloseSessionRequest,
   ListSessionsRequest,
   ListSessionsResponse,
+  StopReason,
+  Usage,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
-import { GlmClient, type GlmMessage } from "../llm/glm-client.js";
+import { GlmClient, type GlmMessage, type GlmStreamChunk } from "../llm/glm-client.js";
 import { ToolExecutor } from "../tools/executor.js";
+import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 
 /** Per-session state */
 interface SessionState {
@@ -28,6 +32,19 @@ interface SessionState {
   abortController: AbortController | null;
   title: string | null;
   updatedAt: string;
+}
+
+/** ACP stop reasons that the prompt loop can produce internally. */
+type InternalStopReason = StopReason;
+
+/**
+ * Optional dependencies for tests.
+ */
+export interface GlmAcpAgentOptions {
+  /** Override the GLM client (used in tests). */
+  glm?: { streamChat: (messages: GlmMessage[], signal?: AbortSignal) => AsyncIterable<GlmStreamChunk> };
+  /** Maximum number of model/tool turns per single prompt. Default 20. */
+  maxTurns?: number;
 }
 
 /**
@@ -39,11 +56,19 @@ interface SessionState {
  */
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
-  private _glm: GlmClient | null = null;
+  private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
+  private maxTurns: number;
+  private clientCapabilities: ClientCapabilities | null = null;
 
-  constructor(private connection: AgentSideConnection) {}
+  constructor(
+    private connection: AgentSideConnection,
+    options: GlmAcpAgentOptions = {}
+  ) {
+    this._glm = options.glm ?? null;
+    this.maxTurns = options.maxTurns ?? 20;
+  }
 
-  private get glm(): GlmClient {
+  private get glm(): NonNullable<GlmAcpAgentOptions["glm"]> {
     if (this._glm === null) {
       this._glm = new GlmClient();
     }
@@ -55,15 +80,45 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    // Negotiate the lowest version both sides support.
+    const negotiatedVersion =
+      params.protocolVersion <= VERSION ? params.protocolVersion : VERSION;
+
+    // Track client capabilities so we can adapt tool calls to what the client
+    // actually supports.
+    this.clientCapabilities = params.clientCapabilities ?? null;
+
     return {
-      protocolVersion: params.protocolVersion <= VERSION ? params.protocolVersion : VERSION,
+      protocolVersion: negotiatedVersion,
       agentInfo: {
         name: "glm-acp-agent",
         version: "1.0.0",
       },
+      // Declare an environment-variable auth method so clients that respect the
+      // auth-methods proposal know what to ask the user for.
+      authMethods: [
+        {
+          type: "env_var",
+          id: "z_ai_api_key",
+          name: "Z.AI API key",
+          description:
+            "API key for the Z.AI / Zhipu AI service. Generate one at https://z.ai/manage-apikey/apikey-list",
+          link: "https://z.ai/manage-apikey/apikey-list",
+          vars: [
+            {
+              name: "Z_AI_API_KEY",
+              label: "Z.AI API key",
+              secret: true,
+              optional: false,
+            },
+          ],
+        },
+      ],
       agentCapabilities: {
         loadSession: false,
         promptCapabilities: {
+          // Baseline (text + resource_link) is implicit; we additionally accept
+          // embedded resources for inline file context.
           embeddedContext: true,
         },
         sessionCapabilities: {
@@ -74,16 +129,27 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
+  async authenticate(
+    _params: AuthenticateRequest
+  ): Promise<AuthenticateResponse> {
+    // Authentication is configured via the Z_AI_API_KEY environment variable
+    // (advertised as an `env_var` auth method). The agent has nothing to do
+    // here; failures will surface when the model is first called.
+    return {};
+  }
+
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const sessionId = randomUUID();
+
+    const tools = this.availableToolNames().join(", ");
 
     const systemPrompt: GlmMessage = {
       role: "system",
       content:
         "You are an expert software engineer and coding assistant. " +
         "You help users read, write, and modify code across their projects. " +
-        "Use the available tools (read_file, write_file, list_files, run_command, web_search, web_reader) " +
-        "to interact with the client's file system, terminal, and the web. " +
+        `Use the available tools (${tools}) to interact with the client's ` +
+        "file system, terminal, and the web. " +
         "Always explain what you are doing before taking any action. " +
         `Working directory: ${params.cwd}`,
     };
@@ -99,16 +165,11 @@ export class GlmAcpAgent implements Agent {
     return { sessionId };
   }
 
-  async authenticate(
-    _params: AuthenticateRequest
-  ): Promise<AuthenticateResponse> {
-    // No authentication required
-    return {};
-  }
-
   async setSessionMode(
     _params: SetSessionModeRequest
   ): Promise<SetSessionModeResponse> {
+    // We don't advertise modes; this is a no-op accepting any request the
+    // client might send.
     return {};
   }
 
@@ -122,29 +183,25 @@ export class GlmAcpAgent implements Agent {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
 
-    // Abort any previous in-flight prompt for this session
+    // The ACP spec serializes prompts per-session – the client should not send
+    // a new prompt while another is running. Defensively cancel any stale
+    // controller.
     session.abortController?.abort();
     const abortController = new AbortController();
     session.abortController = abortController;
 
-    // Convert ACP content blocks to a GLM user message.
-    // Baseline: text blocks. Extended: resource_link (URI reference) and
-    // embedded resource blocks (inline text content).
-    const userParts: string[] = [];
-    for (const block of params.prompt) {
-      if (block.type === "text") {
-        userParts.push(block.text);
-      } else if (block.type === "resource_link") {
-        userParts.push(`[${block.name}](${block.uri})`);
-      } else if (block.type === "resource") {
-        const res = block.resource;
-        if ("text" in res) {
-          userParts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
-        }
-      }
+    // Abort the prompt automatically if the underlying connection closes.
+    const onConnectionClose = () => abortController.abort();
+    const connSignal = this.connection.signal;
+    if (connSignal && !connSignal.aborted) {
+      connSignal.addEventListener("abort", onConnectionClose, { once: true });
+    } else if (connSignal?.aborted) {
+      abortController.abort();
     }
-    const userText = userParts.join("\n");
 
+    // Convert ACP content blocks into a GLM user message.
+    // Baseline: text + resource_link. Optional: embedded resources (text only).
+    const userText = renderPromptBlocks(params.prompt);
     session.messages.push({ role: "user", content: userText });
 
     try {
@@ -157,48 +214,51 @@ export class GlmAcpAgent implements Agent {
       session.abortController = null;
       session.updatedAt = new Date().toISOString();
 
-      // Derive a session title from the first user message (first prompt only)
-      if (!session.title) {
-        session.title = userText.slice(0, 80).replace(/\n/g, " ") || "New conversation";
-        await this.connection.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "session_info_update",
-            title: session.title,
-            updatedAt: session.updatedAt,
-          },
-        });
-      } else {
-        await this.connection.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "session_info_update",
-            updatedAt: session.updatedAt,
-          },
-        });
-      }
+      // Emit a session_info_update with the (possibly first-set) title and
+      // updated timestamp so clients can show fresh metadata.
+      const titleUpdate: { title?: string | null } =
+        session.title === null
+          ? (() => {
+              const derived = userText.slice(0, 80).replace(/\s+/g, " ").trim();
+              session.title = derived.length > 0 ? derived : "New conversation";
+              return { title: session.title };
+            })()
+          : {};
 
-      // Report token usage if the model provided it
-      if (usage) {
-        await this.connection.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "usage_update",
-            usage,
-          },
-        });
-      }
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          updatedAt: session.updatedAt,
+          ...titleUpdate,
+        },
+      });
 
-      return {
-        stopReason,
-        userMessageId: params.messageId ?? undefined,
-      };
+      const response: PromptResponse = { stopReason };
+      if (usage) response.usage = usage;
+      if (params.messageId) response.userMessageId = params.messageId;
+      return response;
     } catch (err) {
+      // If the abort happened concurrently with another error, prefer the
+      // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted) {
         session.abortController = null;
         return { stopReason: "cancelled" };
       }
+      session.abortController = null;
+      // Surface the error to the user as an agent message so the IDE displays
+      // something instead of a silent JSON-RPC error.
+      const message = err instanceof Error ? err.message : String(err);
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `\n\n[error] ${message}` },
+        },
+      });
       throw err;
+    } finally {
+      connSignal?.removeEventListener("abort", onConnectionClose);
     }
   }
 
@@ -216,7 +276,6 @@ export class GlmAcpAgent implements Agent {
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const allSessions = Array.from(this.sessions.entries());
 
-    // Optional cwd filter
     const filtered = params.cwd
       ? allSessions.filter(([, s]) => s.cwd === params.cwd)
       : allSessions;
@@ -244,16 +303,17 @@ export class GlmAcpAgent implements Agent {
     sessionId: string,
     session: SessionState,
     signal: AbortSignal
-  ): Promise<{
-    stopReason: "end_turn" | "cancelled" | "max_tokens" | "max_turn_requests" | "refusal";
-    usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
-  }> {
-    const MAX_TURNS = 20;
-    const executor = new ToolExecutor(this.connection, sessionId, signal);
-    let lastUsage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
-    let lastStopReason: string | undefined;
+  ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
+    const executor = new ToolExecutor(
+      this.connection,
+      sessionId,
+      this.clientCapabilities,
+      signal
+    );
 
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
+    let lastUsage: Usage | undefined;
+
+    for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled" };
 
       const toolCalls: Array<{
@@ -263,21 +323,18 @@ export class GlmAcpAgent implements Agent {
       }> = [];
 
       let assistantText = "";
+      let lastStopReason: string | undefined;
 
-      // Stream the GLM response
+      // Stream the GLM response.
       for await (const chunk of this.glm.streamChat(session.messages, signal)) {
         if (signal.aborted) return { stopReason: "cancelled" };
 
         if (chunk.thinking) {
-          // Forward reasoning tokens as ACP thought chunks
           await this.connection.sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: "agent_thought_chunk",
-              content: {
-                type: "text",
-                text: chunk.thinking,
-              },
+              content: { type: "text", text: chunk.thinking },
             },
           });
         }
@@ -288,10 +345,7 @@ export class GlmAcpAgent implements Agent {
             sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
-              content: {
-                type: "text",
-                text: chunk.text,
-              },
+              content: { type: "text", text: chunk.text },
             },
           });
         }
@@ -309,39 +363,30 @@ export class GlmAcpAgent implements Agent {
         }
       }
 
-      // Record the assistant message in history
+      // Record the assistant turn in history so the model has full context for
+      // the next iteration.
       if (toolCalls.length > 0) {
         session.messages.push({
           role: "assistant",
-          content: assistantText || null,
+          content: assistantText.length > 0 ? assistantText : null,
           tool_calls: toolCalls.map((tc) => ({
             id: tc.id,
             type: "function" as const,
-            function: {
-              name: tc.name,
-              arguments: tc.arguments,
-            },
+            function: { name: tc.name, arguments: tc.arguments },
           })),
         });
-      } else if (assistantText) {
-        session.messages.push({
-          role: "assistant",
-          content: assistantText,
-        });
+      } else if (assistantText.length > 0) {
+        session.messages.push({ role: "assistant", content: assistantText });
       }
 
-      // If there are no tool calls, we're done
+      // No tool calls => model is done.
       if (toolCalls.length === 0) {
-        const stopReason = this.mapStopReason(lastStopReason);
-        return {
-          stopReason,
-          usage: lastUsage,
-        };
+        return { stopReason: this.mapStopReason(lastStopReason), usage: lastUsage };
       }
 
-      // Execute tool calls and feed results back
+      // Execute tool calls in declaration order and feed each result back.
       for (const tc of toolCalls) {
-        if (signal.aborted) return { stopReason: "cancelled" };
+        if (signal.aborted) return { stopReason: "cancelled", usage: lastUsage };
 
         const result = await executor.execute(tc.id, tc.name, tc.arguments);
 
@@ -352,18 +397,93 @@ export class GlmAcpAgent implements Agent {
         });
       }
 
-      // Continue the loop (tool_calls finish reason means GLM wants another turn)
+      // Loop and continue – GLM expects a follow-up completion now that it has
+      // tool results.
     }
 
-    // MAX_TURNS reached: we exceeded internal model/tool requests for a single user turn.
+    // Reached MAX_TURNS without resolution.
     return { stopReason: "max_turn_requests", usage: lastUsage };
   }
 
-  private mapStopReason(
-    stopReason: string | undefined
-  ): "end_turn" | "max_tokens" | "refusal" {
-    if (stopReason === "length") return "max_tokens";
-    if (stopReason === "content_filter") return "refusal";
-    return "end_turn";
+  private mapStopReason(stopReason: string | undefined): InternalStopReason {
+    switch (stopReason) {
+      case "length":
+        return "max_tokens";
+      case "content_filter":
+        return "refusal";
+      case "stop":
+      case "tool_calls":
+      case undefined:
+      case null:
+      case "":
+        return "end_turn";
+      default:
+        return "end_turn";
+    }
+  }
+
+  /** Names of tools we expose given the client's capabilities. */
+  private availableToolNames(): string[] {
+    const fs = this.clientCapabilities?.fs ?? {};
+    const terminal = this.clientCapabilities?.terminal ?? false;
+    const names: string[] = [];
+    if (fs.readTextFile) names.push("read_file");
+    if (fs.writeTextFile) names.push("write_file");
+    if (terminal) names.push("list_files", "run_command");
+    // Web tools always run inside the agent process, so they are unconditional.
+    names.push("web_search", "web_reader");
+    // If everything is missing fall back to the full list so the system prompt
+    // still mentions tools by name (the executor will surface a clean error if
+    // they are invoked).
+    if (names.length === 2) return TOOL_DEFINITIONS.map((t) => t.function.name);
+    return names;
+  }
+}
+
+/** Render a list of ACP content blocks into a single user message string. */
+function renderPromptBlocks(blocks: PromptRequest["prompt"]): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        parts.push(block.text);
+        break;
+      case "resource_link":
+        parts.push(`[${block.name}](${block.uri})`);
+        break;
+      case "resource": {
+        const res = block.resource;
+        if ("text" in res && typeof res.text === "string") {
+          parts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
+        } else if ("blob" in res) {
+          // Binary resources can't be inlined into a chat message; keep a link
+          // reference so the model knows it exists.
+          parts.push(`[binary resource](${res.uri})`);
+        }
+        break;
+      }
+      case "image":
+      case "audio":
+        // We don't advertise image/audio capabilities, but defensively render
+        // a placeholder so a misbehaving client doesn't crash the agent.
+        parts.push(`[unsupported ${block.type} block]`);
+        break;
+      default:
+        // Future block types: best-effort placeholder.
+        parts.push(`[unknown block type ${(block as { type: string }).type}]`);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** sessionUpdate that swallows transport errors during error reporting. */
+async function safeSessionUpdate(
+  connection: AgentSideConnection,
+  params: Parameters<AgentSideConnection["sessionUpdate"]>[0]
+): Promise<void> {
+  try {
+    await connection.sessionUpdate(params);
+  } catch {
+    // best-effort
   }
 }

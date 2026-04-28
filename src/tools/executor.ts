@@ -1,4 +1,7 @@
-import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import type {
+  AgentSideConnection,
+  ClientCapabilities,
+} from "@agentclientprotocol/sdk";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -11,11 +14,15 @@ export interface ToolResult {
  * Executes GLM tool calls by delegating to the corresponding ACP Client methods.
  *
  * Permission is requested from the user before any write or execute operation.
+ * Tools that require capabilities the client did not advertise return a clear
+ * error string instead of throwing, so the model can recover by trying a
+ * different approach.
  */
 export class ToolExecutor {
   constructor(
     private connection: AgentSideConnection,
     private sessionId: string,
+    private clientCapabilities: ClientCapabilities | null = null,
     private signal?: AbortSignal
   ) {}
 
@@ -31,9 +38,14 @@ export class ToolExecutor {
   ): Promise<ToolResult> {
     let args: Record<string, unknown>;
     try {
-      args = JSON.parse(rawArguments) as Record<string, unknown>;
+      args =
+        rawArguments.trim().length === 0
+          ? {}
+          : (JSON.parse(rawArguments) as Record<string, unknown>);
     } catch {
-      return { content: `Error: could not parse tool arguments: ${rawArguments}` };
+      const message = `Error: could not parse tool arguments as JSON: ${rawArguments}`;
+      await this.failedToolCall(toolCallId, toolName, {}, message);
+      return { content: message };
     }
 
     switch (toolName) {
@@ -49,9 +61,31 @@ export class ToolExecutor {
         return this.webSearch(toolCallId, args);
       case "web_reader":
         return this.webReader(toolCallId, args);
-      default:
-        return { content: `Error: unknown tool "${toolName}"` };
+      default: {
+        const message = `Error: unknown tool "${toolName}"`;
+        await this.failedToolCall(toolCallId, toolName, args, message);
+        return { content: message };
+      }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capability helpers
+  // ---------------------------------------------------------------------------
+
+  private requireCap(
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    available: boolean,
+    capName: string
+  ): Promise<ToolResult> | null {
+    if (available) return null;
+    const message = `Error: client does not advertise the ${capName} capability; this tool is unavailable.`;
+    return (async () => {
+      await this.failedToolCall(toolCallId, toolName, args, message);
+      return { content: message };
+    })();
   }
 
   // ---------------------------------------------------------------------------
@@ -62,9 +96,20 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const path = String(args["path"] ?? "");
+    const cap = this.requireCap(
+      toolCallId,
+      "read_file",
+      args,
+      Boolean(this.clientCapabilities?.fs?.readTextFile),
+      "fs.readTextFile"
+    );
+    if (cap) return cap;
 
-    // Notify the client about the pending read tool call
+    const path = String(args["path"] ?? "");
+    if (!path) {
+      return this.failAndReturn(toolCallId, "read_file", args, "Error: `path` is required.");
+    }
+
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -72,7 +117,7 @@ export class ToolExecutor {
         toolCallId,
         title: `Read file: ${path}`,
         kind: "read",
-        status: "pending",
+        status: "in_progress",
         locations: [{ path }],
         rawInput: args,
       },
@@ -90,6 +135,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
+          content: [{ type: "content", content: { type: "text", text: response.content } }],
           rawOutput: { content: response.content },
         },
       });
@@ -97,15 +143,7 @@ export class ToolExecutor {
       return { content: response.content };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error reading file: ${message}` };
     }
   }
@@ -114,10 +152,36 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
+    const cap = this.requireCap(
+      toolCallId,
+      "write_file",
+      args,
+      Boolean(this.clientCapabilities?.fs?.writeTextFile),
+      "fs.writeTextFile"
+    );
+    if (cap) return cap;
+
     const path = String(args["path"] ?? "");
     const content = String(args["content"] ?? "");
+    if (!path) {
+      return this.failAndReturn(toolCallId, "write_file", args, "Error: `path` is required.");
+    }
 
-    // Request permission before writing
+    // Step 1: announce the pending tool call so the client can show it.
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Write file: ${path}`,
+        kind: "edit",
+        status: "pending",
+        locations: [{ path }],
+        rawInput: args,
+      },
+    });
+
+    // Step 2: request user permission.
     const permissionResponse = await this.connection.requestPermission({
       sessionId: this.sessionId,
       toolCall: {
@@ -129,40 +193,30 @@ export class ToolExecutor {
         rawInput: args,
       },
       options: [
-        {
-          kind: "allow_once",
-          name: "Allow write",
-          optionId: "allow",
-        },
-        {
-          kind: "reject_once",
-          name: "Skip write",
-          optionId: "reject",
-        },
+        { kind: "allow_once", name: "Allow write", optionId: "allow" },
+        { kind: "reject_once", name: "Skip write", optionId: "reject" },
       ],
     });
 
     if (permissionResponse.outcome.outcome === "cancelled") {
+      await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Write cancelled by user." };
     }
     if (
       permissionResponse.outcome.outcome === "selected" &&
       permissionResponse.outcome.optionId === "reject"
     ) {
+      await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Write rejected by user." };
     }
 
-    // Notify pending state
+    // Step 3: move to in_progress and execute.
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call_update",
         toolCallId,
-        title: `Write file: ${path}`,
-        kind: "edit",
-        status: "pending",
-        locations: [{ path }],
-        rawInput: args,
+        status: "in_progress",
       },
     });
 
@@ -186,15 +240,7 @@ export class ToolExecutor {
       return { content: `File written successfully: ${path}` };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error writing file: ${message}` };
     }
   }
@@ -203,9 +249,23 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
+    const cap = this.requireCap(
+      toolCallId,
+      "list_files",
+      args,
+      Boolean(this.clientCapabilities?.terminal),
+      "terminal"
+    );
+    if (cap) return cap;
+
     const rawPath = args["path"];
     if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
-      return { content: "Error listing files: `path` must be a non-empty string." };
+      return this.failAndReturn(
+        toolCallId,
+        "list_files",
+        args,
+        "Error listing files: `path` must be a non-empty string."
+      );
     }
     const path = rawPath;
 
@@ -216,7 +276,7 @@ export class ToolExecutor {
         toolCallId,
         title: `List files: ${path}`,
         kind: "read",
-        status: "pending",
+        status: "in_progress",
         locations: [{ path }],
         rawInput: args,
       },
@@ -226,8 +286,9 @@ export class ToolExecutor {
     try {
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
-        command: "ls",
-        args: ["-la", path],
+        // Run via a shell so quoting / wildcards behave like a real ls call.
+        command: "sh",
+        args: ["-c", `ls -la -- ${shellQuote(path)}`],
       });
 
       await terminal.waitForExit();
@@ -240,12 +301,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [
-            {
-              type: "terminal",
-              terminalId: terminal.id,
-            },
-          ],
+          content: [{ type: "terminal", terminalId: terminal.id }],
           rawOutput: { output },
         },
       });
@@ -253,18 +309,14 @@ export class ToolExecutor {
       return { content: output };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error listing files: ${message}` };
     } finally {
-      await terminal?.release();
+      try {
+        await terminal?.release();
+      } catch {
+        // ignore release errors
+      }
     }
   }
 
@@ -272,9 +324,40 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const command = String(args["command"] ?? "");
+    const cap = this.requireCap(
+      toolCallId,
+      "run_command",
+      args,
+      Boolean(this.clientCapabilities?.terminal),
+      "terminal"
+    );
+    if (cap) return cap;
 
-    // Request permission before executing arbitrary commands
+    const command = String(args["command"] ?? "").trim();
+    if (!command) {
+      return this.failAndReturn(
+        toolCallId,
+        "run_command",
+        args,
+        "Error running command: command must be a non-empty string."
+      );
+    }
+
+    // Step 1: announce.
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Run command: ${command}`,
+        kind: "execute",
+        status: "pending",
+        locations: [],
+        rawInput: args,
+      },
+    });
+
+    // Step 2: request permission.
     const permissionResponse = await this.connection.requestPermission({
       sessionId: this.sessionId,
       toolCall: {
@@ -286,76 +369,47 @@ export class ToolExecutor {
         rawInput: args,
       },
       options: [
-        {
-          kind: "allow_once",
-          name: "Run command",
-          optionId: "allow",
-        },
-        {
-          kind: "reject_once",
-          name: "Skip command",
-          optionId: "reject",
-        },
+        { kind: "allow_once", name: "Run command", optionId: "allow" },
+        { kind: "reject_once", name: "Skip command", optionId: "reject" },
       ],
     });
 
     if (permissionResponse.outcome.outcome === "cancelled") {
+      await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Command cancelled by user." };
     }
     if (
       permissionResponse.outcome.outcome === "selected" &&
       permissionResponse.outcome.optionId === "reject"
     ) {
+      await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Command rejected by user." };
     }
 
-    return this.runTerminalCommand(toolCallId, command, `Run: ${command}`, args);
+    return this.runTerminalCommand(toolCallId, command);
   }
 
   private async runTerminalCommand(
     toolCallId: string,
-    command: string,
-    title: string,
-    rawInput: Record<string, unknown>
+    command: string
   ): Promise<ToolResult> {
-    const trimmed = command.trim();
-    if (!trimmed) {
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: "Command must be a non-empty string." },
-        },
-      });
-      return { content: "Error running command: command must be a non-empty string." };
-    }
-
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
-        sessionUpdate: "tool_call",
+        sessionUpdate: "tool_call_update",
         toolCallId,
-        title,
-        kind: "execute",
-        status: "pending",
-        locations: [],
-        rawInput,
+        status: "in_progress",
       },
     });
 
     let terminal;
     try {
-      // Split command string into executable + argument list so ACP hosts that
-      // treat `command` as the binary path (not a shell invocation) work correctly.
-      // Note: simple whitespace split; commands with quoted or escaped arguments
-      // should pass the executable and args separately via run_command tool guidance.
-      const [cmd, ...cmdArgs] = trimmed.split(/\s+/);
+      // Run via `sh -c` so the command string is interpreted by a real shell –
+      // this preserves quoting, pipes, redirects and environment expansion.
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
-        command: cmd,
-        args: cmdArgs,
+        command: "sh",
+        args: ["-c", command],
       });
 
       await terminal.waitForExit();
@@ -368,12 +422,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [
-            {
-              type: "terminal",
-              terminalId: terminal.id,
-            },
-          ],
+          content: [{ type: "terminal", terminalId: terminal.id }],
           rawOutput: { output },
         },
       });
@@ -381,18 +430,14 @@ export class ToolExecutor {
       return { content: output };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error running command: ${message}` };
     } finally {
-      await terminal?.release();
+      try {
+        await terminal?.release();
+      } catch {
+        // ignore release errors
+      }
     }
   }
 
@@ -400,8 +445,16 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const query = String(args["query"] ?? "");
+    const query = String(args["query"] ?? "").trim();
     const count = typeof args["count"] === "number" ? args["count"] : undefined;
+    if (!query) {
+      return this.failAndReturn(
+        toolCallId,
+        "web_search",
+        args,
+        "Error: `query` is required."
+      );
+    }
 
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
@@ -409,18 +462,15 @@ export class ToolExecutor {
         sessionUpdate: "tool_call",
         toolCallId,
         title: `Web search: ${query}`,
-        kind: "read",
-        status: "pending",
+        kind: "fetch",
+        status: "in_progress",
         locations: [],
         rawInput: args,
       },
     });
 
     try {
-      const apiKey = process.env["Z_AI_API_KEY"];
-      if (!apiKey) {
-        throw new Error("Z_AI_API_KEY environment variable is required but not set.");
-      }
+      const apiKey = requireApiKey();
       const body: Record<string, unknown> = {
         search_engine: "search-prime",
         search_query: query,
@@ -431,7 +481,7 @@ export class ToolExecutor {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
         signal: this.signal,
@@ -442,7 +492,7 @@ export class ToolExecutor {
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
 
-      const data = await response.json() as {
+      const data = (await response.json()) as {
         search_result?: Array<{
           title?: string;
           link?: string;
@@ -472,6 +522,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
+          content: [{ type: "content", content: { type: "text", text: output } }],
           rawOutput: { resultCount: results.length },
         },
       });
@@ -479,15 +530,7 @@ export class ToolExecutor {
       return { content: output };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error performing web search: ${message}` };
     }
   }
@@ -496,8 +539,16 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const url = String(args["url"] ?? "");
+    const url = String(args["url"] ?? "").trim();
     const returnFormat = String(args["return_format"] ?? "markdown");
+    if (!url) {
+      return this.failAndReturn(
+        toolCallId,
+        "web_reader",
+        args,
+        "Error: `url` is required."
+      );
+    }
 
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
@@ -505,24 +556,21 @@ export class ToolExecutor {
         sessionUpdate: "tool_call",
         toolCallId,
         title: `Read URL: ${url}`,
-        kind: "read",
-        status: "pending",
+        kind: "fetch",
+        status: "in_progress",
         locations: [{ path: url }],
         rawInput: args,
       },
     });
 
     try {
-      const apiKey = process.env["Z_AI_API_KEY"];
-      if (!apiKey) {
-        throw new Error("Z_AI_API_KEY environment variable is required but not set.");
-      }
+      const apiKey = requireApiKey();
 
       const response = await fetch("https://api.z.ai/api/paas/v4/reader", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({ url, return_format: returnFormat }),
         signal: this.signal,
@@ -533,7 +581,7 @@ export class ToolExecutor {
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
 
-      const data = await response.json() as {
+      const data = (await response.json()) as {
         reader_result?: {
           title?: string;
           description?: string;
@@ -556,6 +604,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
+          content: [{ type: "content", content: { type: "text", text: output } }],
           rawOutput: { title: result?.title, url: result?.url },
         },
       });
@@ -563,16 +612,77 @@ export class ToolExecutor {
       return { content: output };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.connection.sessionUpdate({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status: "failed",
-          rawOutput: { error: message },
-        },
-      });
+      await this.markFailed(toolCallId, message);
       return { content: `Error reading URL: ${message}` };
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Notification helpers
+  // ---------------------------------------------------------------------------
+
+  /** Mark an in-progress tool call as failed. */
+  private async markFailed(toolCallId: string, message: string): Promise<void> {
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "failed",
+        rawOutput: { error: message },
+      },
+    });
+  }
+
+  /**
+   * Emit a brand new failed tool_call (for situations where we never made it
+   * to in_progress, e.g. invalid arguments / missing capabilities).
+   */
+  private async failedToolCall(
+    toolCallId: string,
+    toolName: string,
+    rawInput: Record<string, unknown>,
+    message: string
+  ): Promise<void> {
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: toolName,
+        kind: "other",
+        status: "failed",
+        locations: [],
+        rawInput,
+        rawOutput: { error: message },
+      },
+    });
+  }
+
+  private async failAndReturn(
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    message: string
+  ): Promise<ToolResult> {
+    await this.failedToolCall(toolCallId, toolName, args, message);
+    return { content: message };
+  }
+}
+
+/** Read the API key from env, throwing a clear error if it's missing. */
+function requireApiKey(): string {
+  const apiKey = process.env["Z_AI_API_KEY"];
+  if (!apiKey) {
+    throw new Error("Z_AI_API_KEY environment variable is required but not set.");
+  }
+  return apiKey;
+}
+
+/**
+ * Quote a string for safe inclusion in a `sh -c` command line.
+ * We use single quotes and escape any embedded single quotes via `'\''`.
+ */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }

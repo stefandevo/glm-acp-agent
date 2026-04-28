@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
+import type { Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 
 /**
@@ -22,26 +23,32 @@ export interface GlmStreamChunk {
     arguments: string;
   };
   /** Token usage reported when the stream finishes */
-  usage?: {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-  };
+  usage?: Usage;
   /** Set when the stream is done */
   done?: boolean;
   /** Stop reason when done */
   stopReason?: string;
 }
 
+/** Default base URL for the Z.AI / Zhipu OpenAI-compatible API. */
+const DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4";
+
+/** Default GLM model. */
+const DEFAULT_MODEL = "glm-5.1";
+
 /**
  * Wrapper around the OpenAI-compatible Zhipu AI (Z.AI) API.
  *
- * Uses the standard `openai` npm package pointed at `https://api.z.ai/v1`
- * so no Zhipu-specific SDK is required.
+ * Uses the standard `openai` npm package pointed at `https://api.z.ai/api/paas/v4`
+ * so no Zhipu-specific SDK is required. The Z.AI service speaks the OpenAI
+ * Chat Completions wire format, plus a few GLM-specific extras (like the
+ * `thinking` field and `delta.reasoning_content` for reasoning tokens).
  */
 export class GlmClient {
   private client: OpenAI;
   private model: string;
+  private maxTokens: number;
+  private thinkingEnabled: boolean;
 
   constructor() {
     const apiKey = process.env["Z_AI_API_KEY"];
@@ -51,22 +58,25 @@ export class GlmClient {
       );
     }
 
-    this.model = process.env["ACP_GLM_MODEL"] ?? "glm-5-1";
+    this.model = process.env["ACP_GLM_MODEL"] ?? DEFAULT_MODEL;
+    const baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
+    this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 8192);
+    this.thinkingEnabled = parseThinking(this.model);
 
-    this.client = new OpenAI({
-      apiKey,
-      baseURL: "https://api.z.ai/v1",
-    });
+    this.client = new OpenAI({ apiKey, baseURL });
   }
 
   /**
    * Stream a chat completion from the GLM model, yielding chunks as they arrive.
    *
-   * Reasoning/thinking tokens (from GLM-5.1's "Rethink" mode) are mapped to
+   * Reasoning/thinking tokens (from GLM "thinking" mode) are mapped to
    * `thinking` chunks so the ACP agent can forward them as `agent_thought_chunk`
    * blocks.
    */
-  async *streamChat(messages: GlmMessage[], signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
+  async *streamChat(
+    messages: GlmMessage[],
+    signal?: AbortSignal
+  ): AsyncGenerator<GlmStreamChunk> {
     const tools: ChatCompletionTool[] = TOOL_DEFINITIONS.map((t) => ({
       type: "function" as const,
       function: {
@@ -76,87 +86,142 @@ export class GlmClient {
       },
     }));
 
-    // Extra params for GLM-5.1 thinking mode. The openai SDK passes through
-    // unknown extra body fields so this works transparently.
+    // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
+    // that to pass GLM-specific fields like `thinking`.
     const extraBody: Record<string, unknown> = {};
-    if (this.model.startsWith("glm-5")) {
+    if (this.thinkingEnabled) {
       extraBody["thinking"] = { type: "enabled" };
     }
 
-    const stream = await this.client.chat.completions.create({
-      model: this.model,
-      messages,
-      tools,
-      tool_choice: "auto",
-      stream: true,
-      max_tokens: 8192,
-      ...extraBody,
-    }, { signal });
+    const stream = await this.client.chat.completions.create(
+      {
+        model: this.model,
+        messages,
+        tools,
+        tool_choice: "auto",
+        stream: true,
+        // Always ask the API to include final usage in the streaming response.
+        stream_options: { include_usage: true },
+        max_tokens: this.maxTokens,
+        ...extraBody,
+      },
+      { signal }
+    );
 
-    // Accumulate tool call deltas keyed by index
+    // Tool call deltas arrive interleaved across chunks; assemble by index.
     const pendingToolCalls: Map<
       number,
       { id: string; name: string; arguments: string }
     > = new Map();
 
+    let lastFinishReason: string | undefined;
+
     for await (const chunk of stream) {
       const choice = chunk.choices[0];
-      if (!choice) continue;
 
-      const delta = choice.delta as Record<string, unknown>;
+      if (choice) {
+        const delta = choice.delta as Record<string, unknown>;
 
-      // Thinking / reasoning tokens (GLM-5.1 "Rethink" mode)
-      // The API returns these in delta.reasoning_content
-      if (typeof delta["reasoning_content"] === "string" && delta["reasoning_content"].length > 0) {
-        yield { thinking: delta["reasoning_content"] as string };
+        // Reasoning / thinking tokens (GLM "thinking" mode).
+        const reasoning = delta["reasoning_content"];
+        if (typeof reasoning === "string" && reasoning.length > 0) {
+          yield { thinking: reasoning };
+        }
+
+        // Regular assistant text.
+        const content = delta["content"];
+        if (typeof content === "string" && content.length > 0) {
+          yield { text: content };
+        }
+
+        // Tool call deltas.
+        const toolCallDeltas = delta["tool_calls"] as
+          | Array<{
+              index: number;
+              id?: string;
+              function?: { name?: string; arguments?: string };
+            }>
+          | undefined;
+
+        if (Array.isArray(toolCallDeltas)) {
+          for (const tc of toolCallDeltas) {
+            let pending = pendingToolCalls.get(tc.index);
+            if (!pending) {
+              pending = { id: "", name: "", arguments: "" };
+              pendingToolCalls.set(tc.index, pending);
+            }
+            if (tc.id) pending.id = tc.id;
+            if (tc.function?.name) pending.name = tc.function.name;
+            if (tc.function?.arguments) pending.arguments += tc.function.arguments;
+          }
+        }
+
+        if (choice.finish_reason) {
+          lastFinishReason = choice.finish_reason;
+        }
       }
 
-      // Regular assistant text
-      if (typeof delta["content"] === "string" && delta["content"].length > 0) {
-        yield { text: delta["content"] as string };
-      }
-
-      // Tool call deltas
-      const toolCallDeltas = delta["tool_calls"] as
-        | Array<{
-            index: number;
-            id?: string;
-            function?: { name?: string; arguments?: string };
-          }>
+      // The final chunk on most providers (GLM included when
+      // include_usage: true) ships only a `usage` object with no choices.
+      const rawUsage = (chunk as { usage?: unknown }).usage as
+        | {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+            prompt_tokens_details?: { cached_tokens?: number };
+            completion_tokens_details?: { reasoning_tokens?: number };
+          }
+        | null
         | undefined;
 
-      if (toolCallDeltas) {
-        for (const tc of toolCallDeltas) {
-          if (!pendingToolCalls.has(tc.index)) {
-            pendingToolCalls.set(tc.index, { id: "", name: "", arguments: "" });
-          }
-          const pending = pendingToolCalls.get(tc.index)!;
-          if (tc.id) pending.id = tc.id;
-          if (tc.function?.name) pending.name = tc.function.name;
-          if (tc.function?.arguments) pending.arguments += tc.function.arguments;
+      if (rawUsage) {
+        const usage: Usage = {
+          inputTokens: rawUsage.prompt_tokens ?? 0,
+          outputTokens: rawUsage.completion_tokens ?? 0,
+          totalTokens: rawUsage.total_tokens ?? 0,
+        };
+        if (typeof rawUsage.prompt_tokens_details?.cached_tokens === "number") {
+          usage.cachedReadTokens = rawUsage.prompt_tokens_details.cached_tokens;
         }
-      }
-
-      // When the finish reason is set, emit any completed tool calls and usage
-      if (choice.finish_reason) {
-        for (const [, tc] of pendingToolCalls) {
-          yield { toolCall: tc };
+        if (
+          typeof rawUsage.completion_tokens_details?.reasoning_tokens === "number"
+        ) {
+          usage.thoughtTokens = rawUsage.completion_tokens_details.reasoning_tokens;
         }
-        pendingToolCalls.clear();
-
-        const rawUsage = chunk.usage as
-          | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
-          | undefined;
-        const usage = rawUsage
-          ? {
-              inputTokens: rawUsage.prompt_tokens ?? 0,
-              outputTokens: rawUsage.completion_tokens ?? 0,
-              totalTokens: rawUsage.total_tokens ?? 0,
-            }
-          : undefined;
-
-        yield { done: true, stopReason: choice.finish_reason, usage };
+        yield { usage };
       }
     }
+
+    // Flush any assembled tool calls and emit a final done chunk.
+    for (const [, tc] of pendingToolCalls) {
+      if (tc.id || tc.name || tc.arguments) yield { toolCall: tc };
+    }
+    pendingToolCalls.clear();
+
+    yield { done: true, stopReason: lastFinishReason };
   }
+}
+
+/** Parse an integer environment variable, falling back to a default. */
+function parseIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Decide whether to enable GLM "thinking" mode for a given model name.
+ *
+ * The user can force on/off via `ACP_GLM_THINKING=true|false`. Otherwise,
+ * we enable thinking for any model whose name suggests it supports it
+ * (the GLM-4.5 / GLM-4.6 / GLM-4.7 / GLM-5.x families).
+ */
+function parseThinking(model: string): boolean {
+  const override = process.env["ACP_GLM_THINKING"];
+  if (override !== undefined) {
+    return override.toLowerCase() === "true" || override === "1";
+  }
+  const m = model.toLowerCase();
+  return /^glm-(4\.[567]|5)/.test(m) || m.startsWith("glm-5");
 }
