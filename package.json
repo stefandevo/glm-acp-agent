@@ -7,6 +7,9 @@
   "bin": {
     "glm-acp-agent": "dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
