@@ -335,6 +335,8 @@ export class ToolExecutor {
     try {
       // Split command string into executable + argument list so ACP hosts that
       // treat `command` as the binary path (not a shell invocation) work correctly.
+      // Note: simple whitespace split; commands with quoted or escaped arguments
+      // should pass the executable and args separately via run_command tool guidance.
       const [cmd, ...cmdArgs] = command.trim().split(/\s+/);
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,

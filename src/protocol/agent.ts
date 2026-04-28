@@ -354,6 +354,9 @@ export class GlmAcpAgent implements Agent {
       // Continue the loop (tool_calls finish reason means GLM wants another turn)
     }
 
+    // MAX_TURNS reached: agentic loop exhausted without a natural stop.
+    // "end_turn" is the closest valid ACP stop reason — "max_tokens" is reserved
+    // for the model's own context-window limit, not an agent loop limit.
     return { stopReason: "end_turn", usage: lastUsage };
   }
 }
