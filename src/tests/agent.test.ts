@@ -1,8 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir as osTmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import type { GlmStreamChunk } from "../llm/glm-client.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+
+// Defence in depth: even though every test below opts out via `sessionStore: null`,
+// redirect the on-disk default path to an isolated tempdir so a future test
+// that forgets the opt-out can't pollute the developer's home directory.
+process.env["ACP_GLM_SESSION_DIR"] = mkdtempSync(
+  pathJoin(osTmpdir(), "glm-acp-test-default-")
+);
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -687,13 +697,11 @@ test("invalid maxTurns falls back to the default", async () => {
 // Session persistence (loadSession / fork / resume)
 // ---------------------------------------------------------------------------
 
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { SessionStore } from "../protocol/session-store.js";
 
 function makeTempStore(): { store: SessionStore; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), "glm-acp-test-"));
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-"));
   const store = new SessionStore(dir);
   return {
     store,
@@ -833,6 +841,82 @@ test("loadSession throws when persistence is disabled", async () => {
     () => agent.loadSession({ sessionId: "x", cwd: "/tmp", mcpServers: [] }),
     /persistence is disabled/
   );
+});
+
+test("closeSession persists final state so a later loadSession can restore it", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const glm = makeStreamingGlm([[{ text: "hi back" }, { done: true, stopReason: "stop" }]]);
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    await agent.closeSession({ sessionId });
+    assert.equal((await agent.listSessions({})).sessions.length, 1, "still listed via store");
+
+    // A fresh agent (simulating a process restart) must be able to load it.
+    const conn2 = createConnectionStub();
+    const agent2 = new GlmAcpAgent(conn2 as never, { sessionStore: store });
+    const loaded = await agent2.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    assert.equal(loaded.models?.currentModelId, store.load(sessionId)?.model);
+  } finally {
+    cleanup();
+  }
+});
+
+test("unstable_forkSession works on a session that exists only on disk", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const sourceId = "22222222-2222-2222-2222-222222222222";
+    store.save({
+      sessionId: sourceId,
+      cwd: "/tmp/orig",
+      messages: [
+        { role: "system", content: "you are a coding assistant" },
+        { role: "user", content: "ping" },
+        { role: "assistant", content: "pong" },
+      ],
+      title: "origin",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-4.5",
+    });
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    // Note: no newSession, no in-memory record — only the disk file exists.
+    const fork = await agent.unstable_forkSession({
+      sessionId: sourceId,
+      cwd: "/tmp/fork",
+      mcpServers: [],
+    });
+
+    assert.notEqual(fork.sessionId, sourceId);
+    const forked = store.load(fork.sessionId);
+    assert.ok(forked);
+    assert.equal(forked?.cwd, "/tmp/fork");
+    assert.equal(forked?.model, "glm-4.5");
+    assert.equal(forked?.messages.length, 3);
+    assert.equal(forked?.title, "origin (fork)");
+  } finally {
+    cleanup();
+  }
+});
+
+test("unstable_setSessionModel emits a session_info_update notification", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const before = conn.updates.length;
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.5-air" });
+
+  const emitted = conn.updates.slice(before).filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "session_info_update"
+  );
+  assert.equal(emitted.length, 1);
 });
 
 test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {

@@ -4,14 +4,32 @@ import { join } from "node:path";
 import type { GlmMessage } from "../llm/glm-client.js";
 
 /**
+ * Schema version embedded in every persisted session file. Bump whenever the
+ * shape of `PersistedSession` changes incompatibly so future loaders can
+ * migrate (or reject) old records instead of silently producing garbage.
+ */
+export const SESSION_SCHEMA_VERSION = 1 as const;
+
+/**
  * On-disk representation of a session. Only fields that need to survive a
  * process restart are persisted — `abortController` / `promptPromise` are
  * transient state that has no meaning across processes.
  */
 export interface PersistedSession {
+  /** Schema version of this on-disk record (see SESSION_SCHEMA_VERSION). */
+  schemaVersion?: number;
   sessionId: string;
   cwd: string;
   messages: GlmMessage[];
+  title: string | null;
+  updatedAt: string;
+  model: string;
+}
+
+/** Light-weight summary of a persisted session — used by `listSessions`. */
+export interface PersistedSessionMetadata {
+  sessionId: string;
+  cwd: string;
   title: string | null;
   updatedAt: string;
   model: string;
@@ -52,7 +70,11 @@ export class SessionStore {
   save(session: PersistedSession): void {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const path = this.pathFor(session.sessionId);
-    writeFileSync(path, JSON.stringify(session, null, 2) + "\n", { mode: 0o600 });
+    const body: PersistedSession = {
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      ...session,
+    };
+    writeFileSync(path, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
   }
 
   /** Load a session by id, returning undefined if no such file exists. */
@@ -63,25 +85,49 @@ export class SessionStore {
     } catch {
       return undefined;
     }
-    const parsed = JSON.parse(raw) as PersistedSession;
+    let parsed: PersistedSession;
+    try {
+      parsed = JSON.parse(raw) as PersistedSession;
+    } catch {
+      return undefined;
+    }
+    // Drop records we don't know how to read. Today there's only one schema,
+    // so an unknown version is almost certainly a forward-incompatible record
+    // written by a newer agent build.
+    const version = parsed.schemaVersion ?? SESSION_SCHEMA_VERSION;
+    if (version !== SESSION_SCHEMA_VERSION) return undefined;
     return parsed;
   }
 
-  /** List all persisted sessions (lightweight metadata only). */
-  list(): PersistedSession[] {
+  /**
+   * List metadata for all persisted sessions, sorted newest-first by
+   * `updatedAt`. This is the hot path for `session/list`; we still parse each
+   * file (single-file-per-session has no shared index), but discard the
+   * `messages` array immediately so memory usage scales with the number of
+   * sessions, not their length.
+   */
+  listMetadata(): PersistedSessionMetadata[] {
     let entries: string[];
     try {
       entries = readdirSync(this.dir);
     } catch {
       return [];
     }
-    const out: PersistedSession[] = [];
+    const out: PersistedSessionMetadata[] = [];
     for (const name of entries) {
       if (!name.endsWith(".json")) continue;
       const sessionId = name.slice(0, -".json".length);
       const sess = this.load(sessionId);
-      if (sess) out.push(sess);
+      if (!sess) continue;
+      out.push({
+        sessionId: sess.sessionId,
+        cwd: sess.cwd,
+        title: sess.title,
+        updatedAt: sess.updatedAt,
+        model: sess.model,
+      });
     }
+    out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
     return out;
   }
 }
