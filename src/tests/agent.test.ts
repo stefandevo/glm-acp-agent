@@ -140,6 +140,64 @@ test("newSession returns a unique session id and seeds a system prompt", async (
   assert.equal(list.sessions.length, 2);
 });
 
+test("system prompt advertises only the tools matching client capabilities", async () => {
+  const conn = createConnectionStub();
+  let captured = "";
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const sys = messages.find((m) => m.role === "system");
+      captured = typeof sys?.content === "string" ? sys.content : "";
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm });
+  // Explicitly empty capabilities: the client has no fs, no terminal.
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  // Web tools are unconditional, but file/terminal tools must NOT appear.
+  assert.ok(captured.includes("web_search"));
+  assert.ok(captured.includes("web_reader"));
+  assert.ok(!captured.includes("read_file"));
+  assert.ok(!captured.includes("write_file"));
+  assert.ok(!captured.includes("list_files"));
+  assert.ok(!captured.includes("run_command"));
+});
+
+test("system prompt falls back to all tools when client never sent capabilities", async () => {
+  const conn = createConnectionStub();
+  let captured = "";
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const sys = messages.find((m) => m.role === "system");
+      captured = typeof sys?.content === "string" ? sys.content : "";
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm });
+  // Skip initialize on purpose so clientCapabilities stays null.
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  for (const name of [
+    "read_file",
+    "write_file",
+    "list_files",
+    "run_command",
+    "web_search",
+    "web_reader",
+  ]) {
+    assert.ok(captured.includes(name), `expected system prompt to mention ${name}`);
+  }
+});
+
 test("listSessions can filter by cwd", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never);

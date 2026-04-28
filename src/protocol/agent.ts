@@ -461,18 +461,22 @@ export class GlmAcpAgent implements Agent {
 
   /** Names of tools we expose given the client's capabilities. */
   private availableToolNames(): string[] {
-    const fs = this.clientCapabilities?.fs ?? {};
-    const terminal = this.clientCapabilities?.terminal ?? false;
+    // If the client never sent capabilities at all (initialize wasn't called,
+    // or it omitted the field), advertise the full set so the system prompt
+    // still mentions every tool. The executor will surface a clean error if
+    // the model invokes one whose capability is missing.
+    if (!this.clientCapabilities) {
+      return TOOL_DEFINITIONS.map((t) => t.function.name);
+    }
+
+    const fs = this.clientCapabilities.fs ?? {};
+    const terminal = this.clientCapabilities.terminal ?? false;
     const names: string[] = [];
     if (fs.readTextFile) names.push("read_file");
     if (fs.writeTextFile) names.push("write_file");
     if (terminal) names.push("list_files", "run_command");
     // Web tools always run inside the agent process, so they are unconditional.
     names.push("web_search", "web_reader");
-    // If everything is missing fall back to the full list so the system prompt
-    // still mentions tools by name (the executor will surface a clean error if
-    // they are invoked).
-    if (names.length === 2) return TOOL_DEFINITIONS.map((t) => t.function.name);
     return names;
   }
 }
