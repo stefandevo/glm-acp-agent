@@ -17,6 +17,12 @@ import type {
   CloseSessionRequest,
   ListSessionsRequest,
   ListSessionsResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  ForkSessionRequest,
+  ForkSessionResponse,
+  ResumeSessionRequest,
+  ResumeSessionResponse,
   SetSessionModelRequest,
   SetSessionModelResponse,
   ModelInfo,
@@ -186,9 +192,10 @@ export class GlmAcpAgent implements Agent {
   async authenticate(
     _params: AuthenticateRequest
   ): Promise<AuthenticateResponse> {
-    // Authentication is configured via the Z_AI_API_KEY environment variable
-    // (advertised as an `env_var` auth method). The agent has nothing to do
-    // here; failures will surface when the model is first called.
+    // Authentication is configured externally — either via Z_AI_API_KEY in the
+    // environment or via the credentials file written by `glm-acp-agent --setup`.
+    // The agent has nothing to do here; failures will surface when the model
+    // is first called.
     return {};
   }
 
@@ -244,6 +251,15 @@ export class GlmAcpAgent implements Agent {
     }
     session.model = params.modelId;
     session.updatedAt = new Date().toISOString();
+    // Notify clients so any UI that displays the active model refreshes
+    // immediately, instead of waiting for the next prompt to complete.
+    await safeSessionUpdate(this.connection, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        updatedAt: session.updatedAt,
+      },
+    });
     return {};
   }
 
@@ -409,17 +425,20 @@ export class GlmAcpAgent implements Agent {
     // store is the source of truth for closed/restarted sessions; in-memory
     // state takes precedence when both exist (it has the freshest title /
     // updatedAt before persistence has fired).
+    //
+    // We use the metadata-only store API so we don't load every conversation's
+    // full message history just to render a session picker.
     const merged = new Map<
       string,
       { cwd: string; title: string | null; updatedAt: string }
     >();
 
     if (this.sessionStore) {
-      for (const persisted of this.sessionStore.list()) {
-        merged.set(persisted.sessionId, {
-          cwd: persisted.cwd,
-          title: persisted.title,
-          updatedAt: persisted.updatedAt,
+      for (const meta of this.sessionStore.listMetadata()) {
+        merged.set(meta.sessionId, {
+          cwd: meta.cwd,
+          title: meta.title,
+          updatedAt: meta.updatedAt,
         });
       }
     }
@@ -435,6 +454,10 @@ export class GlmAcpAgent implements Agent {
     const filtered = params.cwd
       ? all.filter(([, s]) => s.cwd === params.cwd)
       : all;
+    // Newest-first so clients can render the picker without re-sorting.
+    filtered.sort(([, a], [, b]) =>
+      a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0
+    );
 
     return {
       sessions: filtered.map(([sessionId, s]) => ({
@@ -450,9 +473,7 @@ export class GlmAcpAgent implements Agent {
   // Session load / fork / resume
   // ---------------------------------------------------------------------------
 
-  async loadSession(
-    params: import("@agentclientprotocol/sdk").LoadSessionRequest
-  ): Promise<import("@agentclientprotocol/sdk").LoadSessionResponse> {
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const persisted = this.requirePersisted(params.sessionId);
 
     // Restore in-memory state. We do NOT carry over the abortController /
@@ -477,8 +498,8 @@ export class GlmAcpAgent implements Agent {
   }
 
   async unstable_forkSession(
-    params: import("@agentclientprotocol/sdk").ForkSessionRequest
-  ): Promise<import("@agentclientprotocol/sdk").ForkSessionResponse> {
+    params: ForkSessionRequest
+  ): Promise<ForkSessionResponse> {
     const source = this.sessions.get(params.sessionId);
     const persisted = source
       ? this.snapshot(params.sessionId, source)
@@ -490,7 +511,7 @@ export class GlmAcpAgent implements Agent {
     const forked: SessionState = {
       cwd: params.cwd,
       // Deep-clone messages so the fork doesn't share state with the parent.
-      messages: JSON.parse(JSON.stringify(persisted.messages)) as GlmMessage[],
+      messages: structuredClone(persisted.messages),
       abortController: null,
       promptPromise: null,
       title: forkedTitle,
@@ -507,8 +528,8 @@ export class GlmAcpAgent implements Agent {
   }
 
   async resumeSession(
-    params: import("@agentclientprotocol/sdk").ResumeSessionRequest
-  ): Promise<import("@agentclientprotocol/sdk").ResumeSessionResponse> {
+    params: ResumeSessionRequest
+  ): Promise<ResumeSessionResponse> {
     const persisted = this.requirePersisted(params.sessionId);
 
     const restored: SessionState = {

@@ -1,5 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir as osTmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
+
+// Defence in depth: redirect the default session-persistence directory to an
+// isolated tempdir so any forgotten `sessionStore: null` opt-out can't write
+// to the developer's home.
+process.env["ACP_GLM_SESSION_DIR"] = mkdtempSync(
+  pathJoin(osTmpdir(), "glm-acp-integration-test-")
+);
 import {
   AgentSideConnection,
   ClientSideConnection,
