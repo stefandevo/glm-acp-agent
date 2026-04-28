@@ -78,8 +78,8 @@ export class GlmAcpAgent implements Agent {
       content:
         "You are an expert software engineer and coding assistant. " +
         "You help users read, write, and modify code across their projects. " +
-        "Use the available tools (read_file, write_file, list_files, run_command) " +
-        "to interact with the client's file system and terminal. " +
+        "Use the available tools (read_file, write_file, list_files, run_command, web_search, web_reader) " +
+        "to interact with the client's file system, terminal, and the web. " +
         "Always explain what you are doing before taking any action. " +
         `Working directory: ${params.cwd}`,
     };
