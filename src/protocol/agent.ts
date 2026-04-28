@@ -14,6 +14,8 @@ import type {
   SetSessionModeRequest,
   SetSessionModeResponse,
   CloseSessionRequest,
+  ListSessionsRequest,
+  ListSessionsResponse,
   PROTOCOL_VERSION,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
@@ -22,8 +24,11 @@ import { ToolExecutor } from "../tools/executor.js";
 
 /** Per-session state */
 interface SessionState {
+  cwd: string;
   messages: GlmMessage[];
   abortController: AbortController | null;
+  title: string | null;
+  updatedAt: string;
 }
 
 /**
@@ -54,8 +59,12 @@ export class GlmAcpAgent implements Agent {
       },
       agentCapabilities: {
         loadSession: false,
+        promptCapabilities: {
+          embeddedContext: true,
+        },
         sessionCapabilities: {
           close: {},
+          list: {},
         },
       },
     };
@@ -76,8 +85,11 @@ export class GlmAcpAgent implements Agent {
     };
 
     this.sessions.set(sessionId, {
+      cwd: params.cwd,
       messages: [systemPrompt],
       abortController: null,
+      title: null,
+      updatedAt: new Date().toISOString(),
     });
 
     return { sessionId };
@@ -111,22 +123,68 @@ export class GlmAcpAgent implements Agent {
     const abortController = new AbortController();
     session.abortController = abortController;
 
-    // Convert ACP content blocks to a GLM user message
-    const userText = params.prompt
-      .filter((block): block is { type: "text"; text: string } => block.type === "text")
-      .map((block) => block.text)
-      .join("\n");
+    // Convert ACP content blocks to a GLM user message.
+    // Baseline: text blocks. Extended: resource_link (URI reference) and
+    // embedded resource blocks (inline text content).
+    const userParts: string[] = [];
+    for (const block of params.prompt) {
+      if (block.type === "text") {
+        userParts.push(block.text);
+      } else if (block.type === "resource_link") {
+        userParts.push(`[${block.name}](${block.uri})`);
+      } else if (block.type === "resource") {
+        const res = block.resource;
+        if ("text" in res) {
+          userParts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
+        }
+      }
+    }
+    const userText = userParts.join("\n");
 
     session.messages.push({ role: "user", content: userText });
 
     try {
-      const stopReason = await this.runPromptLoop(
+      const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
         session,
         abortController.signal
       );
 
       session.abortController = null;
+      session.updatedAt = new Date().toISOString();
+
+      // Derive a session title from the first user message (first prompt only)
+      if (!session.title) {
+        session.title = userText.slice(0, 80).replace(/\n/g, " ") || "New conversation";
+        await this.connection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            title: session.title,
+            updatedAt: session.updatedAt,
+          },
+        });
+      } else {
+        await this.connection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            updatedAt: session.updatedAt,
+          },
+        });
+      }
+
+      // Report token usage if the model provided it
+      if (usage) {
+        await this.connection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            usage,
+          },
+        });
+      }
+
       return {
         stopReason,
         userMessageId: params.messageId ?? undefined,
@@ -151,6 +209,24 @@ export class GlmAcpAgent implements Agent {
     this.sessions.delete(params.sessionId);
   }
 
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    const allSessions = Array.from(this.sessions.entries());
+
+    // Optional cwd filter
+    const filtered = params.cwd
+      ? allSessions.filter(([, s]) => s.cwd === params.cwd)
+      : allSessions;
+
+    return {
+      sessions: filtered.map(([sessionId, s]) => ({
+        sessionId,
+        cwd: s.cwd,
+        title: s.title ?? undefined,
+        updatedAt: s.updatedAt,
+      })),
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Internal prompt loop
   // ---------------------------------------------------------------------------
@@ -158,18 +234,22 @@ export class GlmAcpAgent implements Agent {
   /**
    * Runs the full prompt/tool-calling loop until the model stops or is cancelled.
    *
-   * Returns the ACP stop reason.
+   * Returns the ACP stop reason and optional token usage reported by the model.
    */
   private async runPromptLoop(
     sessionId: string,
     session: SessionState,
     signal: AbortSignal
-  ): Promise<"end_turn" | "cancelled" | "max_tokens"> {
+  ): Promise<{
+    stopReason: "end_turn" | "cancelled" | "max_tokens";
+    usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+  }> {
     const MAX_TURNS = 20;
     const executor = new ToolExecutor(this.connection, sessionId);
+    let lastUsage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      if (signal.aborted) return "cancelled";
+      if (signal.aborted) return { stopReason: "cancelled" };
 
       const toolCalls: Array<{
         id: string;
@@ -181,7 +261,7 @@ export class GlmAcpAgent implements Agent {
 
       // Stream the GLM response
       for await (const chunk of this.glm.streamChat(session.messages)) {
-        if (signal.aborted) return "cancelled";
+        if (signal.aborted) return { stopReason: "cancelled" };
 
         if (chunk.thinking) {
           // Forward reasoning tokens as ACP thought chunks
@@ -215,8 +295,8 @@ export class GlmAcpAgent implements Agent {
           toolCalls.push(chunk.toolCall);
         }
 
-        if (chunk.done) {
-          // finish_reason recorded; tool calls are emitted by the stream generator
+        if (chunk.usage) {
+          lastUsage = chunk.usage;
         }
       }
 
@@ -243,12 +323,12 @@ export class GlmAcpAgent implements Agent {
 
       // If there are no tool calls, we're done
       if (toolCalls.length === 0) {
-        return "end_turn";
+        return { stopReason: "end_turn", usage: lastUsage };
       }
 
       // Execute tool calls and feed results back
       for (const tc of toolCalls) {
-        if (signal.aborted) return "cancelled";
+        if (signal.aborted) return { stopReason: "cancelled" };
 
         const result = await executor.execute(tc.id, tc.name, tc.arguments);
 
@@ -262,6 +342,6 @@ export class GlmAcpAgent implements Agent {
       // Continue the loop (tool_calls finish reason means GLM wants another turn)
     }
 
-    return "max_tokens";
+    return { stopReason: "max_tokens", usage: lastUsage };
   }
 }

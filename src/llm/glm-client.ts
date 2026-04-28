@@ -21,6 +21,12 @@ export interface GlmStreamChunk {
     name: string;
     arguments: string;
   };
+  /** Token usage reported when the stream finishes */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
   /** Set when the stream is done */
   done?: boolean;
   /** Stop reason when done */
@@ -131,13 +137,25 @@ export class GlmClient {
         }
       }
 
-      // When the finish reason is set, emit any completed tool calls
+      // When the finish reason is set, emit any completed tool calls and usage
       if (choice.finish_reason) {
         for (const [, tc] of pendingToolCalls) {
           yield { toolCall: tc };
         }
         pendingToolCalls.clear();
-        yield { done: true, stopReason: choice.finish_reason };
+
+        const rawUsage = chunk.usage as
+          | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+          | undefined;
+        const usage = rawUsage
+          ? {
+              inputTokens: rawUsage.prompt_tokens ?? 0,
+              outputTokens: rawUsage.completion_tokens ?? 0,
+              totalTokens: rawUsage.total_tokens ?? 0,
+            }
+          : undefined;
+
+        yield { done: true, stopReason: choice.finish_reason, usage };
       }
     }
   }
