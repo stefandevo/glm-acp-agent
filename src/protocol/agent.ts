@@ -16,7 +16,6 @@ import type {
   CloseSessionRequest,
   ListSessionsRequest,
   ListSessionsResponse,
-  PROTOCOL_VERSION,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
 import { GlmClient, type GlmMessage } from "../llm/glm-client.js";
@@ -40,10 +39,15 @@ interface SessionState {
  */
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
-  private glm: GlmClient;
+  private _glm: GlmClient | null = null;
 
-  constructor(private connection: AgentSideConnection) {
-    this.glm = new GlmClient();
+  constructor(private connection: AgentSideConnection) {}
+
+  private get glm(): GlmClient {
+    if (this._glm === null) {
+      this._glm = new GlmClient();
+    }
+    return this._glm;
   }
 
   // ---------------------------------------------------------------------------

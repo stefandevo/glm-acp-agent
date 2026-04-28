@@ -61,7 +61,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "list_files",
       description:
-        "List the files and directories at the given path using the client's file system.",
+        "List the files and directories at the given path by running a terminal directory-listing command on the client machine; output and availability may vary by shell and platform.",
       parameters: {
         type: "object",
         properties: {

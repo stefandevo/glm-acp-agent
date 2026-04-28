@@ -219,7 +219,6 @@ export class ToolExecutor {
 
     let terminal;
     try {
-      // Use ls as the command with the path as a direct argument to avoid shell injection
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
         command: "ls",
@@ -331,8 +330,8 @@ export class ToolExecutor {
     try {
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
-        command: "/bin/sh",
-        args: ["-c", command],
+        command,
+        args: [],
       });
 
       await terminal.waitForExit();

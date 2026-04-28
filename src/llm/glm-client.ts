@@ -132,7 +132,7 @@ export class GlmClient {
           }
           const pending = pendingToolCalls.get(tc.index)!;
           if (tc.id) pending.id = tc.id;
-          if (tc.function?.name) pending.name += tc.function.name;
+          if (tc.function?.name) pending.name = tc.function.name;
           if (tc.function?.arguments) pending.arguments += tc.function.arguments;
         }
       }
