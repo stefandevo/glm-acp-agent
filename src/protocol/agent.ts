@@ -104,9 +104,18 @@ export class GlmAcpAgent implements Agent {
         name: "glm-acp-agent",
         version: "1.0.0",
       },
-      // Declare an environment-variable auth method so clients that respect the
-      // auth-methods proposal know what to ask the user for.
+      // Advertise auth methods so the ACP registry verifier and capable
+      // clients can discover how to configure us. The `agent`-default method
+      // (no `type` discriminator) signals that the agent reads its credentials
+      // itself at startup; the experimental `env_var` method gives clients
+      // that support it the metadata to prompt the user for the right var.
       authMethods: [
+        {
+          id: "z-ai-api-key",
+          name: "Z.AI API key",
+          description:
+            "Set the Z_AI_API_KEY environment variable to authenticate. Generate one at https://z.ai/manage-apikey/apikey-list",
+        },
         {
           type: "env_var",
           id: "z_ai_api_key",

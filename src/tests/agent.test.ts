@@ -105,6 +105,14 @@ test("initialize returns negotiated protocol version, agent info, and auth metho
     (m) => (m as { type?: string }).type === "env_var"
   );
   assert.ok(envVarMethod, "env_var auth method should be advertised");
+  // The ACP registry verifier requires at least one method of type `agent`
+  // (no discriminator) or `terminal`. We advertise an `agent` method since
+  // the agent reads Z_AI_API_KEY itself at startup with no extra UI.
+  const agentMethod = result.authMethods?.find(
+    (m) => (m as { type?: string }).type === undefined
+  );
+  assert.ok(agentMethod, "agent-default auth method should be advertised");
+  assert.equal((agentMethod as { id: string }).id, "z-ai-api-key");
 });
 
 test("initialize negotiates lower protocol version when client requests one", async () => {
