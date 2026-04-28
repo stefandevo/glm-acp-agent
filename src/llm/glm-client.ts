@@ -289,6 +289,5 @@ function parseThinking(model: string): boolean {
   if (override !== undefined) {
     return override.toLowerCase() === "true" || override === "1";
   }
-  const m = model.toLowerCase();
-  return /^glm-(4\.[567]|5)/.test(m) || m.startsWith("glm-5");
+  return /^glm-(?:4\.[567]|5)/i.test(model);
 }

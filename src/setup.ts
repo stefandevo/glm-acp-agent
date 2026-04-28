@@ -59,8 +59,18 @@ async function readSecret(
     let buf = "";
     const cleanup = () => {
       stream.off("data", onData);
+      stream.off("close", onClose);
+      stream.off("error", onError);
       stream.setRawMode(false);
       stream.pause();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("Input stream closed before a key was entered."));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
     };
     const onData = (data: Buffer | string) => {
       const chunk = typeof data === "string" ? data : data.toString("utf8");
@@ -92,5 +102,7 @@ async function readSecret(
       }
     };
     stream.on("data", onData);
+    stream.on("close", onClose);
+    stream.on("error", onError);
   });
 }
