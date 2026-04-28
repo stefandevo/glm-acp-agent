@@ -66,7 +66,7 @@ export class GlmClient {
    * `thinking` chunks so the ACP agent can forward them as `agent_thought_chunk`
    * blocks.
    */
-  async *streamChat(messages: GlmMessage[]): AsyncGenerator<GlmStreamChunk> {
+  async *streamChat(messages: GlmMessage[], signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
     const tools: ChatCompletionTool[] = TOOL_DEFINITIONS.map((t) => ({
       type: "function" as const,
       function: {
@@ -91,7 +91,7 @@ export class GlmClient {
       stream: true,
       max_tokens: 8192,
       ...extraBody,
-    });
+    }, { signal });
 
     // Accumulate tool call deltas keyed by index
     const pendingToolCalls: Map<

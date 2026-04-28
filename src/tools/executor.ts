@@ -15,7 +15,8 @@ export interface ToolResult {
 export class ToolExecutor {
   constructor(
     private connection: AgentSideConnection,
-    private sessionId: string
+    private sessionId: string,
+    private signal?: AbortSignal
   ) {}
 
   /**
@@ -202,7 +203,11 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const path = String(args["path"] ?? ".");
+    const rawPath = args["path"];
+    if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
+      return { content: "Error listing files: `path` must be a non-empty string." };
+    }
+    const path = rawPath;
 
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
@@ -328,10 +333,13 @@ export class ToolExecutor {
 
     let terminal;
     try {
+      // Split command string into executable + argument list so ACP hosts that
+      // treat `command` as the binary path (not a shell invocation) work correctly.
+      const [cmd, ...cmdArgs] = command.trim().split(/\s+/);
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
-        command,
-        args: [],
+        command: cmd,
+        args: cmdArgs,
       });
 
       await terminal.waitForExit();
@@ -410,6 +418,7 @@ export class ToolExecutor {
           "Authorization": `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: this.signal,
       });
 
       if (!response.ok) {
@@ -500,6 +509,7 @@ export class ToolExecutor {
           "Authorization": `Bearer ${apiKey}`,
         },
         body: JSON.stringify({ url, return_format: returnFormat }),
+        signal: this.signal,
       });
 
       if (!response.ok) {

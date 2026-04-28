@@ -18,7 +18,7 @@ The agent connects to any ACP-compatible IDE or client over **stdio**, streams r
 
 ## Architecture
 
-```
+```text
 ACP Client (IDE plugin, CLI, …)
         │  stdio (ndjson)
         ▼
@@ -55,7 +55,7 @@ The agent process itself only needs network access to `api.z.ai`. All file-syste
 
 ## Prerequisites
 
-- **Node.js** 18 or later (native `fetch` required)
+- **Node.js** 20 or later (native `fetch` required)
 - **npm** 9 or later
 - A **Z.AI API key** – obtain one at <https://z.ai/manage-apikey/apikey-list>
 
@@ -158,7 +158,7 @@ Point the client at the `dist/index.js` entry point with `node` as the runtime a
 
 ## Project Structure
 
-```
+```text
 src/
 ├── index.ts                  # Entry point – starts stdio connection
 ├── llm/

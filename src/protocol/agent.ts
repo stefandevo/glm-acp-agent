@@ -249,8 +249,9 @@ export class GlmAcpAgent implements Agent {
     usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
   }> {
     const MAX_TURNS = 20;
-    const executor = new ToolExecutor(this.connection, sessionId);
+    const executor = new ToolExecutor(this.connection, sessionId, signal);
     let lastUsage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
+    let lastStopReason: string | undefined;
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       if (signal.aborted) return { stopReason: "cancelled" };
@@ -264,7 +265,7 @@ export class GlmAcpAgent implements Agent {
       let assistantText = "";
 
       // Stream the GLM response
-      for await (const chunk of this.glm.streamChat(session.messages)) {
+      for await (const chunk of this.glm.streamChat(session.messages, signal)) {
         if (signal.aborted) return { stopReason: "cancelled" };
 
         if (chunk.thinking) {
@@ -302,6 +303,10 @@ export class GlmAcpAgent implements Agent {
         if (chunk.usage) {
           lastUsage = chunk.usage;
         }
+
+        if (chunk.done) {
+          lastStopReason = chunk.stopReason;
+        }
       }
 
       // Record the assistant message in history
@@ -327,7 +332,10 @@ export class GlmAcpAgent implements Agent {
 
       // If there are no tool calls, we're done
       if (toolCalls.length === 0) {
-        return { stopReason: "end_turn", usage: lastUsage };
+        return {
+          stopReason: lastStopReason === "length" ? "max_tokens" : "end_turn",
+          usage: lastUsage,
+        };
       }
 
       // Execute tool calls and feed results back
@@ -346,6 +354,6 @@ export class GlmAcpAgent implements Agent {
       // Continue the loop (tool_calls finish reason means GLM wants another turn)
     }
 
-    return { stopReason: "max_tokens", usage: lastUsage };
+    return { stopReason: "end_turn", usage: lastUsage };
   }
 }
