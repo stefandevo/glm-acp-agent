@@ -1,0 +1,14 @@
+{
+  "id": "glm-acp-agent",
+  "name": "GLM Agent",
+  "version": "1.0.0",
+  "description": "ACP agent powered by Zhipu AI's GLM model family (GLM-5.1, GLM-4.5, ...)",
+  "repository": "https://github.com/stefandevo/glm-acp-agent",
+  "authors": ["Stefan de Vogelaere"],
+  "license": "Apache-2.0",
+  "distribution": {
+    "npx": {
+      "package": "glm-acp-agent@1.0.0"
+    }
+  }
+}
