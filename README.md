@@ -8,11 +8,13 @@ The agent connects to any ACP-compatible IDE or client over **stdio**, streams r
 
 ## Features
 
-- **Full ACP compliance** – implements `initialize`, `newSession`, `prompt`, `cancel`, `closeSession`, and `listSessions`
+- **Full ACP compliance** – implements `initialize`, `authenticate`, `newSession`, `setSessionMode`, `prompt`, `cancel`, `closeSession`, and `listSessions`
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
 - **Tool calling** – agentic loop with up to 20 turns of GLM function-calling
 - **Thinking mode** – GLM-5.1's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's thinking
 - **Six built-in tools** (see below)
+- **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
+- **Protocol-correct tool statuses** – uses ACP tool lifecycle statuses (`pending`, `in_progress`, `completed`, `failed`)
 
 ---
 
@@ -178,6 +180,7 @@ src/
 ```bash
 npm run build   # one-shot TypeScript compilation → dist/
 npm run dev     # watch mode
+npm test        # build + run protocol-focused unit tests
 ```
 
 TypeScript output lands in `dist/` with source maps and declaration files.

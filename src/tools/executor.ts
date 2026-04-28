@@ -102,7 +102,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });
@@ -191,7 +191,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });
@@ -258,7 +258,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });
@@ -318,6 +318,20 @@ export class ToolExecutor {
     title: string,
     rawInput: Record<string, unknown>
   ): Promise<ToolResult> {
+    const trimmed = command.trim();
+    if (!trimmed) {
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "failed",
+          rawOutput: { error: "Command must be a non-empty string." },
+        },
+      });
+      return { content: "Error running command: command must be a non-empty string." };
+    }
+
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -337,7 +351,7 @@ export class ToolExecutor {
       // treat `command` as the binary path (not a shell invocation) work correctly.
       // Note: simple whitespace split; commands with quoted or escaped arguments
       // should pass the executable and args separately via run_command tool guidance.
-      const [cmd, ...cmdArgs] = command.trim().split(/\s+/);
+      const [cmd, ...cmdArgs] = trimmed.split(/\s+/);
       terminal = await this.connection.createTerminal({
         sessionId: this.sessionId,
         command: cmd,
@@ -372,7 +386,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });
@@ -470,7 +484,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });
@@ -554,7 +568,7 @@ export class ToolExecutor {
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId,
-          status: "error",
+          status: "failed",
           rawOutput: { error: message },
         },
       });

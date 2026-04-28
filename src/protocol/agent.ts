@@ -245,7 +245,7 @@ export class GlmAcpAgent implements Agent {
     session: SessionState,
     signal: AbortSignal
   ): Promise<{
-    stopReason: "end_turn" | "cancelled" | "max_tokens";
+    stopReason: "end_turn" | "cancelled" | "max_tokens" | "max_turn_requests" | "refusal";
     usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
   }> {
     const MAX_TURNS = 20;
@@ -332,8 +332,9 @@ export class GlmAcpAgent implements Agent {
 
       // If there are no tool calls, we're done
       if (toolCalls.length === 0) {
+        const stopReason = this.mapStopReason(lastStopReason);
         return {
-          stopReason: lastStopReason === "length" ? "max_tokens" : "end_turn",
+          stopReason,
           usage: lastUsage,
         };
       }
@@ -354,9 +355,15 @@ export class GlmAcpAgent implements Agent {
       // Continue the loop (tool_calls finish reason means GLM wants another turn)
     }
 
-    // MAX_TURNS reached: agentic loop exhausted without a natural stop.
-    // "end_turn" is the closest valid ACP stop reason — "max_tokens" is reserved
-    // for the model's own context-window limit, not an agent loop limit.
-    return { stopReason: "end_turn", usage: lastUsage };
+    // MAX_TURNS reached: we exceeded internal model/tool requests for a single user turn.
+    return { stopReason: "max_turn_requests", usage: lastUsage };
+  }
+
+  private mapStopReason(
+    stopReason: string | undefined
+  ): "end_turn" | "max_tokens" | "refusal" {
+    if (stopReason === "length") return "max_tokens";
+    if (stopReason === "content_filter") return "refusal";
+    return "end_turn";
   }
 }
