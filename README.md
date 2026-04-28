@@ -8,10 +8,13 @@ The agent connects to any ACP-compatible IDE or client over **stdio**, streams r
 
 ## Features
 
-- **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, and `session/list`
+- **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
 - **Tool calling** – agentic loop with up to 20 turns of GLM function calling
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
+- **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
+- **Image input** – `promptCapabilities.image` is advertised; image content blocks are forwarded as data-URL parts so vision-capable models (e.g. `glm-4v-plus`) can ingest them
+- **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
 - **Capability-aware** – every tool is gated on the client capabilities advertised at `initialize` time; tools the client can't run return a clear error to the model instead of crashing
 - **Permissioned writes / commands** – every `write_file` and `run_command` call asks the user via `session/request_permission` before doing anything
@@ -77,15 +80,28 @@ npm run build
 
 ## Configuration
 
-The agent is configured entirely through environment variables.
+The agent reads its configuration from environment variables, plus an optional credentials file written by `glm-acp-agent --setup`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `Z_AI_API_KEY` | **Yes** | — | API key for the Z.AI / Zhipu AI service |
-| `ACP_GLM_MODEL` | No | `glm-5.1` | Override the GLM model |
+| `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
+| `ACP_GLM_MODEL` | No | `glm-5.1` | Default GLM model for new sessions |
+| `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
+| `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
+| `XDG_CONFIG_HOME` | No | `~/.config` | Where the credentials file is read/written |
+
+### One-time setup
+
+If you'd rather not pass `Z_AI_API_KEY` through your ACP client's environment block, run the interactive setup once and the agent will read the key from disk on subsequent launches:
+
+```bash
+glm-acp-agent --setup
+```
+
+The key is written to `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json` (default: `~/.config/glm-acp-agent/credentials.json`) with `0600` permissions. The `Z_AI_API_KEY` environment variable, when set, always wins over the file.
 
 ### Supported models
 
@@ -155,7 +171,12 @@ Any client that supports configuring an ACP agent via a `command` + `args` invoc
 
 ### Authentication
 
-The agent advertises a single `env_var` authentication method. ACP clients that support the auth-methods proposal will prompt the user for `Z_AI_API_KEY` automatically; clients that don't yet handle auth methods should set the variable themselves before launching the agent.
+The agent advertises two authentication methods at `initialize` time:
+
+1. An **`agent`-default** method — the agent will read the API key itself, either from the `Z_AI_API_KEY` environment variable or from the credentials file written by `glm-acp-agent --setup`.
+2. An **`env_var`** method (experimental SDK extension) describing the `Z_AI_API_KEY` variable so capable clients can prompt the user and inject it.
+
+ACP clients that support the auth-methods proposal will use whichever method they recognise; clients that don't handle auth methods should set `Z_AI_API_KEY` themselves before launching the agent (or run `glm-acp-agent --setup` once and let the agent read it from disk).
 
 ---
 
@@ -163,17 +184,21 @@ The agent advertises a single `env_var` authentication method. ACP clients that 
 
 ```text
 src/
-├── index.ts                  # Entry point – starts stdio connection
+├── index.ts                  # Entry point – starts stdio connection or --setup flow
+├── setup.ts                  # Interactive credential setup (`--setup`)
 ├── llm/
-│   └── glm-client.ts         # OpenAI-compatible client for Z.AI / Zhipu AI
+│   ├── glm-client.ts         # OpenAI-compatible client for Z.AI / Zhipu AI
+│   └── credentials.ts        # API-key resolution (env var > credentials.json)
 ├── protocol/
 │   ├── connection.ts         # Sets up the ACP stdio connection
-│   └── agent.ts              # GlmAcpAgent – ACP protocol implementation
+│   ├── agent.ts              # GlmAcpAgent – ACP protocol implementation
+│   └── session-store.ts      # On-disk persistence for load/fork/resume
 ├── tools/
 │   ├── definitions.ts        # Tool JSON schemas (function-calling format)
 │   └── executor.ts           # ToolExecutor – dispatches tool calls
 └── tests/
     ├── agent.test.ts         # Protocol-level tests for GlmAcpAgent
+    ├── credentials.test.ts   # Credential resolution and --setup persistence
     ├── executor.test.ts      # Tests for ToolExecutor
     ├── glm-client.test.ts    # Tests for streaming / tool-call assembly
     └── integration.test.ts   # End-to-end tests over the real ACP ndjson transport
@@ -206,7 +231,7 @@ The test suite covers:
 
 ## Troubleshooting
 
-- **`Z_AI_API_KEY environment variable is required but not set.`** — set the env var or configure your ACP client to forward it.
+- **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
 - **The agent says "client does not advertise the … capability".** — your ACP client doesn't expose that capability (e.g. terminal). Ask the model to use a different tool, or upgrade the client.
 - **Tools never get to run.** — make sure the client is sending the `clientCapabilities` field in `initialize`; the agent uses it to decide which tools to expose to the model.

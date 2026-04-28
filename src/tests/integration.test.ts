@@ -71,7 +71,7 @@ test("end-to-end initialize / new session / prompt round-trip via real SDK trans
   ]);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _agentConn = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn, { glm }),
+    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
     a
   );
 
@@ -134,7 +134,7 @@ test("end-to-end tool call: agent reads a file via the stub client", async () =>
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _agentConn = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn, { glm }),
+    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
     a
   );
   const clientConn = new ClientSideConnection(() => stub, b);
@@ -184,7 +184,7 @@ test("end-to-end cancellation via session/cancel notification", async () => {
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _agentConn = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn, { glm }),
+    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
     a
   );
   const clientConn = new ClientSideConnection(() => stub, b);
@@ -208,7 +208,7 @@ test("end-to-end session/list and session/close advertised on initialize and rou
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _agentConn = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn, { glm: makeStreamingGlm([]) }),
+    (conn) => new GlmAcpAgent(conn, { glm: makeStreamingGlm([]), sessionStore: null }),
     a
   );
   const clientConn = new ClientSideConnection(() => stub, b);

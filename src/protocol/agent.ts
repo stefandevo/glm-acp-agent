@@ -17,13 +17,24 @@ import type {
   CloseSessionRequest,
   ListSessionsRequest,
   ListSessionsResponse,
+  SetSessionModelRequest,
+  SetSessionModelResponse,
+  ModelInfo,
   StopReason,
   Usage,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
-import { GlmClient, type GlmMessage, type GlmStreamChunk } from "../llm/glm-client.js";
+import {
+  GlmClient,
+  getAvailableModels,
+  getDefaultModel,
+  type GlmMessage,
+  type GlmStreamChunk,
+  type StreamChatOptions,
+} from "../llm/glm-client.js";
 import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
+import { SessionStore, type PersistedSession } from "./session-store.js";
 
 /** Per-session state */
 interface SessionState {
@@ -38,6 +49,8 @@ interface SessionState {
   promptPromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
+  /** Active model for this session (clients can change via `session/set_model`). */
+  model: string;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -48,9 +61,22 @@ type InternalStopReason = StopReason;
  */
 export interface GlmAcpAgentOptions {
   /** Override the GLM client (used in tests). */
-  glm?: { streamChat: (messages: GlmMessage[], signal?: AbortSignal) => AsyncIterable<GlmStreamChunk> };
+  glm?: {
+    streamChat: (
+      messages: GlmMessage[],
+      signal?: AbortSignal,
+      options?: StreamChatOptions
+    ) => AsyncIterable<GlmStreamChunk>;
+  };
   /** Maximum number of model/tool turns per single prompt. Default 20. */
   maxTurns?: number;
+  /**
+   * Override the session store (used in tests). When undefined the agent
+   * uses an on-disk store rooted at `$ACP_GLM_SESSION_DIR` /
+   * `$XDG_STATE_HOME/glm-acp-agent/sessions` / `~/.local/state/glm-acp-agent/sessions`.
+   * Pass `null` to disable persistence entirely.
+   */
+  sessionStore?: SessionStore | null;
 }
 
 /**
@@ -65,6 +91,7 @@ export class GlmAcpAgent implements Agent {
   private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
   private maxTurns: number;
   private clientCapabilities: ClientCapabilities | null = null;
+  private sessionStore: SessionStore | null;
 
   constructor(
     private connection: AgentSideConnection,
@@ -76,6 +103,10 @@ export class GlmAcpAgent implements Agent {
       Number.isFinite(candidateMaxTurns) && candidateMaxTurns > 0
         ? Math.floor(candidateMaxTurns)
         : 20;
+    this.sessionStore =
+      options.sessionStore === null
+        ? null
+        : (options.sessionStore ?? new SessionStore());
   }
 
   private get glm(): NonNullable<GlmAcpAgentOptions["glm"]> {
@@ -114,7 +145,7 @@ export class GlmAcpAgent implements Agent {
           id: "z-ai-api-key",
           name: "Z.AI API key",
           description:
-            "Set the Z_AI_API_KEY environment variable to authenticate. Generate one at https://z.ai/manage-apikey/apikey-list",
+            "Set Z_AI_API_KEY in the environment, or run `glm-acp-agent --setup` once to store the key on disk. Generate one at https://z.ai/manage-apikey/apikey-list",
         },
         {
           type: "env_var",
@@ -134,15 +165,19 @@ export class GlmAcpAgent implements Agent {
         },
       ],
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
         promptCapabilities: {
           // Baseline (text + resource_link) is implicit; we additionally accept
-          // embedded resources for inline file context.
+          // embedded resources for inline file context, plus images for
+          // vision-capable GLM models (e.g. glm-4v-plus).
           embeddedContext: true,
+          image: true,
         },
         sessionCapabilities: {
           close: {},
           list: {},
+          fork: {},
+          resume: {},
         },
       },
     };
@@ -173,6 +208,8 @@ export class GlmAcpAgent implements Agent {
         `Working directory: ${params.cwd}`,
     };
 
+    const model = getDefaultModel();
+
     this.sessions.set(sessionId, {
       cwd: params.cwd,
       messages: [systemPrompt],
@@ -180,9 +217,45 @@ export class GlmAcpAgent implements Agent {
       promptPromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
+      model,
     });
 
-    return { sessionId };
+    return {
+      sessionId,
+      models: this.modelsState(model),
+    };
+  }
+
+  async unstable_setSessionModel(
+    params: SetSessionModelRequest
+  ): Promise<SetSessionModelResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${params.sessionId}`);
+    }
+    const available = getAvailableModels();
+    const known = available.find((m) => m.modelId === params.modelId);
+    if (!known) {
+      // Allow the caller to pick any model id even if not in the curated list
+      // (Z.AI may offer models we haven't catalogued), but log a stderr hint.
+      process.stderr.write(
+        `[glm-acp-agent] warning: model "${params.modelId}" is not in the advertised list; using as-is.\n`
+      );
+    }
+    session.model = params.modelId;
+    session.updatedAt = new Date().toISOString();
+    return {};
+  }
+
+  /** Build the SessionModelState we advertise on session create/load/resume/fork. */
+  private modelsState(currentModelId: string): {
+    availableModels: ModelInfo[];
+    currentModelId: string;
+  } {
+    return {
+      availableModels: getAvailableModels(),
+      currentModelId,
+    };
   }
 
   async setSessionMode(
@@ -231,10 +304,14 @@ export class GlmAcpAgent implements Agent {
       abortController.abort();
     }
 
-    // Convert ACP content blocks into a GLM user message.
-    // Baseline: text + resource_link. Optional: embedded resources (text only).
-    const userText = renderPromptBlocks(params.prompt);
-    session.messages.push({ role: "user", content: userText });
+    // Convert ACP content blocks into a GLM user message. Baseline: text +
+    // resource_link. Optional: embedded resources, plus image blocks (forwarded
+    // as OpenAI-shaped data-URL parts so vision-capable GLM models like
+    // glm-4v-plus can ingest them).
+    const { content: userContent, plainText: userText } = renderPromptBlocks(
+      params.prompt
+    );
+    session.messages.push({ role: "user", content: userContent });
 
     // Echo back the client-supplied messageId on every response (success,
     // cancelled, or error) so the client can correlate the turn.
@@ -274,6 +351,8 @@ export class GlmAcpAgent implements Agent {
           ...titleUpdate,
         },
       });
+
+      this.persistSession(params.sessionId, session);
 
       const response: PromptResponse = { stopReason };
       if (usage) response.usage = usage;
@@ -316,15 +395,46 @@ export class GlmAcpAgent implements Agent {
   async closeSession(params: CloseSessionRequest): Promise<void> {
     const session = this.sessions.get(params.sessionId);
     session?.abortController?.abort();
+    if (session) {
+      // Persist final state on close so a subsequent loadSession/resume can
+      // pick the conversation back up. closeSession only releases in-memory
+      // resources; the on-disk record is intentionally retained.
+      this.persistSession(params.sessionId, session);
+    }
     this.sessions.delete(params.sessionId);
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    const allSessions = Array.from(this.sessions.entries());
+    // Merge in-memory sessions with anything previously persisted to disk. The
+    // store is the source of truth for closed/restarted sessions; in-memory
+    // state takes precedence when both exist (it has the freshest title /
+    // updatedAt before persistence has fired).
+    const merged = new Map<
+      string,
+      { cwd: string; title: string | null; updatedAt: string }
+    >();
 
+    if (this.sessionStore) {
+      for (const persisted of this.sessionStore.list()) {
+        merged.set(persisted.sessionId, {
+          cwd: persisted.cwd,
+          title: persisted.title,
+          updatedAt: persisted.updatedAt,
+        });
+      }
+    }
+    for (const [sessionId, s] of this.sessions) {
+      merged.set(sessionId, {
+        cwd: s.cwd,
+        title: s.title,
+        updatedAt: s.updatedAt,
+      });
+    }
+
+    const all = Array.from(merged.entries());
     const filtered = params.cwd
-      ? allSessions.filter(([, s]) => s.cwd === params.cwd)
-      : allSessions;
+      ? all.filter(([, s]) => s.cwd === params.cwd)
+      : all;
 
     return {
       sessions: filtered.map(([sessionId, s]) => ({
@@ -334,6 +444,170 @@ export class GlmAcpAgent implements Agent {
         updatedAt: s.updatedAt,
       })),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Session load / fork / resume
+  // ---------------------------------------------------------------------------
+
+  async loadSession(
+    params: import("@agentclientprotocol/sdk").LoadSessionRequest
+  ): Promise<import("@agentclientprotocol/sdk").LoadSessionResponse> {
+    const persisted = this.requirePersisted(params.sessionId);
+
+    // Restore in-memory state. We do NOT carry over the abortController /
+    // promptPromise — those are transient.
+    const restored: SessionState = {
+      cwd: params.cwd,
+      messages: persisted.messages,
+      abortController: null,
+      promptPromise: null,
+      title: persisted.title,
+      updatedAt: persisted.updatedAt,
+      model: persisted.model,
+    };
+    this.sessions.set(params.sessionId, restored);
+
+    // Replay user/assistant text turns so the client can rehydrate its UI.
+    // Tool / system messages are skipped — they're internal and the client
+    // doesn't render them on its own.
+    await this.replayMessages(params.sessionId, persisted.messages);
+
+    return { models: this.modelsState(persisted.model) };
+  }
+
+  async unstable_forkSession(
+    params: import("@agentclientprotocol/sdk").ForkSessionRequest
+  ): Promise<import("@agentclientprotocol/sdk").ForkSessionResponse> {
+    const source = this.sessions.get(params.sessionId);
+    const persisted = source
+      ? this.snapshot(params.sessionId, source)
+      : this.requirePersisted(params.sessionId);
+
+    const newSessionId = randomUUID();
+    const forkedTitle =
+      persisted.title === null ? null : `${persisted.title} (fork)`;
+    const forked: SessionState = {
+      cwd: params.cwd,
+      // Deep-clone messages so the fork doesn't share state with the parent.
+      messages: JSON.parse(JSON.stringify(persisted.messages)) as GlmMessage[],
+      abortController: null,
+      promptPromise: null,
+      title: forkedTitle,
+      updatedAt: new Date().toISOString(),
+      model: persisted.model,
+    };
+    this.sessions.set(newSessionId, forked);
+    this.persistSession(newSessionId, forked);
+
+    return {
+      sessionId: newSessionId,
+      models: this.modelsState(forked.model),
+    };
+  }
+
+  async resumeSession(
+    params: import("@agentclientprotocol/sdk").ResumeSessionRequest
+  ): Promise<import("@agentclientprotocol/sdk").ResumeSessionResponse> {
+    const persisted = this.requirePersisted(params.sessionId);
+
+    const restored: SessionState = {
+      cwd: params.cwd,
+      messages: persisted.messages,
+      abortController: null,
+      promptPromise: null,
+      title: persisted.title,
+      updatedAt: persisted.updatedAt,
+      model: persisted.model,
+    };
+    this.sessions.set(params.sessionId, restored);
+
+    // Resume does NOT replay history — the client keeps its own UI state and
+    // just wants the agent to pick up where it left off.
+    return { models: this.modelsState(persisted.model) };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence helpers
+  // ---------------------------------------------------------------------------
+
+  private snapshot(sessionId: string, session: SessionState): PersistedSession {
+    return {
+      sessionId,
+      cwd: session.cwd,
+      messages: session.messages,
+      title: session.title,
+      updatedAt: session.updatedAt,
+      model: session.model,
+    };
+  }
+
+  private persistSession(sessionId: string, session: SessionState): void {
+    if (!this.sessionStore) return;
+    try {
+      this.sessionStore.save(this.snapshot(sessionId, session));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[glm-acp-agent] warning: failed to persist session ${sessionId}: ${msg}\n`
+      );
+    }
+  }
+
+  private requirePersisted(sessionId: string): PersistedSession {
+    if (!this.sessionStore) {
+      throw new Error("Session persistence is disabled");
+    }
+    const persisted = this.sessionStore.load(sessionId);
+    if (!persisted) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    return persisted;
+  }
+
+  private async replayMessages(
+    sessionId: string,
+    messages: GlmMessage[]
+  ): Promise<void> {
+    for (const msg of messages) {
+      if (msg.role === "user") {
+        const text = stringifyUserMessage(msg.content);
+        if (text.length === 0) continue;
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text },
+          },
+        });
+      } else if (msg.role === "assistant") {
+        const content = msg.content;
+        const text =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .filter(
+                    (p): p is { type: "text"; text: string } =>
+                      typeof p === "object" &&
+                      p !== null &&
+                      (p as { type?: unknown }).type === "text" &&
+                      typeof (p as { text?: unknown }).text === "string"
+                  )
+                  .map((p) => p.text)
+                  .join("")
+              : "";
+        if (text.length === 0) continue;
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        });
+      }
+      // system / tool messages are not replayed — they're internal.
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -371,8 +645,11 @@ export class GlmAcpAgent implements Agent {
       let assistantText = "";
       let lastStopReason: string | undefined;
 
-      // Stream the GLM response.
-      for await (const chunk of this.glm.streamChat(session.messages, signal)) {
+      // Stream the GLM response. The session's currently-selected model wins;
+      // it's mutated by `unstable_setSessionModel` between turns.
+      for await (const chunk of this.glm.streamChat(session.messages, signal, {
+        model: session.model,
+      })) {
         if (signal.aborted) return { stopReason: "cancelled" };
 
         if (chunk.thinking) {
@@ -490,37 +767,97 @@ export class GlmAcpAgent implements Agent {
   }
 }
 
-/** Render a list of ACP content blocks into a single user message string. */
-function renderPromptBlocks(blocks: PromptRequest["prompt"]): string {
-  const parts: string[] = [];
+/** OpenAI-shaped content part for multimodal user messages. */
+type UserContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+/**
+ * Render a list of ACP content blocks into a GLM user message.
+ *
+ * When the prompt contains only text/resource blocks we return a plain string
+ * (the broadest-compatible shape). When at least one image block is present
+ * we switch to OpenAI's multimodal array shape so vision-capable GLM models
+ * receive the image as a data URL.
+ *
+ * `plainText` always contains the text-only flattening of the prompt and is
+ * used by the agent to derive a session title.
+ */
+function renderPromptBlocks(blocks: PromptRequest["prompt"]): {
+  content: string | UserContentPart[];
+  plainText: string;
+} {
+  const textParts: string[] = [];
+  const imageParts: UserContentPart[] = [];
+
   for (const block of blocks) {
     switch (block.type) {
       case "text":
-        parts.push(block.text);
+        textParts.push(block.text);
         break;
       case "resource_link":
-        parts.push(`[${block.name}](${block.uri})`);
+        textParts.push(`[${block.name}](${block.uri})`);
         break;
       case "resource": {
         const res = block.resource;
         if ("text" in res && typeof res.text === "string") {
-          parts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
+          textParts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
         } else if ("blob" in res) {
           // Binary resources can't be inlined into a chat message; keep a link
           // reference so the model knows it exists.
-          parts.push(`[binary resource](${res.uri})`);
+          textParts.push(`[binary resource](${res.uri})`);
         }
         break;
       }
-      case "image":
+      case "image": {
+        const dataUrl = `data:${block.mimeType};base64,${block.data}`;
+        imageParts.push({ type: "image_url", image_url: { url: dataUrl } });
+        break;
+      }
       case "audio":
-        // We don't advertise image/audio capabilities, but defensively render
-        // a placeholder so a misbehaving client doesn't crash the agent.
-        parts.push(`[unsupported ${block.type} block]`);
+        textParts.push("[unsupported audio block]");
         break;
       default:
-        // Future block types: best-effort placeholder.
-        parts.push(`[unknown block type ${(block as { type: string }).type}]`);
+        textParts.push(`[unknown block type ${(block as { type: string }).type}]`);
+    }
+  }
+
+  const plainText = textParts.join("\n");
+
+  if (imageParts.length === 0) {
+    return { content: plainText, plainText };
+  }
+
+  // Multimodal: combine text + images. OpenAI requires at least one part, so
+  // we always include the text part (even when empty, the array form is valid).
+  const content: UserContentPart[] = [];
+  if (plainText.length > 0) {
+    content.push({ type: "text", text: plainText });
+  }
+  content.push(...imageParts);
+  return { content, plainText };
+}
+
+/**
+ * Flatten the `content` of a user message into a plain string for replay.
+ *
+ * Multimodal user messages (text + image parts) are rendered as their text
+ * portions only; images are noted with a placeholder so the client knows
+ * something visual was there but doesn't try to re-render an opaque
+ * `image_url` part it never produced.
+ */
+function stringifyUserMessage(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part !== "object" || part === null) continue;
+    const type = (part as { type?: unknown }).type;
+    if (type === "text") {
+      const text = (part as { text?: unknown }).text;
+      if (typeof text === "string") parts.push(text);
+    } else if (type === "image_url") {
+      parts.push("[image]");
     }
   }
   return parts.join("\n");

@@ -1,7 +1,8 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
-import type { Usage } from "@agentclientprotocol/sdk";
+import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
+import { resolveApiKey } from "./credentials.js";
 
 /**
  * A single message in the GLM conversation history.
@@ -30,11 +31,76 @@ export interface GlmStreamChunk {
   stopReason?: string;
 }
 
+/** Options applied to a single `streamChat` call. */
+export interface StreamChatOptions {
+  /** GLM model identifier to use for this call. */
+  model: string;
+}
+
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API. */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4";
 
-/** Default GLM model. */
-const DEFAULT_MODEL = "glm-5.1";
+/** Default GLM model when neither client nor user has chosen one. */
+export const DEFAULT_MODEL = "glm-5.1";
+
+/**
+ * Curated list of GLM models the agent advertises to ACP clients via
+ * `SessionModelState.availableModels`. Users can override this list via the
+ * `ACP_GLM_AVAILABLE_MODELS` environment variable (comma-separated model ids).
+ *
+ * The descriptions are intentionally short — clients render them in compact
+ * model pickers.
+ */
+const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
+  {
+    modelId: "glm-5.1",
+    name: "GLM-5.1",
+    description: "Latest GLM reasoning model with thinking mode",
+  },
+  {
+    modelId: "glm-4.6",
+    name: "GLM-4.6",
+    description: "General-purpose reasoning model",
+  },
+  {
+    modelId: "glm-4.5",
+    name: "GLM-4.5",
+    description: "Stable production model",
+  },
+  {
+    modelId: "glm-4.5-air",
+    name: "GLM-4.5 Air",
+    description: "Lightweight, lower-latency model",
+  },
+  {
+    modelId: "glm-4v-plus",
+    name: "GLM-4V Plus",
+    description: "Vision-capable multimodal model",
+  },
+];
+
+/**
+ * Resolve the list of advertised models, allowing the user to override the
+ * built-in list via `ACP_GLM_AVAILABLE_MODELS`.
+ */
+export function getAvailableModels(): ModelInfo[] {
+  const override = process.env["ACP_GLM_AVAILABLE_MODELS"];
+  if (!override) return BUILTIN_AVAILABLE_MODELS;
+  const ids = override
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (ids.length === 0) return BUILTIN_AVAILABLE_MODELS;
+  return ids.map((id) => {
+    const builtin = BUILTIN_AVAILABLE_MODELS.find((m) => m.modelId === id);
+    return builtin ?? { modelId: id, name: id };
+  });
+}
+
+/** Default model for new sessions: env override → built-in default. */
+export function getDefaultModel(): string {
+  return process.env["ACP_GLM_MODEL"] ?? DEFAULT_MODEL;
+}
 
 /**
  * Wrapper around the OpenAI-compatible Zhipu AI (Z.AI) API.
@@ -46,22 +112,18 @@ const DEFAULT_MODEL = "glm-5.1";
  */
 export class GlmClient {
   private client: OpenAI;
-  private model: string;
   private maxTokens: number;
-  private thinkingEnabled: boolean;
 
   constructor() {
-    const apiKey = process.env["Z_AI_API_KEY"];
+    const apiKey = resolveApiKey();
     if (!apiKey) {
       throw new Error(
-        "Z_AI_API_KEY environment variable is required but not set."
+        "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
       );
     }
 
-    this.model = process.env["ACP_GLM_MODEL"] ?? DEFAULT_MODEL;
     const baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
     this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 8192);
-    this.thinkingEnabled = parseThinking(this.model);
 
     this.client = new OpenAI({ apiKey, baseURL });
   }
@@ -75,8 +137,11 @@ export class GlmClient {
    */
   async *streamChat(
     messages: GlmMessage[],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: StreamChatOptions
   ): AsyncGenerator<GlmStreamChunk> {
+    const model = options?.model ?? getDefaultModel();
+    const thinkingEnabled = parseThinking(model);
     const tools: ChatCompletionTool[] = TOOL_DEFINITIONS.map((t) => ({
       type: "function" as const,
       function: {
@@ -89,13 +154,13 @@ export class GlmClient {
     // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
     // that to pass GLM-specific fields like `thinking`.
     const extraBody: Record<string, unknown> = {};
-    if (this.thinkingEnabled) {
+    if (thinkingEnabled) {
       extraBody["thinking"] = { type: "enabled" };
     }
 
     const stream = await this.client.chat.completions.create(
       {
-        model: this.model,
+        model,
         messages,
         tools,
         tool_choice: "auto",
