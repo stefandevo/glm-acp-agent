@@ -192,9 +192,11 @@ export class GlmClient {
       }
     }
 
-    // Flush any assembled tool calls and emit a final done chunk.
+    // Flush any assembled tool calls and emit a final done chunk. Only emit
+    // calls that have both an id and a name – partial entries can be left
+    // behind by upstream errors and would just confuse the agent loop.
     for (const [, tc] of pendingToolCalls) {
-      if (tc.id || tc.name || tc.arguments) yield { toolCall: tc };
+      if (tc.id && tc.name) yield { toolCall: tc };
     }
     pendingToolCalls.clear();
 

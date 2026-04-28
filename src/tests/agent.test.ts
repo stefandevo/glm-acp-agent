@@ -294,16 +294,21 @@ test("prompt loop returns max_turn_requests after exhausting tool turns", async 
 
 test("prompt cancellation returns cancelled stop reason", async () => {
   const conn = createConnectionStub();
+  // Latches that make the cancel point deterministic: the test waits until
+  // the model has yielded at least one chunk before calling cancel, and the
+  // model waits for the cancel signal to fire before completing.
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((r) => (resolveStarted = r));
+
   const glm = {
     async *streamChat(_msgs: unknown, signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
       yield { text: "starting..." };
-      // simulate awaiting more tokens; signal will fire
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      if (signal?.aborted) {
-        yield { done: true, stopReason: "stop" };
-        return;
-      }
-      yield { text: "more" };
+      resolveStarted();
+      // Suspend until cancellation fires.
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
       yield { done: true, stopReason: "stop" };
     },
   };
@@ -314,10 +319,13 @@ test("prompt cancellation returns cancelled stop reason", async () => {
   const promptPromise = agent.prompt({
     sessionId,
     prompt: [{ type: "text", text: "hi" }],
+    messageId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
   });
+  await started;
   await agent.cancel({ sessionId });
   const result = await promptPromise;
   assert.equal(result.stopReason, "cancelled");
+  assert.equal(result.userMessageId, "abcd1234-abcd-abcd-abcd-abcdabcd1234");
 });
 
 test("prompt echoes userMessageId and reports usage", async () => {
@@ -435,4 +443,61 @@ test("prompt without title sets title from first user message", async () => {
 
   const list = await agent.listSessions({});
   assert.ok(list.sessions[0]?.title?.includes("How do I write a TypeScript function?"));
+});
+
+test("a follow-up prompt waits for the previous loop to fully unwind", async () => {
+  const conn = createConnectionStub();
+
+  // The first call suspends until aborted; the second one must not start
+  // until the first has fully exited.
+  let firstStartedResolve!: () => void;
+  const firstStarted = new Promise<void>((r) => (firstStartedResolve = r));
+  let firstReturned = false;
+  let secondStartedBeforeFirstReturned = false;
+  let callCount = 0;
+
+  const glm = {
+    async *streamChat(_msgs: unknown, signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      if (callCount === 1) {
+        yield { text: "first" };
+        firstStartedResolve();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        // simulate some unwinding work
+        await new Promise<void>((r) => setImmediate(r));
+        firstReturned = true;
+        yield { done: true, stopReason: "stop" };
+      } else {
+        if (!firstReturned) secondStartedBeforeFirstReturned = true;
+        yield { text: "second" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "go 1" }] });
+  await firstStarted;
+  const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "go 2" }] });
+
+  const [r1, r2] = await Promise.all([first, second]);
+  assert.equal(r1.stopReason, "cancelled");
+  assert.equal(r2.stopReason, "end_turn");
+  assert.equal(secondStartedBeforeFirstReturned, false);
+});
+
+test("invalid maxTurns falls back to the default", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+
+  for (const bad of [0, -1, NaN, Number.POSITIVE_INFINITY]) {
+    const agent = new GlmAcpAgent(conn as never, { glm: { ...glm }, maxTurns: bad });
+    assert.equal((agent as unknown as { maxTurns: number }).maxTurns, 20);
+  }
 });

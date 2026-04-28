@@ -164,15 +164,20 @@ test("end-to-end cancellation via session/cancel notification", async () => {
   const { a, b } = pairedStreams();
   const stub = new StubClient();
 
+  // The stub yields one chunk, signals via `started`, then suspends until the
+  // abort signal fires. This makes the cancel point deterministic without
+  // any reliance on setTimeout pacing.
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((r) => (resolveStarted = r));
+
   const glm = {
     async *streamChat(_messages: unknown, signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
       yield { text: "starting" };
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      if (signal?.aborted) {
-        yield { done: true, stopReason: "stop" };
-        return;
-      }
-      yield { text: "more" };
+      resolveStarted();
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
       yield { done: true, stopReason: "stop" };
     },
   };
@@ -191,7 +196,7 @@ test("end-to-end cancellation via session/cancel notification", async () => {
     sessionId: session.sessionId,
     prompt: [{ type: "text", text: "go" }],
   });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await started;
   await clientConn.cancel({ sessionId: session.sessionId });
   const result = await promptPromise;
   assert.equal(result.stopReason, "cancelled");

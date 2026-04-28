@@ -30,6 +30,12 @@ interface SessionState {
   cwd: string;
   messages: GlmMessage[];
   abortController: AbortController | null;
+  /**
+   * Promise that resolves once the currently-running prompt loop has fully
+   * unwound. Tracking this lets a follow-up prompt wait for the previous loop
+   * to observe its abort before mutating shared session state.
+   */
+  promptPromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
 }
@@ -65,7 +71,11 @@ export class GlmAcpAgent implements Agent {
     options: GlmAcpAgentOptions = {}
   ) {
     this._glm = options.glm ?? null;
-    this.maxTurns = options.maxTurns ?? 20;
+    const candidateMaxTurns = options.maxTurns ?? 20;
+    this.maxTurns =
+      Number.isFinite(candidateMaxTurns) && candidateMaxTurns > 0
+        ? Math.floor(candidateMaxTurns)
+        : 20;
   }
 
   private get glm(): NonNullable<GlmAcpAgentOptions["glm"]> {
@@ -158,6 +168,7 @@ export class GlmAcpAgent implements Agent {
       cwd: params.cwd,
       messages: [systemPrompt],
       abortController: null,
+      promptPromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
     });
@@ -185,8 +196,20 @@ export class GlmAcpAgent implements Agent {
 
     // The ACP spec serializes prompts per-session – the client should not send
     // a new prompt while another is running. Defensively cancel any stale
-    // controller.
-    session.abortController?.abort();
+    // controller and wait for the previous loop to fully unwind so it stops
+    // mutating session.messages or emitting updates before we start the new
+    // one.
+    if (session.abortController) {
+      session.abortController.abort();
+    }
+    if (session.promptPromise) {
+      try {
+        await session.promptPromise;
+      } catch {
+        // The previous loop's failure is already reported back to its caller.
+      }
+    }
+
     const abortController = new AbortController();
     session.abortController = abortController;
 
@@ -203,6 +226,15 @@ export class GlmAcpAgent implements Agent {
     // Baseline: text + resource_link. Optional: embedded resources (text only).
     const userText = renderPromptBlocks(params.prompt);
     session.messages.push({ role: "user", content: userText });
+
+    // Echo back the client-supplied messageId on every response (success,
+    // cancelled, or error) so the client can correlate the turn.
+    const userMessageId = params.messageId ?? undefined;
+
+    let resolvePromptPromise!: () => void;
+    session.promptPromise = new Promise<void>((resolve) => {
+      resolvePromptPromise = resolve;
+    });
 
     try {
       const { stopReason, usage } = await this.runPromptLoop(
@@ -236,14 +268,16 @@ export class GlmAcpAgent implements Agent {
 
       const response: PromptResponse = { stopReason };
       if (usage) response.usage = usage;
-      if (params.messageId) response.userMessageId = params.messageId;
+      if (userMessageId) response.userMessageId = userMessageId;
       return response;
     } catch (err) {
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted) {
         session.abortController = null;
-        return { stopReason: "cancelled" };
+        const cancelled: PromptResponse = { stopReason: "cancelled" };
+        if (userMessageId) cancelled.userMessageId = userMessageId;
+        return cancelled;
       }
       session.abortController = null;
       // Surface the error to the user as an agent message so the IDE displays
@@ -259,6 +293,9 @@ export class GlmAcpAgent implements Agent {
       throw err;
     } finally {
       connSignal?.removeEventListener("abort", onConnectionClose);
+      // Always resolve the promptPromise so a subsequent prompt can proceed.
+      session.promptPromise = null;
+      resolvePromptPromise();
     }
   }
 

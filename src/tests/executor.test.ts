@@ -269,3 +269,77 @@ test("list_files rejects empty path", async () => {
   const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "" }));
   assert.match(result.content, /non-empty string/);
 });
+
+// ---------------------------------------------------------------------------
+// Permission transport errors
+// ---------------------------------------------------------------------------
+
+test("write_file converts requestPermission transport errors into a failed tool result", async () => {
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    async sessionUpdate(payload: Record<string, unknown>) {
+      this.updates.push(payload);
+    },
+    async writeTextFile() {
+      throw new Error("should not be called");
+    },
+    async requestPermission(): Promise<never> {
+      throw new Error("connection lost");
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "write_file",
+    JSON.stringify({ path: "/y.txt", content: "data" })
+  );
+  assert.match(result.content, /requesting permission.*connection lost/i);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("run_command converts requestPermission transport errors into a failed tool result", async () => {
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    async sessionUpdate(payload: Record<string, unknown>) {
+      this.updates.push(payload);
+    },
+    async createTerminal() {
+      throw new Error("should not be called");
+    },
+    async requestPermission(): Promise<never> {
+      throw new Error("connection lost");
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "echo hi" })
+  );
+  assert.match(result.content, /requesting permission.*connection lost/i);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// Whitespace path normalization
+// ---------------------------------------------------------------------------
+
+test("read_file rejects whitespace-only paths", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "   " }));
+  assert.match(result.content, /path.*required/);
+});
+
+test("write_file rejects whitespace-only paths", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "write_file",
+    JSON.stringify({ path: " \t\n", content: "x" })
+  );
+  assert.match(result.content, /path.*required/);
+});

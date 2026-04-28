@@ -140,3 +140,25 @@ test("constructor throws if Z_AI_API_KEY is missing", () => {
     if (old !== undefined) process.env["Z_AI_API_KEY"] = old;
   }
 });
+
+test("streamChat does not flush partial tool calls (missing id or name)", async () => {
+  // Stream a tool_call delta that only contains arguments – no id, no name.
+  // The client should silently drop the partial entry instead of yielding it.
+  const stream = fakeStream([
+    {
+      choices: [
+        {
+          delta: { tool_calls: [{ index: 0, function: { arguments: '{"foo":1}' } }] },
+          finish_reason: null,
+        },
+      ],
+    },
+    { choices: [{ delta: {}, finish_reason: "stop" }] },
+  ]);
+  const c = makeClient(stream);
+  const calls: Array<{ id: string; name: string }> = [];
+  for await (const chunk of c.streamChat([])) {
+    if (chunk.toolCall) calls.push({ id: chunk.toolCall.id, name: chunk.toolCall.name });
+  }
+  assert.equal(calls.length, 0);
+});

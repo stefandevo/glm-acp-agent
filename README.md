@@ -175,7 +175,8 @@ src/
 └── tests/
     ├── agent.test.ts         # Protocol-level tests for GlmAcpAgent
     ├── executor.test.ts      # Tests for ToolExecutor
-    └── glm-client.test.ts    # Tests for streaming / tool-call assembly
+    ├── glm-client.test.ts    # Tests for streaming / tool-call assembly
+    └── integration.test.ts   # End-to-end tests over the real ACP ndjson transport
 ```
 
 ---

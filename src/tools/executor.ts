@@ -105,7 +105,7 @@ export class ToolExecutor {
     );
     if (cap) return cap;
 
-    const path = String(args["path"] ?? "");
+    const path = String(args["path"] ?? "").trim();
     if (!path) {
       return this.failAndReturn(toolCallId, "read_file", args, "Error: `path` is required.");
     }
@@ -161,7 +161,7 @@ export class ToolExecutor {
     );
     if (cap) return cap;
 
-    const path = String(args["path"] ?? "");
+    const path = String(args["path"] ?? "").trim();
     const content = String(args["content"] ?? "");
     if (!path) {
       return this.failAndReturn(toolCallId, "write_file", args, "Error: `path` is required.");
@@ -181,22 +181,30 @@ export class ToolExecutor {
       },
     });
 
-    // Step 2: request user permission.
-    const permissionResponse = await this.connection.requestPermission({
-      sessionId: this.sessionId,
-      toolCall: {
-        toolCallId,
-        title: `Write file: ${path}`,
-        kind: "edit",
-        status: "pending",
-        locations: [{ path }],
-        rawInput: args,
-      },
-      options: [
-        { kind: "allow_once", name: "Allow write", optionId: "allow" },
-        { kind: "reject_once", name: "Skip write", optionId: "reject" },
-      ],
-    });
+    // Step 2: request user permission. Treat transport failures here as a
+    // failed tool call instead of letting them escape and abort the loop.
+    let permissionResponse;
+    try {
+      permissionResponse = await this.connection.requestPermission({
+        sessionId: this.sessionId,
+        toolCall: {
+          toolCallId,
+          title: `Write file: ${path}`,
+          kind: "edit",
+          status: "pending",
+          locations: [{ path }],
+          rawInput: args,
+        },
+        options: [
+          { kind: "allow_once", name: "Allow write", optionId: "allow" },
+          { kind: "reject_once", name: "Skip write", optionId: "reject" },
+        ],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error requesting permission: ${message}` };
+    }
 
     if (permissionResponse.outcome.outcome === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
@@ -357,22 +365,30 @@ export class ToolExecutor {
       },
     });
 
-    // Step 2: request permission.
-    const permissionResponse = await this.connection.requestPermission({
-      sessionId: this.sessionId,
-      toolCall: {
-        toolCallId,
-        title: `Run command: ${command}`,
-        kind: "execute",
-        status: "pending",
-        locations: [],
-        rawInput: args,
-      },
-      options: [
-        { kind: "allow_once", name: "Run command", optionId: "allow" },
-        { kind: "reject_once", name: "Skip command", optionId: "reject" },
-      ],
-    });
+    // Step 2: request permission. Transport failures here become a failed
+    // tool call so the agent loop can continue.
+    let permissionResponse;
+    try {
+      permissionResponse = await this.connection.requestPermission({
+        sessionId: this.sessionId,
+        toolCall: {
+          toolCallId,
+          title: `Run command: ${command}`,
+          kind: "execute",
+          status: "pending",
+          locations: [],
+          rawInput: args,
+        },
+        options: [
+          { kind: "allow_once", name: "Run command", optionId: "allow" },
+          { kind: "reject_once", name: "Skip command", optionId: "reject" },
+        ],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error requesting permission: ${message}` };
+    }
 
     if (permissionResponse.outcome.outcome === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
