@@ -93,4 +93,51 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description:
+        "Search the web using Z.AI's search engine and return a list of relevant results including titles, URLs, and content summaries.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query.",
+          },
+          count: {
+            type: "integer",
+            description: "Number of results to return (1–50). Default is 10.",
+            minimum: 1,
+            maximum: 50,
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_reader",
+      description:
+        "Fetch and parse the content of a web page at the given URL, returning the main text content in markdown or plain-text format.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "The URL of the page to read.",
+          },
+          return_format: {
+            type: "string",
+            description: "Return format: 'markdown' (default) or 'text'.",
+            enum: ["markdown", "text"],
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
 ];

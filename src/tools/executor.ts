@@ -44,6 +44,10 @@ export class ToolExecutor {
         return this.listFiles(toolCallId, args);
       case "run_command":
         return this.runCommand(toolCallId, args);
+      case "web_search":
+        return this.webSearch(toolCallId, args);
+      case "web_reader":
+        return this.webReader(toolCallId, args);
       default:
         return { content: `Error: unknown tool "${toolName}"` };
     }
@@ -366,6 +370,184 @@ export class ToolExecutor {
       return { content: `Error running command: ${message}` };
     } finally {
       await terminal?.release();
+    }
+  }
+
+  private async webSearch(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const query = String(args["query"] ?? "");
+    const count = typeof args["count"] === "number" ? args["count"] : undefined;
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Web search: ${query}`,
+        kind: "read",
+        status: "pending",
+        locations: [],
+        rawInput: args,
+      },
+    });
+
+    try {
+      const apiKey = process.env["Z_AI_API_KEY"];
+      if (!apiKey) {
+        throw new Error("Z_AI_API_KEY environment variable is required but not set.");
+      }
+      const body: Record<string, unknown> = {
+        search_engine: "search-prime",
+        search_query: query,
+      };
+      if (count !== undefined) body["count"] = count;
+
+      const response = await fetch("https://api.z.ai/api/paas/v4/web_search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json() as {
+        search_result?: Array<{
+          title?: string;
+          link?: string;
+          content?: string;
+          media?: string;
+          publish_date?: string;
+        }>;
+      };
+
+      const results = data.search_result ?? [];
+      const formatted = results
+        .map((r, i) => {
+          const lines = [`[${i + 1}] ${r.title ?? "(no title)"}`];
+          if (r.link) lines.push(`URL: ${r.link}`);
+          if (r.media) lines.push(`Source: ${r.media}`);
+          if (r.publish_date) lines.push(`Date: ${r.publish_date}`);
+          if (r.content) lines.push(`Summary: ${r.content}`);
+          return lines.join("\n");
+        })
+        .join("\n\n");
+
+      const output = formatted || "No results found.";
+
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          rawOutput: { resultCount: results.length },
+        },
+      });
+
+      return { content: output };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "error",
+          rawOutput: { error: message },
+        },
+      });
+      return { content: `Error performing web search: ${message}` };
+    }
+  }
+
+  private async webReader(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const url = String(args["url"] ?? "");
+    const returnFormat = String(args["return_format"] ?? "markdown");
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Read URL: ${url}`,
+        kind: "read",
+        status: "pending",
+        locations: [{ path: url }],
+        rawInput: args,
+      },
+    });
+
+    try {
+      const apiKey = process.env["Z_AI_API_KEY"];
+      if (!apiKey) {
+        throw new Error("Z_AI_API_KEY environment variable is required but not set.");
+      }
+
+      const response = await fetch("https://api.z.ai/api/paas/v4/reader", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ url, return_format: returnFormat }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json() as {
+        reader_result?: {
+          title?: string;
+          description?: string;
+          url?: string;
+          content?: string;
+        };
+      };
+
+      const result = data.reader_result;
+      const lines: string[] = [];
+      if (result?.title) lines.push(`# ${result.title}`);
+      if (result?.url) lines.push(`URL: ${result.url}`);
+      if (result?.description) lines.push(`\n${result.description}`);
+      if (result?.content) lines.push(`\n${result.content}`);
+      const output = lines.join("\n") || "No content returned.";
+
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          rawOutput: { title: result?.title, url: result?.url },
+        },
+      });
+
+      return { content: output };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "error",
+          rawOutput: { error: message },
+        },
+      });
+      return { content: `Error reading URL: ${message}` };
     }
   }
 }
