@@ -29,7 +29,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Tool calling** – agentic loop with up to 20 turns of GLM function calling
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
-- **Image input** – `promptCapabilities.image` is advertised; image content blocks are forwarded as data-URL parts so vision-capable models (e.g. `glm-4v-plus`) can ingest them
+- **Image input via Coding Plan Vision MCP** – `promptCapabilities.image` is advertised; pasted ACP image blocks are routed through Z.AI Vision MCP (`@z_ai/mcp-server`) and the resulting analysis is fed into the main coding model. Direct chat-image (e.g. `glm-4v-plus`) calls are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
 - **Capability-aware** – every tool is gated on the client capabilities advertised at `initialize` time; tools the client can't run return a clear error to the model instead of crashing
@@ -48,17 +48,18 @@ ACP Client (IDE plugin, CLI, …)
         ▼
   GlmAcpAgent          ← ACP protocol layer  (src/protocol/)
         │
-        ├─ GlmClient   ← Z.AI / Zhipu AI Chat Completions  (src/llm/)
-        │    └─ streams chat completions with tool schemas
+        ├─ GlmClient   ← Z.AI / Zhipu AI Coding Plan Chat Completions  (src/llm/)
         │
-        └─ ToolExecutor ← executes tool calls  (src/tools/)
-             ├─ read_file / write_file       → ACP client (fs.*)
-             ├─ list_files / run_command     → ACP client (terminal)
-             ├─ web_search                   → Z.AI Coding Plan Web Search MCP
-             └─ web_reader                   → Z.AI Coding Plan Web Reader MCP
+        ├─ ToolExecutor ← executes tool calls  (src/tools/)
+        │    ├─ read_file / write_file       → ACP client (fs.*)
+        │    ├─ list_files / run_command     → ACP client (terminal)
+        │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
+        │    └─ image_analysis               → Z.AI Coding Plan Vision MCP (stdio)
+        │
+        └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process itself only needs network access to `api.z.ai`. All file-system and shell operations are **delegated to the ACP client** — the agent never touches the local disk directly. `web_search` and `web_reader` run **inside the agent process** and call Z.AI's Coding Plan-compatible MCP servers with the same resolved API key used for model calls.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations remain delegated to the ACP client; the agent itself only writes to the OS temp directory when it needs to materialize a pasted image for Vision MCP, and those temp files are removed once the prompt completes.
 
 ---
 
@@ -72,6 +73,7 @@ The agent process itself only needs network access to `api.z.ai`. All file-syste
 | `run_command` | ACP client | `terminal` | Run an arbitrary shell command via `sh -c` (asks for permission) |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | – | Search the web — returns titles, URLs, and summaries |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | – | Fetch and parse a web page (markdown or plain text) |
+| `image_analysis` | Agent (Z.AI Vision MCP, stdio) | – | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
 
 ---
 
@@ -126,17 +128,31 @@ The key is written to `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json` (default
 
 ### Supported models
 
-Any model exposed by the Z.AI Chat Completions API can be used. Recommended choices:
+The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 
 | Model | Notes |
 |-------|-------|
 | `glm-5.1` | **Default.** Long-horizon coding model; thinking mode auto-enabled |
-| `glm-4.7` | Strong reasoning, 200K context |
-| `glm-4.6` | Faster, slightly cheaper |
-| `glm-4.5` | Cost-efficient general-purpose |
-| `glm-4-long` | Extended-context variant |
+| `glm-5-turbo` | Faster Coding Plan reasoning model |
+| `glm-4.7` | 200K-context reasoning model |
+| `glm-4.5-air` | Lightweight, lower-latency model |
+
+`ACP_GLM_AVAILABLE_MODELS` still lets you advertise custom IDs, but custom IDs sit outside the supported Coding Plan list — the Coding Plan endpoint will reject any model code Z.AI hasn't whitelisted (business code `1211`).
+
+Vision (`glm-4v-plus` etc.) is **not** advertised as a chat model: vision on the Coding Plan flows through the [Vision MCP](#vision-mcp) section below instead.
 
 When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or `glm-5.x`, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. Override with `ACP_GLM_THINKING=false` if you want plain completions only.
+
+### Vision MCP
+
+Pasted ACP image blocks are not sent to the chat-completions endpoint. Instead, the agent boots `@z_ai/mcp-server` over stdio (via `npx -y @z_ai/mcp-server@latest`) and calls its `image_analysis` tool. The text result is spliced into the user message as `<image_analysis index="N">…</image_analysis>` so the regular Coding Plan model can reason about it.
+
+Prerequisites:
+
+- `npx` on `PATH` (Node 18+ / npm 9+).
+- The same `Z_AI_API_KEY` used for chat completions; the agent forwards it to the MCP server as `Z_AI_API_KEY` plus `Z_AI_MODE=ZAI`.
+
+The model can also call `image_analysis` explicitly with `{ image_source: "/path/or/url", prompt?: "…" }`. Vision failures (missing `npx`, MCP startup, quota) are surfaced as actionable errors but never abort the prompt; an inline `<image_analysis_error>` annotation is used so the conversation can continue.
 
 ---
 
@@ -331,6 +347,7 @@ The test suite covers:
 - Permission flows for `write_file` and `run_command` (allow / reject / cancel)
 - Shell-quoted argument handling for `list_files` and `run_command`
 - GLM streaming: text deltas, `reasoning_content` deltas, multi-chunk tool-call assembly, and trailing usage
+- Image preprocessing through a mocked Vision MCP client and graceful degradation on Vision MCP failures
 
 ---
 
