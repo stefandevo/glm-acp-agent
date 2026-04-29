@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { preprocessImageBlocks } from "../protocol/image-preprocessor.js";
+import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "../protocol/image-preprocessor.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 function makeClient(impl: VisionMcpClient["callTool"]): VisionMcpClient {
@@ -77,4 +77,65 @@ test("preprocessImageBlocks skips vision when no client is given and notes the i
   assert.equal(block.type, "text");
   assert.match(block.text ?? "", /image attached \(not analyzed/i);
   assert.equal(result.cleanups.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// buildPromptBlockDiagnosticLines
+// ---------------------------------------------------------------------------
+
+test("buildPromptBlockDiagnosticLines summarizes block types without leaking base64", () => {
+  const base64Data = Buffer.from("fake image payload data").toString("base64");
+  const lines = buildPromptBlockDiagnosticLines([
+    { type: "text", text: "hello" },
+    { type: "image", data: base64Data, mimeType: "image/jpeg" },
+  ]);
+  const summary = lines[0] ?? "";
+  assert.ok(summary.includes("text×1"), "summary must count text blocks");
+  assert.ok(summary.includes("image×1"), "summary must count image blocks");
+  for (const line of lines) {
+    assert.ok(!line.includes(base64Data), "base64 payload must not appear in diagnostic output");
+  }
+  const imageLine = lines.find((l) => l.includes("image block"));
+  assert.ok(imageLine, "image block diagnostic line must be present");
+  assert.ok(imageLine!.includes("data_bytes"), "approximate byte count must be logged");
+  assert.ok(imageLine!.includes("uri=false"), "URI presence must be false when uri is absent");
+});
+
+test("buildPromptBlockDiagnosticLines logs approximate decoded byte count for base64 data", () => {
+  // 4 base64 chars ≈ 3 decoded bytes; Math.floor(4 * 0.75) = 3
+  const lines = buildPromptBlockDiagnosticLines([
+    { type: "image", data: "AAAA", mimeType: "image/png" },
+  ]);
+  const imageLine = lines.find((l) => l.includes("image block")) ?? "";
+  assert.ok(imageLine.includes("data_bytes≈3"), "should log approximate decoded byte count");
+});
+
+test("buildPromptBlockDiagnosticLines marks URI presence when uri is set", () => {
+  const lines = buildPromptBlockDiagnosticLines([
+    { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
+  ]);
+  const imageLine = lines.find((l) => l.includes("image block")) ?? "";
+  assert.ok(imageLine.includes("uri=true"), "URI presence must be true when uri is set");
+});
+
+test("buildPromptBlockDiagnosticLines logs safe URI basename for resource_link", () => {
+  const lines = buildPromptBlockDiagnosticLines([
+    { type: "resource_link", uri: "file:///home/user/private/secret-config.ts", name: "secret-config.ts" },
+  ]);
+  const rl = lines.find((l) => l.includes("resource_link block")) ?? "";
+  assert.ok(rl.length > 0, "resource_link diagnostic line must be present");
+  assert.ok(!rl.includes("/home/user/private/"), "full directory path must not appear");
+  assert.ok(rl.includes("secret-config.ts"), "basename should appear");
+});
+
+test("buildPromptBlockDiagnosticLines redacts data: URIs for resources", () => {
+  const lines = buildPromptBlockDiagnosticLines([
+    {
+      type: "resource",
+      resource: { uri: "data:text/plain;base64,SGVsbG8=", text: "Hello" },
+    },
+  ]);
+  const rl = lines.find((l) => l.includes("resource block")) ?? "";
+  assert.ok(rl.includes("data:<redacted>"), "data: URI must be redacted");
+  assert.ok(!rl.includes("SGVsbG8="), "base64 payload in data URI must not appear");
 });

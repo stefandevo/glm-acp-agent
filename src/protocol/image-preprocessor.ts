@@ -77,8 +77,64 @@ export async function preprocessImageBlocks(
   return { blocks: out, cleanups };
 }
 
+/**
+ * Build a list of safe, redacted diagnostic lines describing the inbound ACP
+ * prompt blocks. Intended for debug logging — callers must guard with
+ * `isDebugEnabled()` before calling so the string work is skipped in prod.
+ *
+ * Safety rules:
+ * - Image blocks: log MIME, URI presence, and approximate decoded byte length.
+ *   Never log the base64 payload.
+ * - Resource/resource-link blocks: log the URI scheme + path basename only
+ *   (no full paths, no query strings, no data: payloads).
+ */
+export function buildPromptBlockDiagnosticLines(blocks: ReadonlyArray<Block>): string[] {
+  const counts = new Map<string, number>();
+  for (const b of blocks) counts.set(b.type, (counts.get(b.type) ?? 0) + 1);
+
+  const lines: string[] = [
+    `prompt blocks: ${[...counts.entries()].map(([t, n]) => `${t}×${n}`).join(", ")}`,
+  ];
+
+  for (const b of blocks) {
+    if (b.type === "image") {
+      const hasUri = typeof b.uri === "string" && b.uri.length > 0;
+      // Approximate decoded byte length from base64 length to avoid overstating size.
+      const dataBytes = typeof b.data === "string" ? Math.floor(b.data.length * 0.75) : 0;
+      lines.push(`  image block: mime=${b.mimeType} uri=${hasUri} data_bytes≈${dataBytes}`);
+    } else if (b.type === "resource_link") {
+      const uriSafe = safeUriSummary(b.uri);
+      const mimePart = b.mimeType ? ` mime=${b.mimeType}` : "";
+      lines.push(`  resource_link block: name=${b.name} uri=${uriSafe}${mimePart}`);
+    } else if (b.type === "resource") {
+      const res = b.resource;
+      const uriSafe = safeUriSummary(res.uri);
+      const mimePart = res.mimeType ? ` mime=${res.mimeType}` : "";
+      lines.push(`  resource block: uri=${uriSafe}${mimePart}`);
+    }
+  }
+
+  return lines;
+}
+
 function textBlock(text: string): TextBlock {
   return { type: "text", text };
+}
+
+function safeUriSummary(uri: string): string {
+  if (uri.startsWith("data:")) return "data:<redacted>";
+  // Normalize backslashes so Windows-style paths don't mislead URL parsing.
+  const normalized = uri.replace(/\\/g, "/");
+  try {
+    const u = new URL(normalized);
+    const segments = u.pathname.split("/").filter(Boolean);
+    const basename = segments.at(-1) ?? "";
+    return `${u.protocol}//...${basename ? "/" + basename : ""}`;
+  } catch {
+    // Not a parseable URL (e.g. a bare local path without scheme).
+    const basename = normalized.split("/").filter(Boolean).at(-1) ?? normalized;
+    return `.../${basename}`;
+  }
 }
 
 function guessExtension(mime: string): string {

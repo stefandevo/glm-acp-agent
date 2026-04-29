@@ -176,6 +176,34 @@ test("initialize negotiates lower protocol version when client requests one", as
   assert.equal(result.protocolVersion, 0);
 });
 
+test("initialize advertises image: false when ACP_GLM_PROMPT_IMAGES=false", async () => {
+  const saved = process.env["ACP_GLM_PROMPT_IMAGES"];
+  try {
+    process.env["ACP_GLM_PROMPT_IMAGES"] = "false";
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    const result = await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    assert.equal(result.agentCapabilities?.promptCapabilities?.image, false);
+  } finally {
+    if (saved === undefined) delete process.env["ACP_GLM_PROMPT_IMAGES"];
+    else process.env["ACP_GLM_PROMPT_IMAGES"] = saved;
+  }
+});
+
+test("initialize advertises image: false when ACP_GLM_PROMPT_IMAGES=0", async () => {
+  const saved = process.env["ACP_GLM_PROMPT_IMAGES"];
+  try {
+    process.env["ACP_GLM_PROMPT_IMAGES"] = "0";
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    const result = await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    assert.equal(result.agentCapabilities?.promptCapabilities?.image, false);
+  } finally {
+    if (saved === undefined) delete process.env["ACP_GLM_PROMPT_IMAGES"];
+    else process.env["ACP_GLM_PROMPT_IMAGES"] = saved;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
@@ -464,6 +492,44 @@ test("the assembled system prompt remains a single system message", async () => 
     assert.equal(systemCount, 1);
   } finally {
     cleanup();
+  }
+});
+
+test("system prompt includes image_handling fallback instructions", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  assert.ok(ref.value.includes("<image_handling>"), "system prompt must contain image_handling section");
+  assert.ok(
+    ref.value.includes("image_analysis_error") || ref.value.includes("image_analysis"),
+    "image_handling must mention the known annotation tags"
+  );
+  assert.ok(
+    ref.value.toLowerCase().includes("client"),
+    "image_handling must attribute missing image to client-side problem"
+  );
+});
+
+test("image_analysis tool is still listed when ACP_GLM_PROMPT_IMAGES=false", async () => {
+  const saved = process.env["ACP_GLM_PROMPT_IMAGES"];
+  const { cwd, cleanup } = makeTempCwd();
+  try {
+    process.env["ACP_GLM_PROMPT_IMAGES"] = "false";
+    const conn = createConnectionStub();
+    const { glm, ref } = captureSystemPrompt();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+    assert.ok(ref.value.includes("image_analysis"), "image_analysis tool must remain in system prompt");
+  } finally {
+    cleanup();
+    if (saved === undefined) delete process.env["ACP_GLM_PROMPT_IMAGES"];
+    else process.env["ACP_GLM_PROMPT_IMAGES"] = saved;
   }
 });
 
