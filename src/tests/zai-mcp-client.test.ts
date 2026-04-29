@@ -55,7 +55,7 @@ test("ZaiMcpClient initializes, sends initialized, discovers tools, and calls a 
     jsonResponse({
       jsonrpc: "2.0",
       id: 2,
-      result: { tools: [{ name: "webSearchPrime" }] },
+      result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" }, result_count: { type: "number" } } } }] },
     }),
     jsonResponse({
       jsonrpc: "2.0",
@@ -90,7 +90,7 @@ test("ZaiMcpClient initializes, sends initialized, discovers tools, and calls a 
   assert.equal(calls[3]?.body.method, "tools/call");
   assert.deepEqual(calls[3]?.body.params, {
     name: "webSearchPrime",
-    arguments: { query: "glm coding plan", count: 3 },
+    arguments: { search_query: "glm coding plan", count: 3 },
   });
   assert.equal(calls[3]?.headers.get("MCP-Session-Id"), "session-123");
   assert.equal(calls[3]?.headers.get("Mcp-Method"), "tools/call");
@@ -376,4 +376,98 @@ test("ZaiMcpClient does not retry on non-tool-not-found errors", async () => {
     /Internal server error/
   );
   assert.equal(calls.length, 4);
+});
+
+test("ZaiMcpClient passes args through unchanged when arg names already match schema properties", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    jsonResponse(
+      { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18", capabilities: {} } },
+      { sessionId: "session-passthrough" }
+    ),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" } } } }] },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { content: [{ type: "text", text: "ok" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await client.callTool({
+    endpoint,
+    toolName: "webSearchPrime",
+    arguments: { search_query: "already correct" },
+    apiKey: "test-key",
+  });
+
+  assert.deepEqual(calls[3]?.body.params, {
+    name: "webSearchPrime",
+    arguments: { search_query: "already correct" },
+  });
+});
+
+test("ZaiMcpClient retries once on -32602 arg-validation error and re-discovers schema", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    // First attempt: init
+    jsonResponse(
+      { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18", capabilities: {} } },
+      { sessionId: "session-stale" }
+    ),
+    new Response(null, { status: 202 }),
+    // First attempt: tools/list returns stale schema (wrong arg name)
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { q: { type: "string" } } } }] },
+    }),
+    // First attempt: tools/call fails with -32602
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      error: { code: -32602, message: "search_query cannot be empty" },
+    }),
+    // Retry: re-initialize
+    jsonResponse(
+      { jsonrpc: "2.0", id: 4, result: { protocolVersion: "2025-06-18", capabilities: {} } },
+      { sessionId: "session-fresh" }
+    ),
+    new Response(null, { status: 202 }),
+    // Retry: tools/list returns updated schema
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 5,
+      result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" } } } }] },
+    }),
+    // Retry: tools/call succeeds with remapped args
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 6,
+      result: { content: [{ type: "text", text: "retry success" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  const result = await client.callTool({
+    endpoint,
+    toolName: "webSearchPrime",
+    arguments: { query: "test" },
+    apiKey: "test-key",
+  });
+
+  assert.deepEqual(result, { content: [{ type: "text", text: "retry success" }] });
+  assert.equal(calls.length, 8);
+  assert.equal(calls[4]?.body.method, "initialize");
+  assert.equal(calls[6]?.body.method, "tools/list");
+  // After re-discovery the alias maps query → search_query
+  assert.deepEqual(calls[7]?.body.params, {
+    name: "webSearchPrime",
+    arguments: { search_query: "test" },
+  });
 });

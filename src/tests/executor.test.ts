@@ -359,7 +359,7 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
         jsonResponse({
           jsonrpc: "2.0",
           id: 2,
-          result: { tools: [{ name: "webSearchPrime" }] },
+          result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" } } } }] },
         }),
         jsonResponse({
           jsonrpc: "2.0",
@@ -402,7 +402,7 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
         assert.equal(calls[3]?.headers.get("Mcp-Name"), "webSearchPrime");
         assert.deepEqual(calls[3]?.body.params, {
           name: "webSearchPrime",
-          arguments: { query: "glm coding plan", count: 1 },
+          arguments: { search_query: "glm coding plan", count: 1 },
         });
         const last = conn.updates.at(-1) as { update: { status?: string } };
         assert.equal(last.update.status, "completed");
