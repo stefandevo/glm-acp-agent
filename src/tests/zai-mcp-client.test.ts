@@ -271,3 +271,109 @@ test("ZaiMcpClient explains Coding Plan eligibility when Z.AI returns 1113", asy
     /Coding Plan quota\/base URL\/tool eligibility.*1113/
   );
 });
+
+test("ZaiMcpClient retries once on tool-not-found error with re-initialization", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    // First attempt: init
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", capabilities: {} },
+      },
+      { sessionId: "session-old" }
+    ),
+    new Response(null, { status: 202 }),
+    // First attempt: tools/list returns stale list
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "staleSearchTool" }] },
+    }),
+    // First attempt: tools/call fails with tool-not-found
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      error: { code: -32601, message: "Tool not found: staleSearchTool" },
+    }),
+    // Retry: re-initialize
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 4,
+        result: { protocolVersion: "2025-06-18", capabilities: {} },
+      },
+      { sessionId: "session-new" }
+    ),
+    new Response(null, { status: 202 }),
+    // Retry: tools/list returns updated list
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 5,
+      result: { tools: [{ name: "webSearchV2" }] },
+    }),
+    // Retry: tools/call succeeds
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 6,
+      result: { content: [{ type: "text", text: "retry success" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  const result = await client.callTool({
+    endpoint,
+    toolName: "webSearchPrime",
+    arguments: { query: "test" },
+    apiKey: "test-key",
+  });
+
+  assert.deepEqual(result, { content: [{ type: "text", text: "retry success" }] });
+  assert.equal(calls.length, 8);
+  assert.equal(calls[4]?.body.method, "initialize");
+  assert.equal(calls[6]?.body.method, "tools/list");
+  assert.equal(calls[7]?.body.method, "tools/call");
+  assert.deepEqual(calls[7]?.body.params, {
+    name: "webSearchV2",
+    arguments: { query: "test" },
+  });
+});
+
+test("ZaiMcpClient does not retry on non-tool-not-found errors", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", capabilities: {} },
+      },
+      { sessionId: "session-no-retry" }
+    ),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "webSearchPrime" }] },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      error: { code: -32000, message: "Internal server error" },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await assert.rejects(
+    () =>
+      client.callTool({
+        endpoint,
+        toolName: "webSearchPrime",
+        arguments: { query: "test" },
+        apiKey: "test-key",
+      }),
+    /Internal server error/
+  );
+  assert.equal(calls.length, 4);
+});
