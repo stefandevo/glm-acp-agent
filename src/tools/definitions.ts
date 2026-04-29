@@ -141,4 +141,26 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "image_analysis",
+      description:
+        "Analyze an image (local file path or remote URL) using Z.AI Coding Plan Vision MCP. Returns a textual description / answer. Use this to extract text from screenshots, describe diagrams, or answer questions about images the user has referenced.",
+      parameters: {
+        type: "object",
+        properties: {
+          image_source: {
+            type: "string",
+            description: "Local file path or remote URL of the image to analyze.",
+          },
+          prompt: {
+            type: "string",
+            description: "Optional question or instruction guiding the analysis. Defaults to a general description.",
+          },
+        },
+        required: ["image_source"],
+      },
+    },
+  },
 ];
