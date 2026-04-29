@@ -76,6 +76,8 @@ const WORKFLOW = `<problem_solving_workflow>
 Prefer fixing the root cause over papering over a symptom. If you hit an obstacle, diagnose it rather than reaching for a destructive shortcut.
 </problem_solving_workflow>`;
 
+// Annotation tag names (<image_analysis>, <image_attached>, <image_analysis_error>) must
+// match the literals emitted by preprocessImageBlocks() in image-preprocessor.ts.
 const IMAGE_HANDLING = `<image_handling>
 When the user refers to an attached image but the most recent user turn contains no <image_analysis>, <image_attached>, or <image_analysis_error> annotation, no image was received by this agent — this is a client-side attachment problem, not a Vision MCP failure. Do not describe or guess at the image contents. Instead, explain that the agent did not receive an image from the client and ask the user to share it as a local file path (e.g. /home/user/photo.png) or a public URL.
 </image_handling>`;
