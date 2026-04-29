@@ -2,6 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { GlmClient } from "../llm/glm-client.js";
 
+test("constructor uses the coding endpoint by default", () => {
+  process.env["Z_AI_API_KEY"] = "test-key";
+  delete process.env["ACP_GLM_BASE_URL"];
+  try {
+    const c = new GlmClient();
+    const url = (c as unknown as { client: { baseURL: string } }).client.baseURL;
+    assert.equal(url, "https://api.z.ai/api/coding/paas/v4");
+  } finally {
+    delete process.env["Z_AI_API_KEY"];
+  }
+});
+
 // We don't want to actually hit the network, but the OpenAI SDK still
 // constructs a client when we instantiate GlmClient. We stub the
 // `client.chat.completions.create` method on the underlying OpenAI client.

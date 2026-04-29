@@ -44,6 +44,7 @@ import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
+import { debug, error } from "../llm/logger.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -213,6 +214,7 @@ export class GlmAcpAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const sessionId = randomUUID();
+    debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
 
     const systemPrompt: GlmMessage = {
       role: "system",
@@ -383,6 +385,7 @@ export class GlmAcpAgent implements Agent {
       if (userMessageId) response.userMessageId = userMessageId;
       return response;
     } catch (err) {
+      error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted) {
@@ -665,6 +668,8 @@ export class GlmAcpAgent implements Agent {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled" };
 
+      debug(`promptLoop: turn=${turn} session=${sessionId} model=${session.model} messages=${session.messages.length}`);
+
       const toolCalls: Array<{
         id: string;
         name: string;
@@ -703,6 +708,7 @@ export class GlmAcpAgent implements Agent {
         }
 
         if (chunk.toolCall) {
+          debug(`promptLoop: toolCall id=${chunk.toolCall.id} name=${chunk.toolCall.name}`);
           toolCalls.push(chunk.toolCall);
         }
 
@@ -741,6 +747,7 @@ export class GlmAcpAgent implements Agent {
         if (signal.aborted) return { stopReason: "cancelled", usage: lastUsage };
 
         const result = await executor.execute(tc.id, tc.name, tc.arguments);
+        debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
         session.messages.push({
           role: "tool",
