@@ -359,6 +359,11 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
         jsonResponse({
           jsonrpc: "2.0",
           id: 2,
+          result: { tools: [{ name: "webSearchPrime" }] },
+        }),
+        jsonResponse({
+          jsonrpc: "2.0",
+          id: 3,
           result: {
             content: [
               {
@@ -390,12 +395,12 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
 
         assert.match(result.content, /\[1\] GLM Coding Plan/);
         assert.match(result.content, /URL: https:\/\/z\.ai\//);
-        assert.equal(calls.length, 3);
+        assert.equal(calls.length, 4);
         assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_search_prime/mcp"));
         assert.equal(calls[0]?.headers.get("Authorization"), "Bearer from-disk");
-        assert.equal(calls[2]?.headers.get("Mcp-Method"), "tools/call");
-        assert.equal(calls[2]?.headers.get("Mcp-Name"), "webSearchPrime");
-        assert.deepEqual(calls[2]?.body.params, {
+        assert.equal(calls[3]?.headers.get("Mcp-Method"), "tools/call");
+        assert.equal(calls[3]?.headers.get("Mcp-Name"), "webSearchPrime");
+        assert.deepEqual(calls[3]?.body.params, {
           name: "webSearchPrime",
           arguments: { query: "glm coding plan", count: 1 },
         });
@@ -421,6 +426,11 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
         jsonResponse({
           jsonrpc: "2.0",
           id: 2,
+          result: { tools: [{ name: "webReader" }] },
+        }),
+        jsonResponse({
+          jsonrpc: "2.0",
+          id: 3,
           result: {
             content: [
               {
@@ -451,8 +461,8 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
         assert.match(result.content, /URL: https:\/\/example\.com\//);
         assert.match(result.content, /Main body/);
         assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_reader/mcp"));
-        assert.equal(calls[2]?.headers.get("Mcp-Name"), "webReader");
-        assert.deepEqual(calls[2]?.body.params, {
+        assert.equal(calls[3]?.headers.get("Mcp-Name"), "webReader");
+        assert.deepEqual(calls[3]?.body.params, {
           name: "webReader",
           arguments: { url: "https://example.com/", return_format: "markdown" },
         });

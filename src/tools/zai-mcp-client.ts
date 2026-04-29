@@ -32,7 +32,7 @@ export interface ZaiMcpToolCall {
 }
 
 export class ZaiMcpClient {
-  private sessions = new Map<string, { sessionId?: string; initialized: boolean }>();
+  private sessions = new Map<string, { sessionId?: string; initialized: boolean; toolNames: string[] }>();
   private nextId = 1;
 
   constructor(
@@ -102,9 +102,38 @@ export class ZaiMcpClient {
       sessionId
     );
 
-    const session = { sessionId, initialized: true };
+    const toolNames = await this.discoverTools(
+      call.endpoint,
+      call.apiKey,
+      sessionId,
+      call.signal
+    );
+    const session = { sessionId, initialized: true, toolNames };
     this.sessions.set(cacheKey, session);
     return session;
+  }
+
+  private async discoverTools(
+    endpoint: string,
+    apiKey: string,
+    sessionId: string | undefined,
+    signal?: AbortSignal
+  ): Promise<string[]> {
+    const response = await this.fetchJsonRpc(
+      endpoint,
+      apiKey,
+      "tools/list",
+      {
+        jsonrpc: "2.0",
+        id: this.nextId++,
+        method: "tools/list",
+      },
+      "tools/list",
+      signal,
+      sessionId
+    );
+    const result = response.body.result as { tools?: { name: string }[] } | undefined;
+    return result?.tools?.map((t) => t.name) ?? [];
   }
 
   private async sendRequest(

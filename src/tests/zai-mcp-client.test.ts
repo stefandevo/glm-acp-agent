@@ -40,7 +40,7 @@ function createFetchStub(responses: Response[]) {
   return { calls, fetchStub };
 }
 
-test("ZaiMcpClient initializes, sends initialized, caches session id, and calls a tool", async () => {
+test("ZaiMcpClient initializes, sends initialized, discovers tools, and calls a tool", async () => {
   const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
   const { calls, fetchStub } = createFetchStub([
     jsonResponse(
@@ -55,6 +55,11 @@ test("ZaiMcpClient initializes, sends initialized, caches session id, and calls 
     jsonResponse({
       jsonrpc: "2.0",
       id: 2,
+      result: { tools: [{ name: "webSearchPrime" }] },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
       result: { content: [{ type: "text", text: "Search result text" }] },
     }),
   ]);
@@ -68,7 +73,7 @@ test("ZaiMcpClient initializes, sends initialized, caches session id, and calls 
   });
 
   assert.deepEqual(result, { content: [{ type: "text", text: "Search result text" }] });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.equal(calls[0]?.body.method, "initialize");
   assert.equal(calls[0]?.headers.get("Authorization"), "Bearer test-key");
   assert.equal(calls[0]?.headers.get("Accept"), "application/json, text/event-stream");
@@ -79,14 +84,60 @@ test("ZaiMcpClient initializes, sends initialized, caches session id, and calls 
   assert.equal(calls[1]?.headers.get("MCP-Session-Id"), "session-123");
   assert.equal(calls[1]?.headers.get("Mcp-Method"), "notifications/initialized");
 
-  assert.equal(calls[2]?.body.method, "tools/call");
-  assert.deepEqual(calls[2]?.body.params, {
+  assert.equal(calls[2]?.body.method, "tools/list");
+  assert.equal(calls[2]?.headers.get("MCP-Session-Id"), "session-123");
+
+  assert.equal(calls[3]?.body.method, "tools/call");
+  assert.deepEqual(calls[3]?.body.params, {
     name: "webSearchPrime",
     arguments: { query: "glm coding plan", count: 3 },
   });
-  assert.equal(calls[2]?.headers.get("MCP-Session-Id"), "session-123");
-  assert.equal(calls[2]?.headers.get("Mcp-Method"), "tools/call");
-  assert.equal(calls[2]?.headers.get("Mcp-Name"), "webSearchPrime");
+  assert.equal(calls[3]?.headers.get("MCP-Session-Id"), "session-123");
+  assert.equal(calls[3]?.headers.get("Mcp-Method"), "tools/call");
+  assert.equal(calls[3]?.headers.get("Mcp-Name"), "webSearchPrime");
+});
+
+test("ZaiMcpClient discovers tools after initialization and caches them", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "zai" } },
+      },
+      { sessionId: "session-discover" }
+    ),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        tools: [
+          { name: "webSearchPrime", description: "Search the web" },
+          { name: "otherTool", description: "Something else" },
+        ],
+      },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { content: [{ type: "text", text: "ok" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await client.callTool({
+    endpoint,
+    toolName: "webSearchPrime",
+    arguments: { query: "test" },
+    apiKey: "test-key",
+  });
+
+  assert.equal(calls.length, 4);
+  assert.equal(calls[2]?.body.method, "tools/list");
+  assert.equal(calls[2]?.headers.get("MCP-Session-Id"), "session-discover");
+  assert.equal(calls[2]?.headers.get("Mcp-Method"), "tools/list");
 });
 
 test("ZaiMcpClient parses SSE wrapped JSON-RPC responses", async () => {
@@ -101,6 +152,11 @@ test("ZaiMcpClient parses SSE wrapped JSON-RPC responses", async () => {
     sseResponse({
       jsonrpc: "2.0",
       id: 2,
+      result: { tools: [{ name: "webReader" }] },
+    }),
+    sseResponse({
+      jsonrpc: "2.0",
+      id: 3,
       result: { content: [{ type: "text", text: "# Title\nBody" }] },
     }),
   ]);
