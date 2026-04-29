@@ -98,6 +98,10 @@ The agent reads its configuration from environment variables, plus an optional c
 If you'd rather not pass `Z_AI_API_KEY` through your ACP client's environment block, run the interactive setup once and the agent will read the key from disk on subsequent launches:
 
 ```bash
+# From the project directory (after npm run build)
+node dist/index.js --setup
+
+# Or, if you installed globally
 glm-acp-agent --setup
 ```
 
@@ -315,7 +319,7 @@ The test suite covers:
 
 ## Troubleshooting
 
-- **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` once to store the key on disk.
+- **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `node dist/index.js --setup` (or `glm-acp-agent --setup` if installed globally) once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
 - **The agent says "client does not advertise the … capability".** — your ACP client doesn't expose that capability (e.g. terminal). Ask the model to use a different tool, or upgrade the client.
 - **Tools never get to run.** — make sure the client is sending the `clientCapabilities` field in `initialize`; the agent uses it to decide which tools to expose to the model.
