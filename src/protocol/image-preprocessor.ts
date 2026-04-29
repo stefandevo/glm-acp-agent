@@ -48,9 +48,7 @@ export async function preprocessImageBlocks(
     }
 
     let imageSource = "";
-    if (typeof block.uri === "string" && block.uri.length > 0) {
-      imageSource = block.uri;
-    } else if (typeof block.data === "string" && block.data.length > 0) {
+    if (typeof block.data === "string" && block.data.length > 0) {
       const dir = await mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
       const ext = guessExtension(block.mimeType);
       const path = pathJoin(dir, `image-${imageIndex}${ext}`);
@@ -59,13 +57,18 @@ export async function preprocessImageBlocks(
       cleanups.push(async () => {
         try { await rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
       });
+    } else if (typeof block.uri === "string" && block.uri.length > 0) {
+      imageSource = block.uri;
     } else {
       out.push(textBlock(`<image_analysis_error index="${imageIndex}">image block has neither a uri nor base64 data</image_analysis_error>`));
       continue;
     }
 
     try {
-      const result = await visionClient.callTool("image_analysis", { image_source: imageSource }, signal);
+      const result = await visionClient.callTool("image_analysis", {
+        image_source: imageSource,
+        prompt: "Describe this image in detail, including any text, code, UI elements, or other visible content.",
+      }, signal);
       const text = extractText(result);
       out.push(textBlock(`<image_analysis index="${imageIndex}">\n${text}\n</image_analysis>`));
     } catch (err) {
