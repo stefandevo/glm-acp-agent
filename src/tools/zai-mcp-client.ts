@@ -41,6 +41,17 @@ export class ZaiMcpClient {
   ) {}
 
   async callTool(call: ZaiMcpToolCall): Promise<unknown> {
+    try {
+      return await this.callToolInternal(call);
+    } catch (err) {
+      if (!isToolNotFoundError(err)) throw err;
+      const cacheKey = `${call.endpoint}\n${call.apiKey}`;
+      this.sessions.delete(cacheKey);
+      return this.callToolInternal(call);
+    }
+  }
+
+  private async callToolInternal(call: ZaiMcpToolCall): Promise<unknown> {
     const session = await this.ensureInitialized(call);
     const resolvedName = resolveToolName(call.toolName, session.toolNames, call.endpoint);
     const result = await this.sendRequest(
@@ -304,4 +315,12 @@ function extractToolKeyword(name: string): string | undefined {
   if (lower.includes("search")) return "search";
   if (lower.includes("reader")) return "reader";
   return undefined;
+}
+
+function isToolNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  if (/-32601/.test(msg)) return true;
+  if (/tool.*not.*found|not.*found.*tool|unknown.*tool/.test(msg)) return true;
+  return false;
 }
