@@ -109,6 +109,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
+| `ACP_GLM_DEBUG` | No | — | Set to `true` or `1` to enable verbose debug logging to stderr (shows model selection, API key resolution, tool calls, and usage stats) |
 | `XDG_CONFIG_HOME` | No | `~/.config` | Where the credentials file is read/written |
 
 ### One-time setup

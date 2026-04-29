@@ -42,6 +42,7 @@ if (args.includes("--setup")) {
       "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default 8192)",
       "  ACP_GLM_THINKING               Force thinking mode (true / false)",
       "  ACP_GLM_SESSION_DIR            Where to persist sessions (default: ~/.local/state/glm-acp-agent/sessions)",
+      "  ACP_GLM_DEBUG                  Enable verbose stderr logging (true or 1)",
       "  XDG_CONFIG_HOME                Where to read/write credentials.json (default: ~/.config)",
       "",
     ].join("\n")
