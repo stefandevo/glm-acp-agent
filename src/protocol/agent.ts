@@ -44,6 +44,9 @@ import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
+import { preprocessImageBlocks, type PreprocessedPrompt } from "./image-preprocessor.js";
+import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
+import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error } from "../llm/logger.js";
 
 /**
@@ -96,6 +99,13 @@ export interface GlmAcpAgentOptions {
    * Pass `null` to disable persistence entirely.
    */
   sessionStore?: SessionStore | null;
+  /**
+   * Vision MCP client used to analyze ACP image blocks via @z_ai/mcp-server.
+   * Pass `null` to disable vision entirely (image blocks degrade to a text
+   * placeholder). When undefined the agent lazy-creates a StdioVisionMcpClient
+   * on first use.
+   */
+  visionClient?: VisionMcpClient | null;
 }
 
 /**
@@ -111,6 +121,8 @@ export class GlmAcpAgent implements Agent {
   private maxTurns: number;
   private clientCapabilities: ClientCapabilities | null = null;
   private sessionStore: SessionStore | null;
+  private _visionClient: VisionMcpClient | null;
+  private visionClientExplicit: boolean;
 
   constructor(
     private connection: AgentSideConnection,
@@ -126,6 +138,8 @@ export class GlmAcpAgent implements Agent {
       options.sessionStore === null
         ? null
         : (options.sessionStore ?? new SessionStore());
+    this.visionClientExplicit = "visionClient" in options;
+    this._visionClient = options.visionClient ?? null;
   }
 
   private get glm(): NonNullable<GlmAcpAgentOptions["glm"]> {
@@ -133,6 +147,16 @@ export class GlmAcpAgent implements Agent {
       this._glm = new GlmClient();
     }
     return this._glm;
+  }
+
+  private get visionClient(): VisionMcpClient | null {
+    if (this.visionClientExplicit) return this._visionClient;
+    if (!this._visionClient) {
+      const apiKey = resolveApiKey();
+      if (!apiKey) return null;
+      this._visionClient = new StdioVisionMcpClient({ apiKey });
+    }
+    return this._visionClient;
   }
 
   // ---------------------------------------------------------------------------
@@ -331,11 +355,17 @@ export class GlmAcpAgent implements Agent {
     }
 
     // Convert ACP content blocks into a GLM user message. Baseline: text +
-    // resource_link. Optional: embedded resources, plus image blocks (forwarded
-    // as OpenAI-shaped data-URL parts so vision-capable GLM models like
-    // glm-4v-plus can ingest them).
+    // resource_link. Optional: embedded resources. Image blocks are routed
+    // through Z.AI Coding Plan Vision MCP (see image-preprocessor) so the
+    // result is always a plain string for the chat-completions endpoint.
+    let preprocessed: PreprocessedPrompt | undefined;
+    preprocessed = await preprocessImageBlocks(
+      params.prompt,
+      this.visionClient,
+      abortController.signal
+    );
     const { content: userContent, plainText: userText } = renderPromptBlocks(
-      params.prompt
+      preprocessed.blocks
     );
     session.messages.push({ role: "user", content: userContent });
 
@@ -411,6 +441,9 @@ export class GlmAcpAgent implements Agent {
       // Always resolve the promptPromise so a subsequent prompt can proceed.
       session.promptPromise = null;
       resolvePromptPromise();
+      for (const cleanup of preprocessed?.cleanups ?? []) {
+        try { await cleanup(); } catch { /* best effort */ }
+      }
     }
   }
 
@@ -660,7 +693,8 @@ export class GlmAcpAgent implements Agent {
       this.connection,
       sessionId,
       this.clientCapabilities,
-      signal
+      signal,
+      this.visionClient
     );
 
     let lastUsage: Usage | undefined;
@@ -797,35 +831,28 @@ export class GlmAcpAgent implements Agent {
     if (fs.readTextFile) names.push("read_file");
     if (fs.writeTextFile) names.push("write_file");
     if (terminal) names.push("list_files", "run_command");
-    // Web tools always run inside the agent process, so they are unconditional.
+    // Web tools and image_analysis run inside the agent process, so they are
+    // unconditional except when vision is explicitly disabled.
     names.push("web_search", "web_reader");
+    if (this.visionClientExplicit ? this._visionClient !== null : true) {
+      names.push("image_analysis");
+    }
     return names;
   }
 }
 
-/** OpenAI-shaped content part for multimodal user messages. */
-type UserContentPart =
-  | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } };
-
 /**
- * Render a list of ACP content blocks into a GLM user message.
+ * Render a list of ACP content blocks (after image preprocessing) into the
+ * plain-string user message we send to the chat-completions endpoint.
  *
- * When the prompt contains only text/resource blocks we return a plain string
- * (the broadest-compatible shape). When at least one image block is present
- * we switch to OpenAI's multimodal array shape so vision-capable GLM models
- * receive the image as a data URL.
- *
- * `plainText` always contains the text-only flattening of the prompt and is
- * used by the agent to derive a session title.
+ * `plainText` mirrors `content` and is used by the agent to derive a session
+ * title.
  */
-function renderPromptBlocks(blocks: PromptRequest["prompt"]): {
-  content: string | UserContentPart[];
+function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number]>): {
+  content: string;
   plainText: string;
 } {
   const textParts: string[] = [];
-  const imageParts: UserContentPart[] = [];
-
   for (const block of blocks) {
     switch (block.type) {
       case "text":
@@ -839,15 +866,13 @@ function renderPromptBlocks(blocks: PromptRequest["prompt"]): {
         if ("text" in res && typeof res.text === "string") {
           textParts.push(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
         } else if ("blob" in res) {
-          // Binary resources can't be inlined into a chat message; keep a link
-          // reference so the model knows it exists.
           textParts.push(`[binary resource](${res.uri})`);
         }
         break;
       }
       case "image": {
-        const dataUrl = `data:${block.mimeType};base64,${block.data}`;
-        imageParts.push({ type: "image_url", image_url: { url: dataUrl } });
+        // Defensive: image blocks should have been preprocessed away upstream.
+        textParts.push(`[image: ${block.mimeType}]`);
         break;
       }
       case "audio":
@@ -857,46 +882,13 @@ function renderPromptBlocks(blocks: PromptRequest["prompt"]): {
         textParts.push(`[unknown block type ${(block as { type: string }).type}]`);
     }
   }
-
   const plainText = textParts.join("\n");
-
-  if (imageParts.length === 0) {
-    return { content: plainText, plainText };
-  }
-
-  // Multimodal: combine text + images. OpenAI requires at least one part, so
-  // we always include the text part (even when empty, the array form is valid).
-  const content: UserContentPart[] = [];
-  if (plainText.length > 0) {
-    content.push({ type: "text", text: plainText });
-  }
-  content.push(...imageParts);
-  return { content, plainText };
+  return { content: plainText, plainText };
 }
 
-/**
- * Flatten the `content` of a user message into a plain string for replay.
- *
- * Multimodal user messages (text + image parts) are rendered as their text
- * portions only; images are noted with a placeholder so the client knows
- * something visual was there but doesn't try to re-render an opaque
- * `image_url` part it never produced.
- */
+/** Flatten the `content` of a user message into a plain string for replay. */
 function stringifyUserMessage(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const part of content) {
-    if (typeof part !== "object" || part === null) continue;
-    const type = (part as { type?: unknown }).type;
-    if (type === "text") {
-      const text = (part as { text?: unknown }).text;
-      if (typeof text === "string") parts.push(text);
-    } else if (type === "image_url") {
-      parts.push("[image]");
-    }
-  }
-  return parts.join("\n");
+  return typeof content === "string" ? content : "";
 }
 
 /**

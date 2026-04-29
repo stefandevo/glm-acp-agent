@@ -875,20 +875,28 @@ test("unstable_setSessionModel rejects unknown sessions", async () => {
 // Image content
 // ---------------------------------------------------------------------------
 
-test("prompt with image block forwards a multimodal user message", async () => {
+test("prompt with image block runs Vision MCP preprocessing and feeds text into the model", async () => {
   const conn = createConnectionStub();
-  let captured: unknown;
+  let capturedUser: unknown;
   const glm = {
     async *streamChat(
       messages: ReadonlyArray<{ role: string; content?: unknown }>
     ): AsyncGenerator<GlmStreamChunk> {
       const userMsg = messages.find((m) => m.role === "user");
-      captured = userMsg?.content;
+      capturedUser = userMsg?.content;
       yield { text: "ok" };
       yield { done: true, stopReason: "stop" };
     },
   };
-  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  const visionCalls: Array<Record<string, unknown>> = [];
+  const visionClient = {
+    async callTool(_name: string, args: Record<string, unknown>) {
+      visionCalls.push(args);
+      return { content: [{ type: "text", text: "It is a kitten." }] };
+    },
+    async dispose() {},
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
@@ -896,16 +904,77 @@ test("prompt with image block forwards a multimodal user message", async () => {
     sessionId,
     prompt: [
       { type: "text", text: "What is in this image?" },
-      { type: "image", data: "AAAA", mimeType: "image/png" },
+      { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
     ],
   });
 
-  assert.ok(Array.isArray(captured), "expected multimodal content array");
-  const arr = captured as Array<{ type: string; image_url?: { url: string }; text?: string }>;
-  const textPart = arr.find((p) => p.type === "text");
-  const imagePart = arr.find((p) => p.type === "image_url");
-  assert.equal(textPart?.text, "What is in this image?");
-  assert.equal(imagePart?.image_url?.url, "data:image/png;base64,AAAA");
+  assert.equal(visionCalls.length, 1);
+  assert.equal(visionCalls[0]?.["image_source"], "https://example.com/cat.png");
+  // Resulting user content must be a plain string with image annotation embedded.
+  assert.equal(typeof capturedUser, "string");
+  assert.match(capturedUser as string, /What is in this image\?/);
+  assert.match(capturedUser as string, /<image_analysis index="1">[\s\S]*It is a kitten\.[\s\S]*<\/image_analysis>/);
+});
+
+test("prompt with image block but no vision client falls back to a text annotation", async () => {
+  const conn = createConnectionStub();
+  let capturedUser: unknown;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const userMsg = messages.find((m) => m.role === "user");
+      capturedUser = userMsg?.content;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient: null, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await agent.prompt({
+    sessionId,
+    prompt: [
+      { type: "text", text: "Describe" },
+      { type: "image", data: "AAAA", mimeType: "image/png" },
+    ],
+  });
+  assert.equal(typeof capturedUser, "string");
+  assert.match(capturedUser as string, /image_attached/);
+});
+
+test("Vision MCP failures degrade gracefully without aborting the prompt", async () => {
+  const conn = createConnectionStub();
+  let capturedUser: unknown;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const userMsg = messages.find((m) => m.role === "user");
+      capturedUser = userMsg?.content;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const visionClient = {
+    async callTool() { throw new Error("Vision MCP image_analysis failed: quota exceeded"); },
+    async dispose() {},
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [
+      { type: "text", text: "look" },
+      { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/x.png" },
+    ],
+  });
+  assert.equal(result.stopReason, "end_turn");
+  assert.match(capturedUser as string, /image_analysis_error/);
+  assert.match(capturedUser as string, /quota exceeded/);
 });
 
 test("prompt without image blocks keeps content as a plain string", async () => {
