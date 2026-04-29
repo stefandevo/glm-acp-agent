@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor } from "../tools/executor.js";
 
 interface StubTerminal {
@@ -66,6 +70,70 @@ const FULL_CAPS = {
   fs: { readTextFile: true, writeTextFile: true },
   terminal: true,
 };
+
+type FetchCall = {
+  url: string;
+  init: RequestInit;
+  body: Record<string, unknown>;
+  headers: Headers;
+};
+
+function jsonResponse(
+  body: unknown,
+  init: ResponseInit & { sessionId?: string } = {}
+): Response {
+  const headers = new Headers(init.headers);
+  headers.set("Content-Type", "application/json");
+  if (init.sessionId) headers.set("MCP-Session-Id", init.sessionId);
+  return new Response(JSON.stringify(body), { ...init, headers });
+}
+
+function createFetchStub(responses: Response[]) {
+  const calls: FetchCall[] = [];
+  const fetchStub = async (url: string | URL | Request, init?: RequestInit) => {
+    assert.ok(init, "fetch init is required");
+    const body =
+      typeof init.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    const headers = new Headers(init.headers);
+    calls.push({ url: String(url), init, body, headers });
+    const response = responses.shift();
+    assert.ok(response, "unexpected fetch call");
+    return response;
+  };
+  return { calls, fetchStub };
+}
+
+async function withStoredApiKey<T>(fn: () => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-creds-"));
+  const oldEnv = process.env["Z_AI_API_KEY"];
+  const oldXdg = process.env["XDG_CONFIG_HOME"];
+  try {
+    delete process.env["Z_AI_API_KEY"];
+    process.env["XDG_CONFIG_HOME"] = dir;
+    writeCredentials("from-disk", join(dir, "glm-acp-agent", "credentials.json"));
+    return await fn();
+  } finally {
+    if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = oldEnv;
+    if (oldXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = oldXdg;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function withMockedFetch<T>(
+  responses: Response[],
+  fn: (calls: FetchCall[]) => Promise<T>
+): Promise<T> {
+  const oldFetch = globalThis.fetch;
+  const { calls, fetchStub } = createFetchStub(responses);
+  try {
+    globalThis.fetch = fetchStub as typeof fetch;
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -268,6 +336,163 @@ test("list_files rejects empty path", async () => {
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
   const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "" }));
   assert.match(result.content, /non-empty string/);
+});
+
+// ---------------------------------------------------------------------------
+// web_search / web_reader via Z.AI Coding Plan MCP
+// ---------------------------------------------------------------------------
+
+test("web_search uses stored credentials and calls the Coding Plan MCP search tool", async () => {
+  await withStoredApiKey(async () => {
+    await withMockedFetch(
+      [
+        jsonResponse(
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            result: { protocolVersion: "2025-06-18", capabilities: {} },
+          },
+          { sessionId: "search-session" }
+        ),
+        new Response(null, { status: 202 }),
+        jsonResponse({
+          jsonrpc: "2.0",
+          id: 2,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  search_result: [
+                    {
+                      title: "GLM Coding Plan",
+                      link: "https://z.ai/",
+                      media: "Z.AI",
+                      publish_date: "2026-04-29",
+                      content: "MCP quota path",
+                    },
+                  ],
+                }),
+              },
+            ],
+          },
+        }),
+      ],
+      async (calls) => {
+        const conn = createConnectionStub();
+        const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+        const result = await exec.execute(
+          "tc-web-search",
+          "web_search",
+          JSON.stringify({ query: "glm coding plan", count: 1 })
+        );
+
+        assert.match(result.content, /\[1\] GLM Coding Plan/);
+        assert.match(result.content, /URL: https:\/\/z\.ai\//);
+        assert.equal(calls.length, 3);
+        assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_search_prime/mcp"));
+        assert.equal(calls[0]?.headers.get("Authorization"), "Bearer from-disk");
+        assert.equal(calls[2]?.headers.get("Mcp-Method"), "tools/call");
+        assert.equal(calls[2]?.headers.get("Mcp-Name"), "webSearchPrime");
+        assert.deepEqual(calls[2]?.body.params, {
+          name: "webSearchPrime",
+          arguments: { query: "glm coding plan", count: 1 },
+        });
+        const last = conn.updates.at(-1) as { update: { status?: string } };
+        assert.equal(last.update.status, "completed");
+      }
+    );
+  });
+});
+
+test("web_reader calls the Coding Plan MCP reader tool and formats reader_result", async () => {
+  const oldEnv = process.env["Z_AI_API_KEY"];
+  try {
+    process.env["Z_AI_API_KEY"] = "from-env";
+    await withMockedFetch(
+      [
+        jsonResponse({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: "2025-06-18", capabilities: {} },
+        }),
+        new Response(null, { status: 202 }),
+        jsonResponse({
+          jsonrpc: "2.0",
+          id: 2,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  reader_result: {
+                    title: "Example",
+                    url: "https://example.com/",
+                    description: "Short description",
+                    content: "Main body",
+                  },
+                }),
+              },
+            ],
+          },
+        }),
+      ],
+      async (calls) => {
+        const conn = createConnectionStub();
+        const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+        const result = await exec.execute(
+          "tc-web-reader",
+          "web_reader",
+          JSON.stringify({ url: "https://example.com/", return_format: "markdown" })
+        );
+
+        assert.match(result.content, /^# Example/);
+        assert.match(result.content, /URL: https:\/\/example\.com\//);
+        assert.match(result.content, /Main body/);
+        assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_reader/mcp"));
+        assert.equal(calls[2]?.headers.get("Mcp-Name"), "webReader");
+        assert.deepEqual(calls[2]?.body.params, {
+          name: "webReader",
+          arguments: { url: "https://example.com/", return_format: "markdown" },
+        });
+      }
+    );
+  } finally {
+    if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = oldEnv;
+  }
+});
+
+test("web_search reports Coding Plan 1113 MCP errors as actionable failed tool results", async () => {
+  const oldEnv = process.env["Z_AI_API_KEY"];
+  try {
+    process.env["Z_AI_API_KEY"] = "from-env";
+    await withMockedFetch(
+      [
+        jsonResponse(
+          { error: { code: "1113", message: "No permission for current API key" } },
+          { status: 429 }
+        ),
+      ],
+      async () => {
+        const conn = createConnectionStub();
+        const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+        const result = await exec.execute(
+          "tc-web-search-error",
+          "web_search",
+          JSON.stringify({ query: "glm" })
+        );
+
+        assert.match(result.content, /Coding Plan quota\/base URL\/tool eligibility/);
+        assert.match(result.content, /1113/);
+        const last = conn.updates.at(-1) as { update: { status?: string } };
+        assert.equal(last.update.status, "failed");
+      }
+    );
+  } finally {
+    if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = oldEnv;
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,22 @@ The agent connects to any ACP-compatible IDE or client over **stdio**, streams r
 
 ---
 
+## Coding Plan Only
+
+`glm-acp-agent` is intentionally built for the **Z.AI GLM Coding Plan**. It is not a general-purpose Z.AI Open Platform API client.
+
+By default, model calls use the Coding Plan endpoint:
+
+```text
+https://api.z.ai/api/coding/paas/v4
+```
+
+The same Coding Plan API key is used for the agent's GLM model calls and supported Coding Plan tools. General Z.AI API/resource-package billing surfaces, such as direct `/api/paas/v4` Tool API calls, are intentionally out of scope for this ACP agent.
+
+Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/api/paas/v4` Tool API. If you need general Z.AI API billing, separate resource packages, or non-Coding Plan endpoints, use a different provider configuration or fork this agent for that purpose.
+
+---
+
 ## Features
 
 - **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`
@@ -38,11 +54,11 @@ ACP Client (IDE plugin, CLI, …)
         └─ ToolExecutor ← executes tool calls  (src/tools/)
              ├─ read_file / write_file       → ACP client (fs.*)
              ├─ list_files / run_command     → ACP client (terminal)
-             ├─ web_search                   → Z.AI /paas/v4/web_search
-             └─ web_reader                   → Z.AI /paas/v4/reader
+             ├─ web_search                   → Z.AI Coding Plan Web Search MCP
+             └─ web_reader                   → Z.AI Coding Plan Web Reader MCP
 ```
 
-The agent process itself only needs network access to `api.z.ai`. All file-system and shell operations are **delegated to the ACP client** — the agent never touches the local disk directly. `web_search` and `web_reader` are different: they run **inside the agent process** and call the Z.AI Tools API directly.
+The agent process itself only needs network access to `api.z.ai`. All file-system and shell operations are **delegated to the ACP client** — the agent never touches the local disk directly. `web_search` and `web_reader` run **inside the agent process** and call Z.AI's Coding Plan-compatible MCP servers with the same resolved API key used for model calls.
 
 ---
 
@@ -54,8 +70,8 @@ The agent process itself only needs network access to `api.z.ai`. All file-syste
 | `write_file` | ACP client | `fs.writeTextFile` | Write or overwrite a text file (asks for permission) |
 | `list_files` | ACP client | `terminal` | List a directory via `ls -la` (POSIX shell required) |
 | `run_command` | ACP client | `terminal` | Run an arbitrary shell command via `sh -c` (asks for permission) |
-| `web_search` | Agent (Z.AI) | – | Search the web — returns titles, URLs, and summaries |
-| `web_reader` | Agent (Z.AI) | – | Fetch and parse a web page (markdown or plain text) |
+| `web_search` | Agent (Z.AI Coding Plan MCP) | – | Search the web — returns titles, URLs, and summaries |
+| `web_reader` | Agent (Z.AI Coding Plan MCP) | – | Fetch and parse a web page (markdown or plain text) |
 
 ---
 
@@ -87,7 +103,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
 | `ACP_GLM_MODEL` | No | `glm-5.1` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
-| `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/paas/v4` | Override the API base URL |
+| `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
