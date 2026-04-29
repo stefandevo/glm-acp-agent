@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { remapArguments, resolveToolName } from "./mcp-arg-remap.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -15,6 +16,11 @@ interface StdioVisionMcpClientOptions {
   spawn?: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => ChildProcessWithoutNullStreams;
 }
 
+interface DiscoveredTool {
+  name: string;
+  properties: string[];
+}
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
@@ -29,13 +35,44 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   private buffer = "";
   private exited = false;
   private exitReason: string | null = null;
+  private discoveredTools: DiscoveredTool[] = [];
 
   constructor(private opts: StdioVisionMcpClientOptions) {}
 
   async callTool(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) throw new Error("Vision MCP call cancelled");
     await this.ensureInitialized();
-    return this.request("tools/call", { name: toolName, arguments: args }, `Vision MCP ${toolName}`, signal);
+    return this.callToolInternal(toolName, args, signal);
+  }
+
+  private async callToolInternal(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    const toolNames = this.discoveredTools.map((t) => t.name);
+    const resolvedName = resolveToolName(toolName, toolNames, "@z_ai/mcp-server");
+    const toolSchema = this.discoveredTools.find((t) => t.name === resolvedName);
+    const remappedArgs = remapArguments(args, toolSchema?.properties ?? []);
+    try {
+      return await this.request("tools/call", { name: resolvedName, arguments: remappedArgs }, `Vision MCP ${toolName}`, signal);
+    } catch (err) {
+      if (!isVisionRetryableError(err)) throw err;
+      await this.rediscoverTools();
+      const resolvedName2 = resolveToolName(toolName, this.discoveredTools.map((t) => t.name), "@z_ai/mcp-server");
+      const toolSchema2 = this.discoveredTools.find((t) => t.name === resolvedName2);
+      const remappedArgs2 = remapArguments(args, toolSchema2?.properties ?? []);
+      return this.request("tools/call", { name: resolvedName2, arguments: remappedArgs2 }, `Vision MCP ${toolName}`, signal);
+    }
+  }
+
+  private async rediscoverTools(): Promise<void> {
+    const result = await this.request("tools/list", {}, "Vision MCP tools/list") as
+      | { tools?: { name: string; inputSchema?: { properties?: Record<string, unknown> } }[] }
+      | undefined;
+    const tools = result?.tools ?? [];
+    if (tools.length > 0) {
+      this.discoveredTools = tools.map((t) => ({
+        name: t.name,
+        properties: t.inputSchema?.properties ? Object.keys(t.inputSchema.properties) : [],
+      }));
+    }
   }
 
   async dispose(): Promise<void> {
@@ -48,6 +85,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     }
     this.child = null;
     this.initialized = null;
+    this.discoveredTools = [];
     for (const [, p] of this.pending) {
       p.reject(new Error(`cancelled (client disposed)`));
     }
@@ -102,6 +140,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
     }, "Vision MCP initialize");
     this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await this.rediscoverTools();
   }
 
   private request(method: string, params: Record<string, unknown>, label: string, signal?: AbortSignal): Promise<unknown> {
@@ -160,4 +199,12 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       }
     }
   }
+}
+
+function isVisionRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  if (/-32601/.test(msg)) return true;
+  if (/tool.*not.*found|not.*found.*tool|unknown.*tool/.test(msg)) return true;
+  return false;
 }

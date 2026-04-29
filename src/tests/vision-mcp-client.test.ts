@@ -53,11 +53,19 @@ test("StdioVisionMcpClient initializes once and forwards tools/call", async () =
 
   pushStdout(JSON.stringify({ jsonrpc: "2.0", id: initBody.id, result: { protocolVersion: "2025-06-18" } }) + "\n");
 
-  // Initialized notification + tools/call should follow.
+  // notifications/initialized and tools/list should follow.
   await new Promise((r) => setImmediate(r));
   const initialized = JSON.parse(written[1]?.trim() ?? "{}") as { method: string };
   assert.equal(initialized.method, "notifications/initialized");
-  const callBody = JSON.parse(written[2]?.trim() ?? "{}") as { id: number; method: string; params: { name: string; arguments: Record<string, unknown> } };
+
+  const toolsListBody = JSON.parse(written[2]?.trim() ?? "{}") as { id: number; method: string };
+  assert.equal(toolsListBody.method, "tools/list");
+
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: toolsListBody.id, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+
+  // tools/call should follow after tools/list completes.
+  await new Promise((r) => setImmediate(r));
+  const callBody = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; method: string; params: { name: string; arguments: Record<string, unknown> } };
   assert.equal(callBody.method, "tools/call");
   assert.equal(callBody.params.name, "image_analysis");
   assert.equal(callBody.params.arguments["image_source"], "/tmp/x.png");
@@ -77,9 +85,11 @@ test("StdioVisionMcpClient surfaces JSON-RPC errors with method context", async 
   const callPromise = client.callTool("image_analysis", { image_source: "x" });
 
   await new Promise((r) => setImmediate(r));
-  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n"); // init response
   await new Promise((r) => setImmediate(r));
-  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32000, message: "quota exceeded" } }) + "\n");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n"); // tools/list
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 3, error: { code: -32000, message: "quota exceeded" } }) + "\n"); // tools/call error
 
   await assert.rejects(callPromise, /Vision MCP image_analysis failed.*quota exceeded/);
   await client.dispose();
@@ -98,3 +108,58 @@ test("StdioVisionMcpClient explains a missing npx as an actionable error", async
     /npx.*not found/i
   );
 });
+
+test("StdioVisionMcpClient resolves tool name via keyword fallback when server uses a different name", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+
+  const callPromise = client.callTool("image_analysis", { image_source: "/img.png" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  // Server uses "analyzeImage" instead of "image_analysis"
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "analyzeImage" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const callBody = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(callBody.params.name, "analyzeImage");
+
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "dog" }] } }) + "\n");
+  const result = await callPromise;
+  assert.deepEqual(result, { content: [{ type: "text", text: "dog" }] });
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient retries once on tool-not-found after re-discovering tools", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+
+  const callPromise = client.callTool("image_analysis", { image_source: "/img.png" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  // Initial discovery: tool name contains "image" so keyword matches
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "old_image_tool" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  // written[3] = first tools/call (name resolved to "old_image_tool" via keyword)
+  const firstCall = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(firstCall.params.name, "old_image_tool");
+  // tools/call fails with tool-not-found
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: firstCall.id, error: { code: -32601, message: "Tool old_image_tool not found" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  // written[4] = re-discovery tools/list
+  const rediscoverBody = JSON.parse(written[4]?.trim() ?? "{}") as { id: number; method: string };
+  assert.equal(rediscoverBody.method, "tools/list");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: rediscoverBody.id, result: { tools: [{ name: "analyzeImage" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  // written[5] = retry tools/call with updated name
+  const retryCallBody = JSON.parse(written[5]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(retryCallBody.params.name, "analyzeImage");
+
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: retryCallBody.id, result: { content: [{ type: "text", text: "cat" }] } }) + "\n");
+  const result = await callPromise;
+  assert.deepEqual(result, { content: [{ type: "text", text: "cat" }] });
+  await client.dispose();
+});
+

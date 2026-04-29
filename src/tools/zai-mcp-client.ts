@@ -1,3 +1,5 @@
+import { remapArguments, resolveToolName } from "./mcp-arg-remap.js";
+
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
 export const ZAI_WEB_SEARCH_MCP_ENDPOINT =
@@ -31,8 +33,13 @@ export interface ZaiMcpToolCall {
   signal?: AbortSignal;
 }
 
+interface DiscoveredTool {
+  name: string;
+  properties: string[];
+}
+
 export class ZaiMcpClient {
-  private sessions = new Map<string, { sessionId?: string; initialized: boolean; toolNames: string[] }>();
+  private sessions = new Map<string, { sessionId?: string; initialized: boolean; tools: DiscoveredTool[] }>();
   private nextId = 1;
 
   constructor(
@@ -44,7 +51,7 @@ export class ZaiMcpClient {
     try {
       return await this.callToolInternal(call);
     } catch (err) {
-      if (!isToolNotFoundError(err)) throw err;
+      if (!isRetryableError(err)) throw err;
       const cacheKey = `${call.endpoint}\n${call.apiKey}`;
       this.sessions.delete(cacheKey);
       return this.callToolInternal(call);
@@ -53,7 +60,10 @@ export class ZaiMcpClient {
 
   private async callToolInternal(call: ZaiMcpToolCall): Promise<unknown> {
     const session = await this.ensureInitialized(call);
-    const resolvedName = resolveToolName(call.toolName, session.toolNames, call.endpoint);
+    const toolNames = session.tools.map((t) => t.name);
+    const resolvedName = resolveToolName(call.toolName, toolNames, call.endpoint);
+    const toolSchema = session.tools.find((t) => t.name === resolvedName);
+    const remappedArgs = remapArguments(call.arguments, toolSchema?.properties ?? []);
     const result = await this.sendRequest(
       call.endpoint,
       call.apiKey,
@@ -64,7 +74,7 @@ export class ZaiMcpClient {
         method: "tools/call",
         params: {
           name: resolvedName,
-          arguments: call.arguments,
+          arguments: remappedArgs,
         },
       },
       "tools/call",
@@ -114,13 +124,13 @@ export class ZaiMcpClient {
       sessionId
     );
 
-    const toolNames = await this.discoverTools(
+    const tools = await this.discoverTools(
       call.endpoint,
       call.apiKey,
       sessionId,
       call.signal
     );
-    const session = { sessionId, initialized: true, toolNames };
+    const session = { sessionId, initialized: true, tools };
     this.sessions.set(cacheKey, session);
     return session;
   }
@@ -130,7 +140,7 @@ export class ZaiMcpClient {
     apiKey: string,
     sessionId: string | undefined,
     signal?: AbortSignal
-  ): Promise<string[]> {
+  ): Promise<DiscoveredTool[]> {
     const response = await this.fetchJsonRpc(
       endpoint,
       apiKey,
@@ -144,8 +154,15 @@ export class ZaiMcpClient {
       signal,
       sessionId
     );
-    const result = response.body.result as { tools?: { name: string }[] } | undefined;
-    return result?.tools?.map((t) => t.name) ?? [];
+    const result = response.body.result as
+      | { tools?: { name: string; inputSchema?: { properties?: Record<string, unknown> } }[] }
+      | undefined;
+    return (
+      result?.tools?.map((t) => ({
+        name: t.name,
+        properties: t.inputSchema?.properties ? Object.keys(t.inputSchema.properties) : [],
+      })) ?? []
+    );
   }
 
   private async sendRequest(
@@ -292,35 +309,11 @@ function isCodingPlanEligibilityError(body: string): boolean {
   return /(^|["\s:])1113($|["\s,}])/.test(body);
 }
 
-function resolveToolName(
-  requestedName: string,
-  availableTools: string[],
-  endpoint: string
-): string {
-  if (availableTools.includes(requestedName)) return requestedName;
-
-  const keyword = extractToolKeyword(requestedName);
-  if (keyword) {
-    const match = availableTools.find((t) => t.toLowerCase().includes(keyword));
-    if (match) return match;
-  }
-
-  throw new Error(
-    `Tool "${requestedName}" not available on ${endpoint}. Available tools: [${availableTools.join(", ")}]`
-  );
-}
-
-function extractToolKeyword(name: string): string | undefined {
-  const lower = name.toLowerCase();
-  if (lower.includes("search")) return "search";
-  if (lower.includes("reader")) return "reader";
-  return undefined;
-}
-
-function isToolNotFoundError(error: unknown): boolean {
+function isRetryableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const msg = error.message.toLowerCase();
   if (/-32601/.test(msg)) return true;
+  if (/-32602/.test(msg)) return true;
   if (/tool.*not.*found|not.*found.*tool|unknown.*tool/.test(msg)) return true;
   return false;
 }
