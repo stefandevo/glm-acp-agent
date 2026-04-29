@@ -32,3 +32,12 @@ process does not have, so they are executed by hand:
 
 The version in `agent.json` and the npm tag pinned in `distribution.npx.package`
 must match the version published to npm.
+
+## Ongoing maintenance
+
+After the initial submission is merged, **version bumps are automatic**: the
+registry runs an hourly cron that picks up the latest npm version for
+`glm-acp-agent` and commits the bump directly to `main`. So this directory only
+needs another PR for non-version changes (description, icon, distribution
+metadata, adding new distribution methods, etc.). A normal `npm publish` is
+enough to roll out a new version through the registry.
