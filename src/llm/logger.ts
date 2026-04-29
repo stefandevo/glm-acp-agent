@@ -40,6 +40,11 @@ export function maskSecret(s: string): string {
   return "****" + s.slice(-4);
 }
 
+/** Returns true when debug logging is active (`ACP_GLM_DEBUG=true`). */
+export function isDebugEnabled(): boolean {
+  return DEBUG_ENABLED;
+}
+
 /** Reset the DEBUG_ENABLED flag (used in tests). */
 export function _resetDebugEnabled(): void {
   // no-op in production; tests monkey-patch this module's internals.

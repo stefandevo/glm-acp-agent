@@ -44,10 +44,10 @@ import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
-import { preprocessImageBlocks, type PreprocessedPrompt } from "./image-preprocessor.js";
+import { preprocessImageBlocks, buildPromptBlockDiagnosticLines, type PreprocessedPrompt } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
-import { debug, error } from "../llm/logger.js";
+import { debug, error, isDebugEnabled } from "../llm/logger.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -213,8 +213,11 @@ export class GlmAcpAgent implements Agent {
           // Baseline (text + resource_link) is implicit; we additionally accept
           // embedded resources for inline file context, plus images for
           // vision-capable GLM models (e.g. glm-4v-plus).
+          // Set ACP_GLM_PROMPT_IMAGES=false (or =0) to stop advertising image
+          // support so clients like Zed won't offer the image-attachment UI.
           embeddedContext: true,
-          image: true,
+          image: process.env["ACP_GLM_PROMPT_IMAGES"] !== "false" &&
+                 process.env["ACP_GLM_PROMPT_IMAGES"] !== "0",
         },
         sessionCapabilities: {
           close: {},
@@ -358,6 +361,11 @@ export class GlmAcpAgent implements Agent {
     // resource_link. Optional: embedded resources. Image blocks are routed
     // through Z.AI Coding Plan Vision MCP (see image-preprocessor) so the
     // result is always a plain string for the chat-completions endpoint.
+    if (isDebugEnabled()) {
+      for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
+        debug(line);
+      }
+    }
     let preprocessed: PreprocessedPrompt | undefined;
     preprocessed = await preprocessImageBlocks(
       params.prompt,
