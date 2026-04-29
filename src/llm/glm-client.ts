@@ -59,24 +59,19 @@ const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
     description: "Latest GLM reasoning model with thinking mode",
   },
   {
-    modelId: "glm-4.6",
-    name: "GLM-4.6",
-    description: "General-purpose reasoning model",
+    modelId: "glm-5-turbo",
+    name: "GLM-5 Turbo",
+    description: "Faster Coding Plan reasoning model",
   },
   {
-    modelId: "glm-4.5",
-    name: "GLM-4.5",
-    description: "Stable production model",
+    modelId: "glm-4.7",
+    name: "GLM-4.7",
+    description: "200K-context reasoning model",
   },
   {
     modelId: "glm-4.5-air",
     name: "GLM-4.5 Air",
     description: "Lightweight, lower-latency model",
-  },
-  {
-    modelId: "glm-4v-plus",
-    name: "GLM-4V Plus",
-    description: "Vision-capable multimodal model",
   },
 ];
 

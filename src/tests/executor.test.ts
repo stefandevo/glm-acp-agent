@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor } from "../tools/executor.js";
+import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 interface StubTerminal {
   id: string;
@@ -577,4 +578,60 @@ test("write_file rejects whitespace-only paths", async () => {
     JSON.stringify({ path: " \t\n", content: "x" })
   );
   assert.match(result.content, /path.*required/);
+});
+
+// ---------------------------------------------------------------------------
+// image_analysis (Vision MCP)
+// ---------------------------------------------------------------------------
+
+function fakeVisionClient(impl: VisionMcpClient["callTool"]): VisionMcpClient {
+  return {
+    callTool: impl,
+    async dispose() { /* noop */ },
+  };
+}
+
+test("image_analysis routes through the injected vision client and returns the text", async () => {
+  const conn = createConnectionStub();
+  const vision = fakeVisionClient(async (toolName, args) => {
+    assert.equal(toolName, "image_analysis");
+    assert.equal(args["image_source"], "/tmp/cat.png");
+    return { content: [{ type: "text", text: "A tabby cat." }] };
+  });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await exec.execute(
+    "tc1",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/cat.png", prompt: "describe" })
+  );
+  assert.equal(result.content, "A tabby cat.");
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "completed");
+});
+
+test("image_analysis surfaces vision errors as a failed tool result", async () => {
+  const conn = createConnectionStub();
+  const vision = fakeVisionClient(async () => {
+    throw new Error("Vision MCP image_analysis failed: quota exceeded");
+  });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await exec.execute(
+    "tc1",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/x.png" })
+  );
+  assert.match(result.content, /quota exceeded/);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("image_analysis is unavailable when no vision client is configured", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/x.png" })
+  );
+  assert.match(result.content, /vision[^.]*not configured/i);
 });

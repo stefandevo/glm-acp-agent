@@ -8,6 +8,7 @@ import {
   ZAI_WEB_READER_MCP_ENDPOINT,
   ZAI_WEB_SEARCH_MCP_ENDPOINT,
 } from "./zai-mcp-client.js";
+import type { VisionMcpClient } from "./vision-mcp-client.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -29,7 +30,8 @@ export class ToolExecutor {
     private connection: AgentSideConnection,
     private sessionId: string,
     private clientCapabilities: ClientCapabilities | null = null,
-    private signal?: AbortSignal
+    private signal?: AbortSignal,
+    private visionClient: VisionMcpClient | null = null
   ) {}
 
   /**
@@ -67,6 +69,8 @@ export class ToolExecutor {
         return this.webSearch(toolCallId, args);
       case "web_reader":
         return this.webReader(toolCallId, args);
+      case "image_analysis":
+        return this.imageAnalysis(toolCallId, args);
       default: {
         const message = `Error: unknown tool "${toolName}"`;
         await this.failedToolCall(toolCallId, toolName, args, message);
@@ -585,6 +589,66 @@ export class ToolExecutor {
     }
   }
 
+  private async imageAnalysis(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const imageSource = String(args["image_source"] ?? "").trim();
+    const prompt = typeof args["prompt"] === "string" ? args["prompt"] : undefined;
+    if (!imageSource) {
+      return this.failAndReturn(
+        toolCallId,
+        "image_analysis",
+        args,
+        "Error: `image_source` is required."
+      );
+    }
+    if (!this.visionClient) {
+      return this.failAndReturn(
+        toolCallId,
+        "image_analysis",
+        args,
+        "Error: vision is not configured on this agent process. Vision MCP requires `npx` and the Z.AI Coding Plan."
+      );
+    }
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Analyze image: ${imageSource}`,
+        kind: "fetch",
+        status: "in_progress",
+        locations: [{ path: imageSource }],
+        rawInput: args,
+      },
+    });
+
+    try {
+      const visionArgs: Record<string, unknown> = { image_source: imageSource };
+      if (prompt) visionArgs["prompt"] = prompt;
+      const mcpResult = await this.visionClient.callTool("image_analysis", visionArgs, this.signal);
+      const text = unwrapVisionText(mcpResult);
+
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text } }],
+          rawOutput: { text },
+        },
+      });
+      return { content: text };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error analyzing image: ${message}` };
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Notification helpers
   // ---------------------------------------------------------------------------
@@ -750,4 +814,16 @@ function stringValue(value: unknown): string | undefined {
  */
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+function unwrapVisionText(mcpResult: unknown): string {
+  if (!isRecord(mcpResult)) return typeof mcpResult === "string" ? mcpResult : "";
+  const content = mcpResult["content"];
+  if (Array.isArray(content)) {
+    const texts = content
+      .map((entry) => (isRecord(entry) && typeof entry["text"] === "string" ? (entry["text"] as string) : ""))
+      .filter((s) => s.length > 0);
+    if (texts.length > 0) return texts.join("\n");
+  }
+  return JSON.stringify(mcpResult);
 }
