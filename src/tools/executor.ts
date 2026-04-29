@@ -2,6 +2,12 @@ import type {
   AgentSideConnection,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
+import { resolveApiKey } from "../llm/credentials.js";
+import {
+  callZaiMcpTool,
+  ZAI_WEB_READER_MCP_ENDPOINT,
+  ZAI_WEB_SEARCH_MCP_ENDPOINT,
+} from "./zai-mcp-client.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -486,51 +492,19 @@ export class ToolExecutor {
     });
 
     try {
-      const apiKey = requireApiKey();
-      const body: Record<string, unknown> = {
-        search_engine: "search-prime",
-        search_query: query,
-      };
-      if (count !== undefined) body["count"] = count;
+      const apiKey = requireResolvedApiKey();
+      const toolArgs: Record<string, unknown> = { query };
+      if (count !== undefined) toolArgs["count"] = count;
 
-      const response = await fetch("https://api.z.ai/api/paas/v4/web_search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(body),
+      const mcpResult = await callZaiMcpTool({
+        endpoint: ZAI_WEB_SEARCH_MCP_ENDPOINT,
+        toolName: "webSearchPrime",
+        arguments: toolArgs,
+        apiKey,
         signal: this.signal,
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP ${response.status}: ${errorText}`);
-      }
-
-      const data = (await response.json()) as {
-        search_result?: Array<{
-          title?: string;
-          link?: string;
-          content?: string;
-          media?: string;
-          publish_date?: string;
-        }>;
-      };
-
-      const results = data.search_result ?? [];
-      const formatted = results
-        .map((r, i) => {
-          const lines = [`[${i + 1}] ${r.title ?? "(no title)"}`];
-          if (r.link) lines.push(`URL: ${r.link}`);
-          if (r.media) lines.push(`Source: ${r.media}`);
-          if (r.publish_date) lines.push(`Date: ${r.publish_date}`);
-          if (r.content) lines.push(`Summary: ${r.content}`);
-          return lines.join("\n");
-        })
-        .join("\n\n");
-
-      const output = formatted || "No results found.";
+      const { output, resultCount } = formatSearchOutput(mcpResult);
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -539,7 +513,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { resultCount: results.length },
+          rawOutput: { resultCount },
         },
       });
 
@@ -580,39 +554,17 @@ export class ToolExecutor {
     });
 
     try {
-      const apiKey = requireApiKey();
+      const apiKey = requireResolvedApiKey();
 
-      const response = await fetch("https://api.z.ai/api/paas/v4/reader", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({ url, return_format: returnFormat }),
+      const mcpResult = await callZaiMcpTool({
+        endpoint: ZAI_WEB_READER_MCP_ENDPOINT,
+        toolName: "webReader",
+        arguments: { url, return_format: returnFormat },
+        apiKey,
         signal: this.signal,
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP ${response.status}: ${errorText}`);
-      }
-
-      const data = (await response.json()) as {
-        reader_result?: {
-          title?: string;
-          description?: string;
-          url?: string;
-          content?: string;
-        };
-      };
-
-      const result = data.reader_result;
-      const lines: string[] = [];
-      if (result?.title) lines.push(`# ${result.title}`);
-      if (result?.url) lines.push(`URL: ${result.url}`);
-      if (result?.description) lines.push(`\n${result.description}`);
-      if (result?.content) lines.push(`\n${result.content}`);
-      const output = lines.join("\n") || "No content returned.";
+      const { output, title, resultUrl } = formatReaderOutput(mcpResult);
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -621,7 +573,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { title: result?.title, url: result?.url },
+          rawOutput: { title, url: resultUrl },
         },
       });
 
@@ -686,13 +638,110 @@ export class ToolExecutor {
   }
 }
 
-/** Read the API key from env, throwing a clear error if it's missing. */
-function requireApiKey(): string {
-  const apiKey = process.env["Z_AI_API_KEY"];
+/** Resolve the API key from env or stored credentials, throwing a clear error if missing. */
+function requireResolvedApiKey(): string {
+  const apiKey = resolveApiKey();
   if (!apiKey) {
-    throw new Error("Z_AI_API_KEY environment variable is required but not set.");
+    throw new Error(
+      "No API key found. Set Z_AI_API_KEY, or run `glm-acp-agent --setup` to store one."
+    );
   }
   return apiKey;
+}
+
+function formatSearchOutput(mcpResult: unknown): { output: string; resultCount: number } {
+  const payload = unwrapMcpPayload(mcpResult);
+  const results = isRecord(payload) && Array.isArray(payload["search_result"])
+    ? payload["search_result"]
+    : [];
+
+  if (results.length === 0) {
+    return {
+      output: typeof payload === "string" && payload.length > 0 ? payload : "No results found.",
+      resultCount: 0,
+    };
+  }
+
+  const output = results
+    .map((raw, i) => {
+      const r = isRecord(raw) ? raw : {};
+      const lines = [`[${i + 1}] ${stringValue(r["title"]) ?? "(no title)"}`];
+      const link = stringValue(r["link"]);
+      const media = stringValue(r["media"]);
+      const publishDate = stringValue(r["publish_date"]);
+      const content = stringValue(r["content"]);
+      if (link) lines.push(`URL: ${link}`);
+      if (media) lines.push(`Source: ${media}`);
+      if (publishDate) lines.push(`Date: ${publishDate}`);
+      if (content) lines.push(`Summary: ${content}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+
+  return { output, resultCount: results.length };
+}
+
+function formatReaderOutput(mcpResult: unknown): {
+  output: string;
+  title?: string;
+  resultUrl?: string;
+} {
+  const payload = unwrapMcpPayload(mcpResult);
+  const result = isRecord(payload) && isRecord(payload["reader_result"])
+    ? payload["reader_result"]
+    : undefined;
+
+  if (!result) {
+    return {
+      output: typeof payload === "string" && payload.length > 0 ? payload : "No content returned.",
+    };
+  }
+
+  const title = stringValue(result["title"]);
+  const resultUrl = stringValue(result["url"]);
+  const description = stringValue(result["description"]);
+  const content = stringValue(result["content"]);
+  const lines: string[] = [];
+  if (title) lines.push(`# ${title}`);
+  if (resultUrl) lines.push(`URL: ${resultUrl}`);
+  if (description) lines.push(`\n${description}`);
+  if (content) lines.push(`\n${content}`);
+
+  return { output: lines.join("\n") || "No content returned.", title, resultUrl };
+}
+
+function unwrapMcpPayload(mcpResult: unknown): unknown {
+  if (!isRecord(mcpResult)) return mcpResult;
+  const content = mcpResult["content"];
+  if (!Array.isArray(content)) return mcpResult;
+
+  const texts = content
+    .map((entry) => {
+      if (!isRecord(entry)) return undefined;
+      const text = entry["text"];
+      return typeof text === "string" ? text : undefined;
+    })
+    .filter((text): text is string => typeof text === "string");
+
+  if (texts.length === 0) return mcpResult;
+  if (texts.length === 1) return parseJsonIfPossible(texts[0]);
+  return texts.join("\n");
+}
+
+function parseJsonIfPossible(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 /**
