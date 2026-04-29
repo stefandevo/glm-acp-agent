@@ -30,6 +30,7 @@ test("preprocessImageBlocks forwards a remote URI directly to the vision client"
     })
   );
   assert.equal(seen?.["image_source"], "https://example.com/cat.png");
+  assert.equal(typeof seen?.["prompt"], "string", "callTool must always receive a prompt field");
   // Image block must have been replaced with a text annotation.
   assert.equal(result.blocks.length, 2);
   const last = result.blocks[1] as { type: string; text?: string };
@@ -37,12 +38,31 @@ test("preprocessImageBlocks forwards a remote URI directly to the vision client"
   assert.match(last.text ?? "", /<image_analysis index="1">[\s\S]*A cat\.[\s\S]*<\/image_analysis>/);
 });
 
+test("preprocessImageBlocks prefers base64 data over URI when both are present", async () => {
+  let seenSource = "";
+  let seenPrompt: unknown;
+  const result = await preprocessImageBlocks(
+    [{ type: "image", data: "AAAA", mimeType: "image/png", uri: "https://example.com/should-not-use.png" }],
+    makeClient(async (_name, args) => {
+      seenSource = String(args["image_source"]);
+      seenPrompt = args["prompt"];
+      return { content: [{ type: "text", text: "blank image" }] };
+    })
+  );
+  for (const c of result.cleanups) await c();
+  assert.ok(!seenSource.startsWith("https://"), "URI must not be used when base64 data is available");
+  assert.ok(seenSource.length > 0, "a temp file path must have been passed");
+  assert.equal(typeof seenPrompt, "string", "callTool must receive a prompt field");
+});
+
 test("preprocessImageBlocks materializes inline data to a temp file and cleans it up", async () => {
   let seenPath = "";
+  let seenPrompt: unknown;
   const result = await preprocessImageBlocks(
     [{ type: "image", data: "AAAA", mimeType: "image/png" }],
     makeClient(async (_name, args) => {
       seenPath = String(args["image_source"]);
+      seenPrompt = args["prompt"];
       assert.ok(existsSync(seenPath), "temp file must exist while vision MCP is invoked");
       const bytes = readFileSync(seenPath);
       assert.equal(bytes.length, 3); // base64 "AAAA" = 3 bytes
@@ -52,6 +72,7 @@ test("preprocessImageBlocks materializes inline data to a temp file and cleans i
   // Run cleanups after the call returns and verify the file is gone.
   for (const c of result.cleanups) await c();
   assert.equal(existsSync(seenPath), false);
+  assert.equal(typeof seenPrompt, "string", "callTool must receive a prompt field");
 });
 
 test("preprocessImageBlocks degrades gracefully when the vision client fails", async () => {
