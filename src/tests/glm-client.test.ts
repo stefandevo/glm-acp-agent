@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GlmClient } from "../llm/glm-client.js";
+import { GlmClient, getAvailableModels } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
   process.env["Z_AI_API_KEY"] = "test-key";
@@ -150,6 +150,32 @@ test("constructor throws if Z_AI_API_KEY is missing", () => {
     assert.throws(() => new GlmClient(), /Z_AI_API_KEY/);
   } finally {
     if (old !== undefined) process.env["Z_AI_API_KEY"] = old;
+  }
+});
+
+test("getAvailableModels returns the Coding Plan allowlist by default", () => {
+  const old = process.env["ACP_GLM_AVAILABLE_MODELS"];
+  delete process.env["ACP_GLM_AVAILABLE_MODELS"];
+  try {
+    const ids = getAvailableModels().map((m) => m.modelId);
+    assert.deepEqual(ids, ["glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
+    assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
+    assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_AVAILABLE_MODELS"] = old;
+  }
+});
+
+test("ACP_GLM_AVAILABLE_MODELS env override still wins over the built-in list", () => {
+  const old = process.env["ACP_GLM_AVAILABLE_MODELS"];
+  process.env["ACP_GLM_AVAILABLE_MODELS"] = "custom-a, custom-b";
+  try {
+    const ids = getAvailableModels().map((m) => m.modelId);
+    assert.deepEqual(ids, ["custom-a", "custom-b"]);
+  } finally {
+    if (old === undefined) delete process.env["ACP_GLM_AVAILABLE_MODELS"];
+    else process.env["ACP_GLM_AVAILABLE_MODELS"] = old;
   }
 });
 
