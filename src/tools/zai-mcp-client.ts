@@ -42,6 +42,7 @@ export class ZaiMcpClient {
 
   async callTool(call: ZaiMcpToolCall): Promise<unknown> {
     const session = await this.ensureInitialized(call);
+    const resolvedName = resolveToolName(call.toolName, session.toolNames, call.endpoint);
     const result = await this.sendRequest(
       call.endpoint,
       call.apiKey,
@@ -51,14 +52,14 @@ export class ZaiMcpClient {
         id: this.nextId++,
         method: "tools/call",
         params: {
-          name: call.toolName,
+          name: resolvedName,
           arguments: call.arguments,
         },
       },
       "tools/call",
       call.signal,
       session.sessionId,
-      call.toolName
+      resolvedName
     );
     return result;
   }
@@ -278,4 +279,29 @@ function formatJsonRpcError(stage: string, error: NonNullable<JsonRpcResponse["e
 
 function isCodingPlanEligibilityError(body: string): boolean {
   return /(^|["\s:])1113($|["\s,}])/.test(body);
+}
+
+function resolveToolName(
+  requestedName: string,
+  availableTools: string[],
+  endpoint: string
+): string {
+  if (availableTools.includes(requestedName)) return requestedName;
+
+  const keyword = extractToolKeyword(requestedName);
+  if (keyword) {
+    const match = availableTools.find((t) => t.toLowerCase().includes(keyword));
+    if (match) return match;
+  }
+
+  throw new Error(
+    `Tool "${requestedName}" not available on ${endpoint}. Available tools: [${availableTools.join(", ")}]`
+  );
+}
+
+function extractToolKeyword(name: string): string | undefined {
+  const lower = name.toLowerCase();
+  if (lower.includes("search")) return "search";
+  if (lower.includes("reader")) return "reader";
+  return undefined;
 }

@@ -172,6 +172,79 @@ test("ZaiMcpClient parses SSE wrapped JSON-RPC responses", async () => {
   assert.deepEqual(result, { content: [{ type: "text", text: "# Title\nBody" }] });
 });
 
+test("ZaiMcpClient resolves tool name via keyword fallback when exact name is unavailable", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", capabilities: {} },
+      },
+      { sessionId: "session-fallback" }
+    ),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "webSearchV2" }, { name: "otherTool" }] },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { content: [{ type: "text", text: "fallback result" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  const result = await client.callTool({
+    endpoint,
+    toolName: "webSearchPrime",
+    arguments: { query: "test" },
+    apiKey: "test-key",
+  });
+
+  assert.deepEqual(result, { content: [{ type: "text", text: "fallback result" }] });
+  assert.equal(calls[3]?.body.method, "tools/call");
+  assert.deepEqual(calls[3]?.body.params, {
+    name: "webSearchV2",
+    arguments: { query: "test" },
+  });
+  assert.equal(calls[3]?.headers.get("Mcp-Name"), "webSearchV2");
+});
+
+test("ZaiMcpClient throws with diagnostics when no matching tool is found", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { fetchStub } = createFetchStub([
+    jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-06-18", capabilities: {} },
+      },
+      { sessionId: "session-no-match" }
+    ),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: "totallyUnrelated" }] },
+    }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await assert.rejects(
+    () =>
+      client.callTool({
+        endpoint,
+        toolName: "webSearchPrime",
+        arguments: { query: "test" },
+        apiKey: "test-key",
+      }),
+    /Tool "webSearchPrime" not available/
+  );
+});
+
 test("ZaiMcpClient explains Coding Plan eligibility when Z.AI returns 1113", async () => {
   const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
   const { fetchStub } = createFetchStub([
