@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { debug, maskSecret } from "./logger.js";
 
 /**
  * Credential management for the Z.AI API key.
@@ -45,8 +46,17 @@ export function readCredentialsKey(path: string = credentialsPath()): string | u
  */
 export function resolveApiKey(): string | undefined {
   const fromEnv = process.env["Z_AI_API_KEY"];
-  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
-  return readCredentialsKey();
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    debug(`resolveApiKey: source=env key=${maskSecret(fromEnv)}`);
+    return fromEnv;
+  }
+  const fromFile = readCredentialsKey();
+  if (fromFile) {
+    debug(`resolveApiKey: source=file key=${maskSecret(fromFile)}`);
+  } else {
+    debug("resolveApiKey: no key found");
+  }
+  return fromFile;
 }
 
 /**

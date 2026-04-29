@@ -3,6 +3,7 @@ import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/reso
 import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
+import { debug, error } from "./logger.js";
 
 /**
  * A single message in the GLM conversation history.
@@ -37,8 +38,8 @@ export interface StreamChatOptions {
   model: string;
 }
 
-/** Default base URL for the Z.AI / Zhipu OpenAI-compatible API. */
-const DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4";
+/** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
+const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 
 /** Default GLM model when neither client nor user has chosen one. */
 export const DEFAULT_MODEL = "glm-5.1";
@@ -151,6 +152,10 @@ export class GlmClient {
       },
     }));
 
+    debug(
+      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${thinkingEnabled}`
+    );
+
     // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
     // that to pass GLM-specific fields like `thinking`.
     const extraBody: Record<string, unknown> = {};
@@ -158,20 +163,28 @@ export class GlmClient {
       extraBody["thinking"] = { type: "enabled" };
     }
 
-    const stream = await this.client.chat.completions.create(
-      {
-        model,
-        messages,
-        tools,
-        tool_choice: "auto",
-        stream: true,
-        // Always ask the API to include final usage in the streaming response.
-        stream_options: { include_usage: true },
-        max_tokens: this.maxTokens,
-        ...extraBody,
-      },
-      { signal }
-    );
+    let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>>;
+    try {
+      stream = await this.client.chat.completions.create(
+        {
+          model,
+          messages,
+          tools,
+          tool_choice: "auto",
+          stream: true,
+          // Always ask the API to include final usage in the streaming response.
+          stream_options: { include_usage: true },
+          max_tokens: this.maxTokens,
+          ...extraBody,
+        },
+        { signal }
+      );
+    } catch (err) {
+      const status = (err as { status?: number })?.status;
+      const body = (err as { error?: unknown })?.error;
+      error(`streamChat request failed: status=${status}`, JSON.stringify(body) ?? String(err));
+      throw err;
+    }
 
     // Tool call deltas arrive interleaved across chunks; assemble by index.
     const pendingToolCalls: Map<
@@ -253,6 +266,7 @@ export class GlmClient {
         ) {
           usage.thoughtTokens = rawUsage.completion_tokens_details.reasoning_tokens;
         }
+        debug(`streamChat usage: input=${usage.inputTokens} output=${usage.outputTokens} total=${usage.totalTokens}`);
         yield { usage };
       }
     }
