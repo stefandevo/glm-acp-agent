@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { remapArguments, resolveToolName } from "./mcp-arg-remap.js";
+import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -14,11 +14,6 @@ interface StdioVisionMcpClientOptions {
   packageSpec?: string;
   /** Override the spawn function for tests. */
   spawn?: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => ChildProcessWithoutNullStreams;
-}
-
-interface DiscoveredTool {
-  name: string;
-  properties: string[];
 }
 
 interface PendingRequest {
@@ -46,24 +41,26 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   }
 
   private async callToolInternal(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    const toolNames = this.discoveredTools.map((t) => t.name);
-    const resolvedName = resolveToolName(toolName, toolNames, "@z_ai/mcp-server");
-    const toolSchema = this.discoveredTools.find((t) => t.name === resolvedName);
-    const remappedArgs = remapArguments(args, toolSchema?.properties ?? []);
+    const { name: resolvedName, args: remappedArgs } = this.resolveAndRemap(toolName, args);
     try {
       return await this.request("tools/call", { name: resolvedName, arguments: remappedArgs }, `Vision MCP ${toolName}`, signal);
     } catch (err) {
       if (!isVisionRetryableError(err)) throw err;
-      await this.rediscoverTools();
-      const resolvedName2 = resolveToolName(toolName, this.discoveredTools.map((t) => t.name), "@z_ai/mcp-server");
-      const toolSchema2 = this.discoveredTools.find((t) => t.name === resolvedName2);
-      const remappedArgs2 = remapArguments(args, toolSchema2?.properties ?? []);
+      await this.rediscoverTools(signal);
+      const { name: resolvedName2, args: remappedArgs2 } = this.resolveAndRemap(toolName, args);
       return this.request("tools/call", { name: resolvedName2, arguments: remappedArgs2 }, `Vision MCP ${toolName}`, signal);
     }
   }
 
-  private async rediscoverTools(): Promise<void> {
-    const result = await this.request("tools/list", {}, "Vision MCP tools/list") as
+  private resolveAndRemap(toolName: string, args: Record<string, unknown>): { name: string; args: Record<string, unknown> } {
+    const toolNames = this.discoveredTools.map((t) => t.name);
+    const resolvedName = resolveToolName(toolName, toolNames, "@z_ai/mcp-server");
+    const toolSchema = this.discoveredTools.find((t) => t.name === resolvedName);
+    return { name: resolvedName, args: remapArguments(args, toolSchema?.properties ?? []) };
+  }
+
+  private async rediscoverTools(signal?: AbortSignal): Promise<void> {
+    const result = await this.request("tools/list", {}, "Vision MCP tools/list", signal) as
       | { tools?: { name: string; inputSchema?: { properties?: Record<string, unknown> } }[] }
       | undefined;
     const tools = result?.tools ?? [];

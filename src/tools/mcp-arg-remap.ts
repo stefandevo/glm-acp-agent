@@ -1,5 +1,11 @@
 import { debug } from "../llm/logger.js";
 
+/** Represents a tool discovered via `tools/list`, including its schema property names. */
+export interface DiscoveredTool {
+  name: string;
+  properties: string[];
+}
+
 /** Maps agent-side argument names to upstream MCP property names. */
 const ARG_ALIASES: Record<string, string> = {
   query: "search_query",
@@ -51,7 +57,10 @@ export function resolveToolName(
   const keywords = extractToolKeywords(requestedName);
   for (const keyword of keywords) {
     const match = availableTools.find((t) => t.toLowerCase().includes(keyword));
-    if (match) return match;
+    if (match) {
+      debug(`mcp-arg-remap: resolved tool name "${requestedName}" → "${match}" via keyword "${keyword}"`);
+      return match;
+    }
   }
 
   throw new Error(

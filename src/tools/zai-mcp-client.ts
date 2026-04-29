@@ -1,4 +1,4 @@
-import { remapArguments, resolveToolName } from "./mcp-arg-remap.js";
+import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -31,11 +31,6 @@ export interface ZaiMcpToolCall {
   arguments: Record<string, unknown>;
   apiKey: string;
   signal?: AbortSignal;
-}
-
-interface DiscoveredTool {
-  name: string;
-  properties: string[];
 }
 
 export class ZaiMcpClient {
