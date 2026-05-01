@@ -1,6 +1,6 @@
 {
   "name": "glm-acp-agent",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "ACP agent in TypeScript that uses the Zhipu AI GLM series (specifically GLM-5.1 and GLM-4.7) as the reasoning core",
   "type": "module",
   "main": "dist/index.js",
