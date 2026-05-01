@@ -23,6 +23,14 @@
     "zhipu",
     "coding-agent"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stefandevo/glm-acp-agent.git"
+  },
+  "homepage": "https://github.com/stefandevo/glm-acp-agent#readme",
+  "bugs": {
+    "url": "https://github.com/stefandevo/glm-acp-agent/issues"
+  },
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
