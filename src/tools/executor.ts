@@ -8,6 +8,7 @@ import {
   ZAI_WEB_READER_MCP_ENDPOINT,
   ZAI_WEB_SEARCH_MCP_ENDPOINT,
 } from "./zai-mcp-client.js";
+import type { SessionMcpTools } from "./session-mcp-client.js";
 import type { VisionMcpClient } from "./vision-mcp-client.js";
 
 /**
@@ -31,7 +32,8 @@ export class ToolExecutor {
     private sessionId: string,
     private clientCapabilities: ClientCapabilities | null = null,
     private signal?: AbortSignal,
-    private visionClient: VisionMcpClient | null = null
+    private visionClient: VisionMcpClient | null = null,
+    private sessionMcpTools: SessionMcpTools | null = null
   ) {}
 
   /**
@@ -72,6 +74,9 @@ export class ToolExecutor {
       case "image_analysis":
         return this.imageAnalysis(toolCallId, args);
       default: {
+        if (this.sessionMcpTools?.hasTool(toolName)) {
+          return this.sessionMcpTool(toolCallId, toolName, args);
+        }
         const message = `Error: unknown tool "${toolName}"`;
         await this.failedToolCall(toolCallId, toolName, args, message);
         return { content: message };
@@ -649,6 +654,45 @@ export class ToolExecutor {
     }
   }
 
+  private async sessionMcpTool(
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: toolName,
+        kind: "other",
+        status: "in_progress",
+        locations: [],
+        rawInput: args,
+      },
+    });
+
+    try {
+      const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
+      const text = unwrapToolText(mcpResult);
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text } }],
+          rawOutput: mcpResult,
+        },
+      });
+      return { content: text };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error calling MCP tool ${toolName}: ${message}` };
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Notification helpers
   // ---------------------------------------------------------------------------
@@ -824,6 +868,20 @@ function unwrapVisionText(mcpResult: unknown): string {
       .map((entry) => (isRecord(entry) && typeof entry["text"] === "string" ? (entry["text"] as string) : ""))
       .filter((s) => s.length > 0);
     if (texts.length > 0) return texts.join("\n");
+  }
+  return JSON.stringify(mcpResult);
+}
+
+function unwrapToolText(mcpResult: unknown): string {
+  if (typeof mcpResult === "string") return mcpResult;
+  if (isRecord(mcpResult)) {
+    const content = mcpResult["content"];
+    if (Array.isArray(content)) {
+      const texts = content
+        .map((entry) => (isRecord(entry) && typeof entry["text"] === "string" ? (entry["text"] as string) : ""))
+        .filter((s) => s.length > 0);
+      if (texts.length > 0) return texts.join("\n");
+    }
   }
   return JSON.stringify(mcpResult);
 }
