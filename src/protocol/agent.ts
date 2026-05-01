@@ -41,7 +41,8 @@ import {
   type StreamChatOptions,
 } from "../llm/glm-client.js";
 import { ToolExecutor } from "../tools/executor.js";
-import { TOOL_DEFINITIONS } from "../tools/definitions.js";
+import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
+import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines, type PreprocessedPrompt } from "./image-preprocessor.js";
@@ -73,6 +74,10 @@ interface SessionState {
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
   model: string;
+  /** Per-session tool schemas, including client-supplied MCP tools. */
+  toolDefinitions: ToolDefinition[];
+  /** Connected client-supplied MCP tools for this session. */
+  mcpTools: SessionMcpTools | null;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -209,6 +214,9 @@ export class GlmAcpAgent implements Agent {
       ],
       agentCapabilities: {
         loadSession: true,
+        mcpCapabilities: {
+          http: true,
+        },
         promptCapabilities: {
           // Baseline (text + resource_link) is implicit; we additionally accept
           // embedded resources for inline file context, plus images for
@@ -242,12 +250,14 @@ export class GlmAcpAgent implements Agent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
+    const mcpTools = await connectSessionMcpServers(params.mcpServers);
+    const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
       role: "system",
       content: buildSystemPrompt({
         cwd: params.cwd,
-        tools: this.availableToolNames(),
+        tools: toolDefinitions.map((tool) => tool.function.name),
         agentsMd: loadProjectContext(params.cwd),
       }),
     };
@@ -262,6 +272,8 @@ export class GlmAcpAgent implements Agent {
       title: null,
       updatedAt: new Date().toISOString(),
       model,
+      toolDefinitions,
+      mcpTools,
     });
 
     return {
@@ -468,6 +480,7 @@ export class GlmAcpAgent implements Agent {
       // pick the conversation back up. closeSession only releases in-memory
       // resources; the on-disk record is intentionally retained.
       this.persistSession(params.sessionId, session);
+      await session.mcpTools?.dispose();
     }
     this.sessions.delete(params.sessionId);
   }
@@ -527,6 +540,9 @@ export class GlmAcpAgent implements Agent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const persisted = this.requirePersisted(params.sessionId);
+    const mcpTools = await connectSessionMcpServers(params.mcpServers);
+    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
 
     // Restore in-memory state. We do NOT carry over the abortController /
     // promptPromise — those are transient.
@@ -538,6 +554,8 @@ export class GlmAcpAgent implements Agent {
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
+      toolDefinitions,
+      mcpTools,
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -556,6 +574,8 @@ export class GlmAcpAgent implements Agent {
     const persisted = source
       ? this.snapshot(params.sessionId, source)
       : this.requirePersisted(params.sessionId);
+    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
+    const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
     const forkedTitle =
@@ -569,6 +589,8 @@ export class GlmAcpAgent implements Agent {
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
+      toolDefinitions,
+      mcpTools,
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -583,6 +605,9 @@ export class GlmAcpAgent implements Agent {
     params: ResumeSessionRequest
   ): Promise<ResumeSessionResponse> {
     const persisted = this.requirePersisted(params.sessionId);
+    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
+    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
 
     const restored: SessionState = {
       cwd: params.cwd,
@@ -592,6 +617,8 @@ export class GlmAcpAgent implements Agent {
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
+      toolDefinitions,
+      mcpTools,
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -702,7 +729,8 @@ export class GlmAcpAgent implements Agent {
       sessionId,
       this.clientCapabilities,
       signal,
-      this.visionClient
+      this.visionClient,
+      session.mcpTools
     );
 
     let lastUsage: Usage | undefined;
@@ -725,6 +753,7 @@ export class GlmAcpAgent implements Agent {
       // it's mutated by `unstable_setSessionModel` between turns.
       for await (const chunk of this.glm.streamChat(session.messages, signal, {
         model: session.model,
+        tools: session.toolDefinitions,
       })) {
         if (signal.aborted) return { stopReason: "cancelled" };
 
@@ -823,14 +852,14 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
-  /** Names of tools we expose given the client's capabilities. */
-  private availableToolNames(): string[] {
+  /** Tool schemas we expose given the client's capabilities and session MCP tools. */
+  private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
     // If the client never sent capabilities at all (initialize wasn't called,
     // or it omitted the field), advertise the full set so the system prompt
     // still mentions every tool. The executor will surface a clean error if
     // the model invokes one whose capability is missing.
     if (!this.clientCapabilities) {
-      return TOOL_DEFINITIONS.map((t) => t.function.name);
+      return [...TOOL_DEFINITIONS, ...(mcpTools?.toolDefinitions ?? [])];
     }
 
     const fs = this.clientCapabilities.fs ?? {};
@@ -845,7 +874,11 @@ export class GlmAcpAgent implements Agent {
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
       names.push("image_analysis");
     }
-    return names;
+    const allowed = new Set(names);
+    return [
+      ...TOOL_DEFINITIONS.filter((tool) => allowed.has(tool.function.name)),
+      ...(mcpTools?.toolDefinitions ?? []),
+    ];
   }
 }
 

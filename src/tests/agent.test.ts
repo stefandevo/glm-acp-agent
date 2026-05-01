@@ -78,6 +78,16 @@ function createConnectionStub(): ConnectionStub {
   return stub;
 }
 
+function jsonResponse(
+  body: unknown,
+  init: ResponseInit & { sessionId?: string } = {}
+): Response {
+  const headers = new Headers(init.headers);
+  headers.set("Content-Type", "application/json");
+  if (init.sessionId) headers.set("MCP-Session-Id", init.sessionId);
+  return new Response(JSON.stringify(body), { ...init, headers });
+}
+
 function makeStreamingGlm(steps: Array<GlmStreamChunk[]>) {
   let i = 0;
   return {
@@ -143,6 +153,7 @@ test("initialize returns negotiated protocol version, agent info, and auth metho
   assert.equal(result.protocolVersion, PROTOCOL_VERSION);
   assert.equal(result.agentInfo?.name, "glm-acp-agent");
   assert.equal(result.agentCapabilities?.loadSession, true);
+  assert.equal(result.agentCapabilities?.mcpCapabilities?.http, true);
   assert.equal(result.agentCapabilities?.promptCapabilities?.embeddedContext, true);
   assert.equal(result.agentCapabilities?.promptCapabilities?.image, true);
   assert.ok(result.agentCapabilities?.sessionCapabilities?.close);
@@ -280,6 +291,220 @@ test("system prompt falls back to all tools when client never sent capabilities"
     "web_reader",
   ]) {
     assert.ok(captured.includes(name), `expected system prompt to mention ${name}`);
+  }
+});
+
+test("newSession connects HTTP MCP servers and exposes discovered tools", async () => {
+  const conn = createConnectionStub();
+  const fetchCalls: Array<{
+    url: string;
+    body: Record<string, unknown>;
+    headers: Headers;
+  }> = [];
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    assert.ok(init, "fetch init is required");
+    const body =
+      typeof init.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    fetchCalls.push({
+      url: String(url),
+      body,
+      headers: new Headers(init.headers),
+    });
+    if (body.method === "initialize") {
+      return jsonResponse(
+        {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "devflow" } },
+        },
+        { sessionId: "mcp-session-1" }
+      );
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          tools: [
+            {
+              name: "devflow_user_choice",
+              description: "Ask the user to choose between options.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  question: { type: "string" },
+                },
+                required: ["question"],
+              },
+            },
+          ],
+        },
+      });
+    }
+    throw new Error(`unexpected MCP method ${String(body.method)}`);
+  }) as typeof fetch;
+
+  try {
+    let capturedSystemPrompt = "";
+    let capturedToolNames: string[] = [];
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>,
+        _signal?: AbortSignal,
+        options?: unknown
+      ): AsyncGenerator<GlmStreamChunk> {
+        const sys = messages.find((m) => m.role === "system");
+        capturedSystemPrompt = typeof sys?.content === "string" ? sys.content : "";
+        capturedToolNames =
+          ((options as { tools?: Array<{ function: { name: string } }> } | undefined)?.tools ?? [])
+            .map((tool) => tool.function.name);
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+
+    const { sessionId } = await agent.newSession({
+      cwd: "/tmp",
+      mcpServers: [
+        {
+          type: "http",
+          name: "devflow",
+          url: "https://mcp.example.test/mcp",
+          headers: [{ name: "X-DevFlow", value: "task-35" }],
+        },
+      ],
+    });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.deepEqual(fetchCalls.map((call) => call.body.method), [
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+    assert.equal(fetchCalls[0]?.headers.get("X-DevFlow"), "task-35");
+    assert.equal(fetchCalls[2]?.headers.get("MCP-Session-Id"), "mcp-session-1");
+    assert.ok(capturedSystemPrompt.includes("devflow_user_choice"));
+    assert.ok(capturedToolNames.includes("devflow_user_choice"));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("prompt routes discovered HTTP MCP tool calls through tools/call", async () => {
+  const conn = createConnectionStub();
+  const fetchCalls: Array<{ body: Record<string, unknown>; headers: Headers }> = [];
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    assert.ok(init, "fetch init is required");
+    const body =
+      typeof init.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    fetchCalls.push({ body, headers: new Headers(init.headers) });
+    if (body.method === "initialize") {
+      return jsonResponse(
+        {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "devflow" } },
+        },
+        { sessionId: "mcp-session-2" }
+      );
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          tools: [
+            {
+              name: "devflow_user_choice",
+              description: "Ask the user to choose between options.",
+              inputSchema: {
+                type: "object",
+                properties: { question: { type: "string" } },
+                required: ["question"],
+              },
+            },
+          ],
+        },
+      });
+    }
+    if (body.method === "tools/call") {
+      assert.deepEqual(body.params, {
+        name: "devflow_user_choice",
+        arguments: { question: "Pick one?" },
+      });
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { content: [{ type: "text", text: "choice accepted" }] },
+      });
+    }
+    throw new Error(`unexpected MCP method ${String(body.method)}`);
+  }) as typeof fetch;
+
+  try {
+    let callIndex = 0;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown; tool_call_id?: string }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        callIndex++;
+        if (callIndex === 1) {
+          yield {
+            toolCall: {
+              id: "mcp-tool-call-1",
+              name: "devflow_user_choice",
+              arguments: JSON.stringify({ question: "Pick one?" }),
+            },
+          };
+          yield { done: true, stopReason: "tool_calls" };
+        } else {
+          const toolMsg = messages.find((m) => m.role === "tool");
+          assert.equal(toolMsg?.tool_call_id, "mcp-tool-call-1");
+          assert.equal(toolMsg?.content, "choice accepted");
+          yield { text: "Done." };
+          yield { done: true, stopReason: "stop" };
+        }
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({
+      cwd: "/tmp",
+      mcpServers: [
+        {
+          type: "http",
+          name: "devflow",
+          url: "https://mcp.example.test/mcp",
+          headers: [],
+        },
+      ],
+    });
+
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "ask me" }],
+    });
+
+    assert.equal(result.stopReason, "end_turn");
+    assert.deepEqual(fetchCalls.map((call) => call.body.method), [
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+      "tools/call",
+    ]);
+    assert.equal(fetchCalls[3]?.headers.get("MCP-Session-Id"), "mcp-session-2");
+  } finally {
+    globalThis.fetch = savedFetch;
   }
 });
 

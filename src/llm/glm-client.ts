@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
 import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
-import { TOOL_DEFINITIONS } from "../tools/definitions.js";
+import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
 import { debug, error } from "./logger.js";
 
@@ -36,6 +36,8 @@ export interface GlmStreamChunk {
 export interface StreamChatOptions {
   /** GLM model identifier to use for this call. */
   model: string;
+  /** Tool schemas available in this specific session. */
+  tools?: ToolDefinition[];
 }
 
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
@@ -138,7 +140,7 @@ export class GlmClient {
   ): AsyncGenerator<GlmStreamChunk> {
     const model = options?.model ?? getDefaultModel();
     const thinkingEnabled = parseThinking(model);
-    const tools: ChatCompletionTool[] = TOOL_DEFINITIONS.map((t) => ({
+    const tools: ChatCompletionTool[] = (options?.tools ?? TOOL_DEFINITIONS).map((t) => ({
       type: "function" as const,
       function: {
         name: t.function.name,
