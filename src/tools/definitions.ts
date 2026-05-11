@@ -2,9 +2,9 @@
  * Tool JSON schemas exposed to the GLM model.
  *
  * These definitions follow the OpenAI function-calling format and map
- * directly to ACP Client capabilities. The agent advertises the same set
- * of tools on every call; whether a tool actually works at runtime depends
- * on the client capabilities advertised at `initialize` time.
+ * directly to ToolExecutor implementations. Local file and shell tools run in
+ * the agent process; writes and command execution still ask the ACP client for
+ * permission before doing anything.
  */
 
 export interface ToolDefinition {
@@ -22,7 +22,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "read_file",
       description:
-        "Read the text content of a file from the client's file system. Requires the `fs.readTextFile` client capability.",
+        "Read the text content of a file from the agent process. Relative paths resolve against the ACP session working directory.",
       parameters: {
         type: "object",
         properties: {
@@ -40,7 +40,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "write_file",
       description:
-        "Write or overwrite a text file in the client's file system. The user is asked for permission before any write occurs. Requires the `fs.writeTextFile` client capability.",
+        "Write or overwrite a text file from the agent process after asking the user for permission. Relative paths resolve against the ACP session working directory.",
       parameters: {
         type: "object",
         properties: {
@@ -62,7 +62,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "list_files",
       description:
-        "List the files and directories at the given path by running `ls -la` through a shell on the client machine. Requires the `terminal` client capability and a POSIX-compatible shell.",
+        "List the files and directories at the given path from the agent process. Relative paths resolve against the ACP session working directory.",
       parameters: {
         type: "object",
         properties: {
@@ -80,7 +80,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "run_command",
       description:
-        "Execute a shell command via `sh -c` on the client machine and return its output. The user is asked for permission before each invocation. Requires the `terminal` client capability.",
+        "Execute a shell command via `sh -c` in the ACP session working directory and return stdout, stderr, and exit code. The user is asked for permission before each invocation.",
       parameters: {
         type: "object",
         properties: {

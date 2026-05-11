@@ -236,7 +236,7 @@ test("newSession returns a unique session id and seeds a system prompt", async (
   assert.equal(list.sessions.length, 2);
 });
 
-test("system prompt advertises only the tools matching client capabilities", async () => {
+test("system prompt advertises agent-owned local tools without client fs or terminal capabilities", async () => {
   const conn = createConnectionStub();
   let captured = "";
   const glm = {
@@ -255,13 +255,16 @@ test("system prompt advertises only the tools matching client capabilities", asy
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
   await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
 
-  // Web tools are unconditional, but file/terminal tools must NOT appear.
-  assert.ok(captured.includes("web_search"));
-  assert.ok(captured.includes("web_reader"));
-  assert.ok(!captured.includes("read_file"));
-  assert.ok(!captured.includes("write_file"));
-  assert.ok(!captured.includes("list_files"));
-  assert.ok(!captured.includes("run_command"));
+  for (const name of [
+    "read_file",
+    "write_file",
+    "list_files",
+    "run_command",
+    "web_search",
+    "web_reader",
+  ]) {
+    assert.ok(captured.includes(name), `expected system prompt to mention ${name}`);
+  }
 });
 
 test("system prompt falls back to all tools when client never sent capabilities", async () => {
@@ -1004,8 +1007,9 @@ test("prompt converts resource_link and embedded resource blocks", async () => {
 });
 
 test("tool call result is fed back into the next streamChat call", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-agent-tool-read-"));
+  writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
   const conn = createConnectionStub();
-  conn.fileResponses.set("/tmp/x.ts", "export const x = 1;");
 
   let callIndex = 0;
   const glm = {
@@ -1015,7 +1019,7 @@ test("tool call result is fed back into the next streamChat call", async () => {
       callIndex++;
       if (callIndex === 1) {
         yield {
-          toolCall: { id: "tc1", name: "read_file", arguments: JSON.stringify({ path: "/tmp/x.ts" }) },
+          toolCall: { id: "tc1", name: "read_file", arguments: JSON.stringify({ path: "x.ts" }) },
         };
         yield { done: true, stopReason: "tool_calls" };
       } else {
@@ -1034,15 +1038,19 @@ test("tool call result is fed back into the next streamChat call", async () => {
     protocolVersion: PROTOCOL_VERSION,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   });
-  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd: dir, mcpServers: [] });
 
-  const result = await agent.prompt({
-    sessionId,
-    prompt: [{ type: "text", text: "read it" }],
-  });
-  assert.equal(result.stopReason, "end_turn");
-  assert.equal(callIndex, 2);
-  assert.deepEqual(conn.reads, ["/tmp/x.ts"]);
+  try {
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "read it" }],
+    });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(callIndex, 2);
+    assert.deepEqual(conn.reads, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("prompt without title sets title from first user message", async () => {
