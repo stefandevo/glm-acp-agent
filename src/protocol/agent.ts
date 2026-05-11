@@ -173,8 +173,9 @@ export class GlmAcpAgent implements Agent {
     const negotiatedVersion =
       params.protocolVersion <= VERSION ? params.protocolVersion : VERSION;
 
-    // Track client capabilities so we can adapt tool calls to what the client
-    // actually supports.
+    // Keep client capabilities for compatibility with ACP initialize payloads.
+    // Built-in local tools run in this agent process and are not gated on
+    // client fs/terminal support.
     this.clientCapabilities = params.clientCapabilities ?? null;
 
     return {
@@ -730,7 +731,8 @@ export class GlmAcpAgent implements Agent {
       this.clientCapabilities,
       signal,
       this.visionClient,
-      session.mcpTools
+      session.mcpTools,
+      session.cwd
     );
 
     let lastUsage: Usage | undefined;
@@ -852,25 +854,9 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
-  /** Tool schemas we expose given the client's capabilities and session MCP tools. */
+  /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
-    // If the client never sent capabilities at all (initialize wasn't called,
-    // or it omitted the field), advertise the full set so the system prompt
-    // still mentions every tool. The executor will surface a clean error if
-    // the model invokes one whose capability is missing.
-    if (!this.clientCapabilities) {
-      return [...TOOL_DEFINITIONS, ...(mcpTools?.toolDefinitions ?? [])];
-    }
-
-    const fs = this.clientCapabilities.fs ?? {};
-    const terminal = this.clientCapabilities.terminal ?? false;
-    const names: string[] = [];
-    if (fs.readTextFile) names.push("read_file");
-    if (fs.writeTextFile) names.push("write_file");
-    if (terminal) names.push("list_files", "run_command");
-    // Web tools and image_analysis run inside the agent process, so they are
-    // unconditional except when vision is explicitly disabled.
-    names.push("web_search", "web_reader");
+    const names = ["read_file", "write_file", "list_files", "run_command", "web_search", "web_reader"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
       names.push("image_analysis");
     }

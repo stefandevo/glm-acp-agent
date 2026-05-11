@@ -2,6 +2,9 @@ import type {
   AgentSideConnection,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
+import { spawn } from "node:child_process";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
   callZaiMcpTool,
@@ -19,12 +22,11 @@ export interface ToolResult {
 }
 
 /**
- * Executes GLM tool calls by delegating to the corresponding ACP Client methods.
+ * Executes GLM tool calls from inside the agent process.
  *
- * Permission is requested from the user before any write or execute operation.
- * Tools that require capabilities the client did not advertise return a clear
- * error string instead of throwing, so the model can recover by trying a
- * different approach.
+ * Permission is requested from the user before any write or execute operation,
+ * while read/list operations and approved writes/commands run locally with
+ * paths resolved relative to the ACP session cwd.
  */
 export class ToolExecutor {
   constructor(
@@ -33,7 +35,8 @@ export class ToolExecutor {
     private clientCapabilities: ClientCapabilities | null = null,
     private signal?: AbortSignal,
     private visionClient: VisionMcpClient | null = null,
-    private sessionMcpTools: SessionMcpTools | null = null
+    private sessionMcpTools: SessionMcpTools | null = null,
+    private sessionCwd: string = process.cwd()
   ) {}
 
   /**
@@ -85,25 +88,6 @@ export class ToolExecutor {
   }
 
   // ---------------------------------------------------------------------------
-  // Capability helpers
-  // ---------------------------------------------------------------------------
-
-  private requireCap(
-    toolCallId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    available: boolean,
-    capName: string
-  ): Promise<ToolResult> | null {
-    if (available) return null;
-    const message = `Error: client does not advertise the ${capName} capability; this tool is unavailable.`;
-    return (async () => {
-      await this.failedToolCall(toolCallId, toolName, args, message);
-      return { content: message };
-    })();
-  }
-
-  // ---------------------------------------------------------------------------
   // Private tool implementations
   // ---------------------------------------------------------------------------
 
@@ -111,19 +95,11 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const cap = this.requireCap(
-      toolCallId,
-      "read_file",
-      args,
-      Boolean(this.clientCapabilities?.fs?.readTextFile),
-      "fs.readTextFile"
-    );
-    if (cap) return cap;
-
     const path = String(args["path"] ?? "").trim();
     if (!path) {
       return this.failAndReturn(toolCallId, "read_file", args, "Error: `path` is required.");
     }
+    const absolutePath = this.resolvePath(path);
 
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
@@ -139,10 +115,7 @@ export class ToolExecutor {
     });
 
     try {
-      const response = await this.connection.readTextFile({
-        sessionId: this.sessionId,
-        path,
-      });
+      const content = await readFile(absolutePath, "utf8");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -150,12 +123,12 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: response.content } }],
-          rawOutput: { content: response.content },
+          content: [{ type: "content", content: { type: "text", text: content } }],
+          rawOutput: { content },
         },
       });
 
-      return { content: response.content };
+      return { content };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.markFailed(toolCallId, message);
@@ -167,20 +140,12 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const cap = this.requireCap(
-      toolCallId,
-      "write_file",
-      args,
-      Boolean(this.clientCapabilities?.fs?.writeTextFile),
-      "fs.writeTextFile"
-    );
-    if (cap) return cap;
-
     const path = String(args["path"] ?? "").trim();
     const content = String(args["content"] ?? "");
     if (!path) {
       return this.failAndReturn(toolCallId, "write_file", args, "Error: `path` is required.");
     }
+    const absolutePath = this.resolvePath(path);
 
     // Step 1: announce the pending tool call so the client can show it.
     await this.connection.sessionUpdate({
@@ -244,11 +209,7 @@ export class ToolExecutor {
     });
 
     try {
-      await this.connection.writeTextFile({
-        sessionId: this.sessionId,
-        path,
-        content,
-      });
+      await writeFile(absolutePath, content, "utf8");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -272,15 +233,6 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const cap = this.requireCap(
-      toolCallId,
-      "list_files",
-      args,
-      Boolean(this.clientCapabilities?.terminal),
-      "terminal"
-    );
-    if (cap) return cap;
-
     const rawPath = args["path"];
     if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
       return this.failAndReturn(
@@ -290,7 +242,8 @@ export class ToolExecutor {
         "Error listing files: `path` must be a non-empty string."
       );
     }
-    const path = rawPath;
+    const path = rawPath.trim();
+    const absolutePath = this.resolvePath(path);
 
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
@@ -305,18 +258,19 @@ export class ToolExecutor {
       },
     });
 
-    let terminal;
     try {
-      terminal = await this.connection.createTerminal({
-        sessionId: this.sessionId,
-        // Run via a shell so quoting / wildcards behave like a real ls call.
-        command: "sh",
-        args: ["-c", `ls -la -- ${shellQuote(path)}`],
-      });
-
-      await terminal.waitForExit();
-      const outputResponse = await terminal.currentOutput();
-      const output = outputResponse.output;
+      const entries = await readdir(absolutePath, { withFileTypes: true });
+      const lines = await Promise.all(
+        entries
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map(async (entry) => {
+            const entryPath = pathJoin(absolutePath, entry.name);
+            const info = await stat(entryPath);
+            const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
+            return `${type}\t${info.size}\t${entry.name}`;
+          })
+      );
+      const output = [`Listing for ${path} (${absolutePath})`, ...lines].join("\n");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -324,7 +278,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "terminal", terminalId: terminal.id }],
+          content: [{ type: "content", content: { type: "text", text: output } }],
           rawOutput: { output },
         },
       });
@@ -334,12 +288,6 @@ export class ToolExecutor {
       const message = err instanceof Error ? err.message : String(err);
       await this.markFailed(toolCallId, message);
       return { content: `Error listing files: ${message}` };
-    } finally {
-      try {
-        await terminal?.release();
-      } catch {
-        // ignore release errors
-      }
     }
   }
 
@@ -347,15 +295,6 @@ export class ToolExecutor {
     toolCallId: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    const cap = this.requireCap(
-      toolCallId,
-      "run_command",
-      args,
-      Boolean(this.clientCapabilities?.terminal),
-      "terminal"
-    );
-    if (cap) return cap;
-
     const command = String(args["command"] ?? "").trim();
     if (!command) {
       return this.failAndReturn(
@@ -417,10 +356,10 @@ export class ToolExecutor {
       return { content: "Command rejected by user." };
     }
 
-    return this.runTerminalCommand(toolCallId, command);
+    return this.runLocalCommand(toolCallId, command);
   }
 
-  private async runTerminalCommand(
+  private async runLocalCommand(
     toolCallId: string,
     command: string
   ): Promise<ToolResult> {
@@ -433,19 +372,13 @@ export class ToolExecutor {
       },
     });
 
-    let terminal;
     try {
-      // Run via `sh -c` so the command string is interpreted by a real shell –
-      // this preserves quoting, pipes, redirects and environment expansion.
-      terminal = await this.connection.createTerminal({
-        sessionId: this.sessionId,
-        command: "sh",
-        args: ["-c", command],
-      });
-
-      await terminal.waitForExit();
-      const outputResponse = await terminal.currentOutput();
-      const output = outputResponse.output;
+      const { stdout, stderr, exitCode, signal } = await runShellCommand(
+        command,
+        this.sessionCwd,
+        this.signal
+      );
+      const output = formatCommandOutput({ stdout, stderr, exitCode, signal });
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -453,8 +386,8 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "terminal", terminalId: terminal.id }],
-          rawOutput: { output },
+          content: [{ type: "content", content: { type: "text", text: output } }],
+          rawOutput: { stdout, stderr, exitCode, signal },
         },
       });
 
@@ -463,13 +396,11 @@ export class ToolExecutor {
       const message = err instanceof Error ? err.message : String(err);
       await this.markFailed(toolCallId, message);
       return { content: `Error running command: ${message}` };
-    } finally {
-      try {
-        await terminal?.release();
-      } catch {
-        // ignore release errors
-      }
     }
+  }
+
+  private resolvePath(path: string): string {
+    return pathResolve(this.sessionCwd, path);
   }
 
   private async webSearch(
@@ -852,12 +783,52 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-/**
- * Quote a string for safe inclusion in a `sh -c` command line.
- * We use single quotes and escape any embedded single quotes via `'\''`.
- */
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
+function runShellCommand(
+  command: string,
+  cwd: string,
+  signal?: AbortSignal
+): Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", command], {
+      cwd,
+      signal,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let settled = false;
+
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    child.on("close", (exitCode, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        exitCode,
+        signal: closeSignal,
+      });
+    });
+  });
+}
+
+function formatCommandOutput(result: {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+}): string {
+  const lines = [`Exit code: ${result.exitCode ?? "unknown"}`];
+  if (result.signal) lines.push(`Signal: ${result.signal}`);
+  lines.push("", "STDOUT:", result.stdout.length > 0 ? result.stdout : "(empty)");
+  lines.push("", "STDERR:", result.stderr.length > 0 ? result.stderr : "(empty)");
+  return lines.join("\n");
 }
 
 function unwrapVisionText(mcpResult: unknown): string {

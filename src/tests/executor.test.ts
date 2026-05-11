@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeCredentials } from "../llm/credentials.js";
@@ -71,6 +71,10 @@ const FULL_CAPS = {
   fs: { readTextFile: true, writeTextFile: true },
   terminal: true,
 };
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 type FetchCall = {
   url: string;
@@ -168,34 +172,55 @@ test("empty arguments string is accepted as empty object", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Capability gating
+// Client capability independence
 // ---------------------------------------------------------------------------
 
-test("read_file is unavailable without fs.readTextFile capability", async () => {
+test("read_file reads from the agent process without fs.readTextFile capability", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-"));
+  const path = join(dir, "note.txt");
+  writeFileSync(path, "from disk", "utf8");
   const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} });
-  const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "/x" }));
-  assert.match(result.content, /does not advertise the fs.readTextFile capability/);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    assert.equal(result.content, "from disk");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test("write_file is unavailable without fs.writeTextFile capability", async () => {
+test("write_file writes from the agent process without fs.writeTextFile capability", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-"));
+  const path = join(dir, "out.txt");
   const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", { fs: { readTextFile: true } });
-  const result = await exec.execute(
-    "tc1",
-    "write_file",
-    JSON.stringify({ path: "/x", content: "hi" })
-  );
-  assert.match(result.content, /does not advertise the fs.writeTextFile capability/);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "hi" })
+    );
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "hi");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test("list_files / run_command are unavailable without terminal capability", async () => {
+test("list_files and run_command execute in the agent process without terminal capability", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-local-"));
+  writeFileSync(join(dir, "entry.txt"), "data", "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", { fs: {} });
-  const ls = await exec.execute("tc1", "list_files", JSON.stringify({ path: "/" }));
-  assert.match(ls.content, /does not advertise the terminal capability/);
-  const rc = await exec.execute("tc2", "run_command", JSON.stringify({ command: "ls" }));
-  assert.match(rc.content, /does not advertise the terminal capability/);
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
+  try {
+    const ls = await exec.execute("tc1", "list_files", JSON.stringify({ path: "." }));
+    assert.match(ls.content, /entry\.txt/);
+    const rc = await exec.execute("tc2", "run_command", JSON.stringify({ command: "pwd" }));
+    assert.match(rc.content, new RegExp(escapeRegExp(dir)));
+    assert.equal(conn.terminalCalls.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -203,30 +228,42 @@ test("list_files / run_command are unavailable without terminal capability", asy
 // ---------------------------------------------------------------------------
 
 test("read_file success path emits in_progress and completed updates", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-success-"));
+  const path = join(dir, "x.txt");
+  writeFileSync(path, "hello", "utf8");
   const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
-  const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "/x.txt" }));
-  assert.equal(result.content, "hello");
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    assert.equal(result.content, "hello");
 
-  const sequence = conn.updates.map(
-    (u) => ({
-      type: (u.update as { sessionUpdate: string }).sessionUpdate,
-      status: (u.update as { status?: string }).status,
-    })
-  );
-  assert.deepEqual(sequence, [
-    { type: "tool_call", status: "in_progress" },
-    { type: "tool_call_update", status: "completed" },
-  ]);
+    const sequence = conn.updates.map(
+      (u) => ({
+        type: (u.update as { sessionUpdate: string }).sessionUpdate,
+        status: (u.update as { status?: string }).status,
+      })
+    );
+    assert.deepEqual(sequence, [
+      { type: "tool_call", status: "in_progress" },
+      { type: "tool_call_update", status: "completed" },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("read_file failure is reported with status=failed and an error message", async () => {
-  const conn = createConnectionStub({ readError: true });
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-fail-"));
+  const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
-  const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "/x.txt" }));
-  assert.match(result.content, /Error reading file:/);
-  const last = conn.updates.at(-1) as { update: { status?: string } };
-  assert.equal(last.update.status, "failed");
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: join(dir, "missing.txt") }));
+    assert.match(result.content, /Error reading file:/);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -234,38 +271,52 @@ test("read_file failure is reported with status=failed and an error message", as
 // ---------------------------------------------------------------------------
 
 test("write_file requests permission, then transitions through pending → in_progress → completed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-success-"));
+  const path = join(dir, "y.txt");
   const conn = createConnectionStub({ permission: "allow" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
-  const result = await exec.execute(
-    "tc1",
-    "write_file",
-    JSON.stringify({ path: "/y.txt", content: "data" })
-  );
-  assert.match(result.content, /written successfully/);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "data" })
+    );
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "data");
 
-  assert.equal(conn.permissionRequests.length, 1);
-  const sequence = conn.updates.map((u) => ({
-    type: (u.update as { sessionUpdate: string }).sessionUpdate,
-    status: (u.update as { status?: string }).status,
-  }));
-  assert.deepEqual(sequence, [
-    { type: "tool_call", status: "pending" },
-    { type: "tool_call_update", status: "in_progress" },
-    { type: "tool_call_update", status: "completed" },
-  ]);
+    assert.equal(conn.permissionRequests.length, 1);
+    const sequence = conn.updates.map((u) => ({
+      type: (u.update as { sessionUpdate: string }).sessionUpdate,
+      status: (u.update as { status?: string }).status,
+    }));
+    assert.deepEqual(sequence, [
+      { type: "tool_call", status: "pending" },
+      { type: "tool_call_update", status: "in_progress" },
+      { type: "tool_call_update", status: "completed" },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("write_file rejected by user marks call failed and skips writing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-reject-"));
+  const path = join(dir, "y.txt");
   const conn = createConnectionStub({ permission: "reject" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
-  const result = await exec.execute(
-    "tc1",
-    "write_file",
-    JSON.stringify({ path: "/y.txt", content: "data" })
-  );
-  assert.match(result.content, /rejected by user/i);
-  const last = conn.updates.at(-1) as { update: { status?: string } };
-  assert.equal(last.update.status, "failed");
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "data" })
+    );
+    assert.match(result.content, /rejected by user/i);
+    assert.equal(existsSync(path), false);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("write_file cancelled by user marks call failed", async () => {
@@ -299,37 +350,84 @@ test("run_command rejects empty input", async () => {
 });
 
 test("run_command runs through sh -c so quoting/pipes work", async () => {
-  const conn = createConnectionStub({ terminalOutput: "/tmp" });
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-cmd-"));
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "printf 'mixed' | tr a-z A-Z && pwd" })
+  );
+  assert.match(result.content, /Exit code: 0/);
+  assert.match(result.content, /MIXED/);
+  assert.match(result.content, new RegExp(escapeRegExp(dir)));
+  assert.equal(conn.terminalCalls.length, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("run_command includes stderr and non-zero exit code in the tool result", async () => {
+  const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
   const result = await exec.execute(
     "tc1",
     "run_command",
-    JSON.stringify({ command: "echo $HOME | tr a-z A-Z" })
+    JSON.stringify({ command: "printf 'bad' >&2; exit 7" })
   );
-  assert.equal(result.content, "/tmp");
-  const call = conn.terminalCalls[0];
-  assert.equal(call?.command, "sh");
-  assert.deepEqual(call?.args, ["-c", "echo $HOME | tr a-z A-Z"]);
+  assert.match(result.content, /Exit code: 7/);
+  assert.match(result.content, /STDERR:\nbad/);
+  const last = conn.updates.at(-1) as {
+    update: { status?: string; rawOutput?: { exitCode?: number; stderr?: string } };
+  };
+  assert.equal(last.update.status, "completed");
+  assert.equal(last.update.rawOutput?.exitCode, 7);
+  assert.equal(last.update.rawOutput?.stderr, "bad");
+});
+
+test("run_command rejected by user marks call failed and skips execution", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "printf should-not-run" })
+  );
+  assert.match(result.content, /rejected by user/i);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+  assert.equal(conn.terminalCalls.length, 0);
+});
+
+test("run_command cancelled by user marks call failed and skips execution", async () => {
+  const conn = createConnectionStub({ permission: "cancelled" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "printf should-not-run" })
+  );
+  assert.match(result.content, /cancelled by user/i);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+  assert.equal(conn.terminalCalls.length, 0);
 });
 
 // ---------------------------------------------------------------------------
 // list_files
 // ---------------------------------------------------------------------------
 
-test("list_files runs through sh -c with shell-quoted path", async () => {
-  const conn = createConnectionStub({ terminalOutput: "drwxr-xr-x ..." });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+test("list_files resolves relative paths against the session cwd", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-list-"));
+  writeFileSync(join(dir, "with space.txt"), "data", "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   const result = await exec.execute(
     "tc1",
     "list_files",
-    JSON.stringify({ path: "/tmp/with space" })
+    JSON.stringify({ path: "." })
   );
-  assert.match(result.content, /drwxr-xr-x/);
-  const call = conn.terminalCalls[0];
-  assert.equal(call?.command, "sh");
-  assert.equal(call?.args?.[0], "-c");
-  assert.match(call?.args?.[1] ?? "", /^ls -la --/);
-  assert.match(call?.args?.[1] ?? "", /'\/tmp\/with space'/);
+  assert.match(result.content, /with space\.txt/);
+  assert.equal(conn.terminalCalls.length, 0);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("list_files rejects empty path", async () => {

@@ -32,7 +32,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Image input via Coding Plan Vision MCP** – `promptCapabilities.image` is advertised; pasted ACP image blocks are routed through Z.AI Vision MCP (`@z_ai/mcp-server`) and the resulting analysis is fed into the main coding model. Direct chat-image (e.g. `glm-4v-plus`) calls are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
-- **Capability-aware** – every tool is gated on the client capabilities advertised at `initialize` time; tools the client can't run return a clear error to the model instead of crashing
+- **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
 - **Permissioned writes / commands** – every `write_file` and `run_command` call asks the user via `session/request_permission` before doing anything
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
@@ -51,15 +51,15 @@ ACP Client (IDE plugin, CLI, …)
         ├─ GlmClient   ← Z.AI / Zhipu AI Coding Plan Chat Completions  (src/llm/)
         │
         ├─ ToolExecutor ← executes tool calls  (src/tools/)
-        │    ├─ read_file / write_file       → ACP client (fs.*)
-        │    ├─ list_files / run_command     → ACP client (terminal)
+        │    ├─ read_file / write_file       → Agent process (Node fs)
+        │    ├─ list_files / run_command     → Agent process (Node fs / child_process)
         │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
         │    └─ image_analysis               → Z.AI Coding Plan Vision MCP (stdio)
         │
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations remain delegated to the ACP client; the agent itself only writes to the OS temp directory when it needs to materialize a pasted image for Vision MCP, and those temp files are removed once the prompt completes.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations run inside the agent process with paths resolved against the ACP session working directory. Writes and arbitrary shell commands still go through ACP `session/request_permission`, so clients can render an approval prompt before the operation runs.
 
 ---
 
@@ -67,10 +67,10 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 
 | Tool | Runs on | Requires client capability | Description |
 |------|---------|----------------------------|-------------|
-| `read_file` | ACP client | `fs.readTextFile` | Read the text content of a file |
-| `write_file` | ACP client | `fs.writeTextFile` | Write or overwrite a text file (asks for permission) |
-| `list_files` | ACP client | `terminal` | List a directory via `ls -la` (POSIX shell required) |
-| `run_command` | ACP client | `terminal` | Run an arbitrary shell command via `sh -c` (asks for permission) |
+| `read_file` | Agent process | – | Read the text content of a file |
+| `write_file` | Agent process | ACP permission prompt | Write or overwrite a text file (asks for permission) |
+| `list_files` | Agent process | – | List a directory using Node filesystem APIs |
+| `run_command` | Agent process | ACP permission prompt | Run an arbitrary shell command via `sh -c` in the session cwd (asks for permission) |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | – | Search the web — returns titles, URLs, and summaries |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | – | Fetch and parse a web page (markdown or plain text) |
 | `image_analysis` | Agent (Z.AI Vision MCP, stdio) | – | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
@@ -284,7 +284,7 @@ For a tighter inner loop, run `npm run dev` in a terminal so `dist/` rebuilds on
 - **`Error: Cannot find module '/.../dist/index.js'`** — you skipped `npm run build`, or the path in `args` is wrong. It must be absolute and point at a file that exists.
 - **`No API key found.`** — neither `Z_AI_API_KEY` nor `~/.config/glm-acp-agent/credentials.json` is set. Use Option A or Option B in step 3.
 - **`HTTP 401: Invalid API key`** — your key is wrong, expired, or for the wrong region. Rotate it on <https://z.ai/manage-apikey/apikey-list>.
-- **`client does not advertise the … capability`** — Zed didn't expose that capability to the agent (e.g. `terminal` for `run_command`/`list_files`). Ask the model to use a different tool, or upgrade Zed.
+- **A write or command did not run.** — approve the ACP permission prompt for that tool call. Rejected or cancelled prompts are reported back to the model as skipped operations.
 
 ### Neovim / VS Code / JetBrains / any ACP client
 
@@ -343,7 +343,7 @@ The test suite covers:
 - Content-block conversion (`text`, `resource_link`, embedded `resource`)
 - Token usage reporting on the `PromptResponse`
 - Tool call lifecycle (`pending` → `in_progress` → `completed` / `failed`)
-- Capability gating (tools refuse cleanly when the client did not advertise the required capability)
+- Agent-owned local file and shell tools that work without ACP `fs` / `terminal` client capabilities
 - Permission flows for `write_file` and `run_command` (allow / reject / cancel)
 - Shell-quoted argument handling for `list_files` and `run_command`
 - GLM streaming: text deltas, `reasoning_content` deltas, multi-chunk tool-call assembly, and trailing usage
@@ -355,8 +355,7 @@ The test suite covers:
 
 - **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `node dist/index.js --setup` (or `glm-acp-agent --setup` if installed globally) once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
-- **The agent says "client does not advertise the … capability".** — your ACP client doesn't expose that capability (e.g. terminal). Ask the model to use a different tool, or upgrade the client.
-- **Tools never get to run.** — make sure the client is sending the `clientCapabilities` field in `initialize`; the agent uses it to decide which tools to expose to the model.
+- **Writes or commands never get to run.** — make sure your ACP client supports `session/request_permission` and that you approve the prompt for the specific tool call.
 
 ---
 

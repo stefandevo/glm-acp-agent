@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -117,10 +117,11 @@ test("end-to-end initialize / new session / prompt round-trip via real SDK trans
   assert.ok(updateKinds.includes("session_info_update"));
 });
 
-test("end-to-end tool call: agent reads a file via the stub client", async () => {
+test("end-to-end tool call: agent reads a local file from the session cwd", async () => {
   const { a, b } = pairedStreams();
   const stub = new StubClient();
-  stub.fileContents.set("/tmp/x.ts", "export const x = 1;");
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-read-"));
+  writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
 
   let callIndex = 0;
   const glm = {
@@ -131,7 +132,7 @@ test("end-to-end tool call: agent reads a file via the stub client", async () =>
           toolCall: {
             id: "tc1",
             name: "read_file",
-            arguments: JSON.stringify({ path: "/tmp/x.ts" }),
+            arguments: JSON.stringify({ path: "x.ts" }),
           },
         };
         yield { done: true, stopReason: "tool_calls" };
@@ -153,21 +154,25 @@ test("end-to-end tool call: agent reads a file via the stub client", async () =>
     protocolVersion: PROTOCOL_VERSION,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   });
-  const session = await clientConn.newSession({ cwd: "/tmp", mcpServers: [] });
-  const result = await clientConn.prompt({
-    sessionId: session.sessionId,
-    prompt: [{ type: "text", text: "read it" }],
-  });
+  const session = await clientConn.newSession({ cwd: dir, mcpServers: [] });
+  try {
+    const result = await clientConn.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "read it" }],
+    });
 
-  assert.equal(result.stopReason, "end_turn");
-  assert.deepEqual(stub.reads, [{ path: "/tmp/x.ts" }]);
+    assert.equal(result.stopReason, "end_turn");
+    assert.deepEqual(stub.reads, []);
 
-  // The client should have seen `tool_call` and `tool_call_update` notifications.
-  const updateKinds = stub.updates.map(
-    (u) => (u.update as { sessionUpdate: string }).sessionUpdate
-  );
-  assert.ok(updateKinds.includes("tool_call"));
-  assert.ok(updateKinds.includes("tool_call_update"));
+    // The client should have seen `tool_call` and `tool_call_update` notifications.
+    const updateKinds = stub.updates.map(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate
+    );
+    assert.ok(updateKinds.includes("tool_call"));
+    assert.ok(updateKinds.includes("tool_call_update"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("end-to-end cancellation via session/cancel notification", async () => {
