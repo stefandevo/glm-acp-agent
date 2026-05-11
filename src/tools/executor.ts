@@ -3,7 +3,7 @@ import type {
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, readdir, readFile, writeFile } from "node:fs/promises";
 import { join as pathJoin, resolve as pathResolve } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
@@ -265,7 +265,7 @@ export class ToolExecutor {
           .sort((a, b) => a.name.localeCompare(b.name))
           .map(async (entry) => {
             const entryPath = pathJoin(absolutePath, entry.name);
-            const info = await stat(entryPath);
+            const info = await lstat(entryPath);
             const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
             return `${type}\t${info.size}\t${entry.name}`;
           })
