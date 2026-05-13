@@ -88,10 +88,7 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 ## Installation
 
 ```bash
-git clone https://github.com/stefandevo/glm-acp-agent.git
-cd glm-acp-agent
-npm install
-npm run build
+npm install -g glm-acp-agent@latest
 ```
 
 ---
