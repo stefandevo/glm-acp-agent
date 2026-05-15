@@ -87,12 +87,35 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 
 ## Installation
 
+### Quick Start
+
+Install the published package globally to get the `glm-acp-agent` command on your `PATH`:
+
+```bash
+npm install -g glm-acp-agent@latest
+```
+
+Then either export your Z.AI API key and run it directly:
+
+```bash
+export Z_AI_API_KEY=your_key_here
+glm-acp-agent
+```
+
+…or run the interactive setup once to persist the key to disk (see [One-time setup](#one-time-setup)) and point any ACP-compatible client at the `glm-acp-agent` command.
+
+### From Source (Development)
+
+Clone the repository if you want to hack on the agent or pin a specific commit:
+
 ```bash
 git clone https://github.com/stefandevo/glm-acp-agent.git
 cd glm-acp-agent
 npm install
 npm run build
 ```
+
+The build output lands in `dist/`; the rest of this README uses `node dist/index.js` whenever it refers to the source-build entry point.
 
 ---
 
@@ -117,11 +140,13 @@ The agent reads its configuration from environment variables, plus an optional c
 If you'd rather not pass `Z_AI_API_KEY` through your ACP client's environment block, run the interactive setup once and the agent will read the key from disk on subsequent launches:
 
 ```bash
-# From the project directory (after npm run build)
-node dist/index.js --setup
-
-# Or, if you installed globally
 glm-acp-agent --setup
+```
+
+If you're working from a source clone instead of the published package, use the build output directly:
+
+```bash
+node dist/index.js --setup
 ```
 
 The key is written to `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json` (default: `~/.config/glm-acp-agent/credentials.json`) with `0600` permissions. The `Z_AI_API_KEY` environment variable, when set, always wins over the file.
@@ -160,6 +185,15 @@ The model can also call `image_analysis` explicitly with `{ image_source: "/path
 
 ### Standalone (stdio)
 
+If you installed the published package globally, just run the CLI:
+
+```bash
+export Z_AI_API_KEY=your_key_here
+glm-acp-agent
+```
+
+If you built from source, invoke the entry point directly:
+
 ```bash
 export Z_AI_API_KEY=your_key_here
 node dist/index.js
@@ -167,15 +201,9 @@ node dist/index.js
 
 The agent speaks the ACP newline-delimited JSON protocol over stdin/stdout. You can connect any ACP-compatible client to it.
 
-### As a global CLI
-
-```bash
-npm install -g .
-export Z_AI_API_KEY=your_key_here
-glm-acp-agent
-```
-
 ### Development mode (watch)
+
+When working from a source clone, run `tsc` in watch mode so `dist/` rebuilds on every save:
 
 ```bash
 export Z_AI_API_KEY=your_key_here
@@ -196,26 +224,35 @@ npm run dev        # tsc --watch
 - Node.js 20 or later on your `PATH` (`node --version`)
 - A Z.AI API key — create one at <https://z.ai/manage-apikey/apikey-list>
 
-#### 2. Build the agent
+#### 2. Install the agent
 
-```bash
-git clone https://github.com/stefandevo/glm-acp-agent.git
-cd glm-acp-agent
-npm install
-npm run build
-```
+Follow either path from the [Installation](#installation) section above:
 
-Take note of the absolute path to the freshly built entry point — Zed needs it (no `~`, no `$HOME` shortcuts):
+- **Quick Start** — `npm install -g glm-acp-agent@latest`. Zed can then spawn the agent with `"command": "glm-acp-agent"`.
+- **From source** — clone, `npm install`, `npm run build`. Zed needs the absolute path to the built entry point (no `~`, no `$HOME` shortcuts):
 
-```bash
-echo "$(pwd)/dist/index.js"
-```
+  ```bash
+  echo "$(pwd)/dist/index.js"
+  ```
 
 #### 3. Wire it into Zed
 
 Open (or create) `~/.config/zed/settings.json` and add an `agent_servers` entry. Pick **one** of the two API-key strategies below.
 
 **Option A — inline `env` block (simplest):**
+
+```json
+{
+  "agent_servers": {
+    "glm": {
+      "command": "glm-acp-agent",
+      "env": { "Z_AI_API_KEY": "sk-…" }
+    }
+  }
+}
+```
+
+If you installed from source instead of the published package, replace `command` / `args` with the absolute path to the build output:
 
 ```json
 {
@@ -231,17 +268,13 @@ Open (or create) `~/.config/zed/settings.json` and add an `agent_servers` entry.
 
 **Option B — credentials file (no key in your editor settings):**
 
-Run the interactive setup once. From the project directory:
-
-```bash
-node dist/index.js --setup
-```
-
-…or, if you `npm install -g .`'d the package:
+Run the interactive setup once:
 
 ```bash
 glm-acp-agent --setup
 ```
+
+If you're working from a source clone, use the build output directly: `node dist/index.js --setup`.
 
 The key is written to `~/.config/glm-acp-agent/credentials.json` with `0600` permissions. Then drop the `env` block from the Zed entry — the agent will read the file on launch:
 
@@ -249,8 +282,7 @@ The key is written to `~/.config/glm-acp-agent/credentials.json` with `0600` per
 {
   "agent_servers": {
     "glm": {
-      "command": "node",
-      "args": ["/absolute/path/to/glm-acp-agent/dist/index.js"]
+      "command": "glm-acp-agent"
     }
   }
 }
@@ -288,7 +320,12 @@ For a tighter inner loop, run `npm run dev` in a terminal so `dist/` rebuilds on
 
 ### Neovim / VS Code / JetBrains / any ACP client
 
-Any client that supports configuring an ACP agent via a `command` + `args` invocation works the same way: point it at `node /absolute/path/to/glm-acp-agent/dist/index.js` and supply `Z_AI_API_KEY` in the environment.
+Any client that supports configuring an ACP agent via a `command` + `args` invocation works the same way:
+
+- If you installed via `npm install -g glm-acp-agent@latest`, set `command` to `glm-acp-agent` (no args required).
+- If you built from source, set `command` to `node` and `args` to `["/absolute/path/to/glm-acp-agent/dist/index.js"]`.
+
+Supply `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` once so the agent reads the key from disk on launch.
 
 ### Authentication
 
@@ -353,7 +390,7 @@ The test suite covers:
 
 ## Troubleshooting
 
-- **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `node dist/index.js --setup` (or `glm-acp-agent --setup` if installed globally) once to store the key on disk.
+- **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` (or `node dist/index.js --setup` from a source clone) once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
 - **Writes or commands never get to run.** — make sure your ACP client supports `session/request_permission` and that you approve the prompt for the specific tool call.
 
