@@ -78,6 +78,30 @@ const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
 ];
 
 /**
+ * Z.AI / Zhipu AI error code returned when the total prompt length (messages +
+ * tools) exceeds the model's context window.
+ */
+export const ERR_CONTEXT_OVERFLOW = 1261;
+
+/**
+ * Context window sizes (in tokens) for GLM series models.
+ */
+const MODEL_METADATA: Record<string, { contextWindow: number }> = {
+  "glm-5.1": { contextWindow: 128_000 },
+  "glm-5-turbo": { contextWindow: 128_000 },
+  "glm-4.7": { contextWindow: 200_000 },
+  "glm-4.5-air": { contextWindow: 128_000 },
+};
+
+/**
+ * Resolve the context window size for a given model ID. Falls back to a safe
+ * default (128K) for uncatalogued models.
+ */
+export function getContextWindow(modelId: string): number {
+  return MODEL_METADATA[modelId]?.contextWindow ?? 128_000;
+}
+
+/**
  * Resolve the list of advertised models, allowing the user to override the
  * built-in list via `ACP_GLM_AVAILABLE_MODELS`.
  */

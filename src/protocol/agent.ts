@@ -36,6 +36,8 @@ import {
   GlmClient,
   getAvailableModels,
   getDefaultModel,
+  getContextWindow,
+  ERR_CONTEXT_OVERFLOW,
   type GlmMessage,
   type GlmStreamChunk,
   type StreamChatOptions,
@@ -740,6 +742,13 @@ export class GlmAcpAgent implements Agent {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled" };
 
+      // Proactive compaction: check if history exceeds 90% of context window.
+      const window = getContextWindow(session.model);
+      const limit = Math.floor(window * 0.9);
+      if (estimateTokens(session.messages) > limit) {
+        session.messages = compactMessages(session.messages, Math.floor(window * 0.8));
+      }
+
       debug(`promptLoop: turn=${turn} session=${sessionId} model=${session.model} messages=${session.messages.length}`);
 
       const toolCalls: Array<{
@@ -751,47 +760,67 @@ export class GlmAcpAgent implements Agent {
       let assistantText = "";
       let lastStopReason: string | undefined;
 
-      // Stream the GLM response. The session's currently-selected model wins;
-      // it's mutated by `unstable_setSessionModel` between turns.
-      for await (const chunk of this.glm.streamChat(session.messages, signal, {
-        model: session.model,
-        tools: session.toolDefinitions,
-      })) {
+      let retryTurn = false;
+      try {
+        // Stream the GLM response. The session's currently-selected model wins;
+        // it's mutated by `unstable_setSessionModel` between turns.
+        for await (const chunk of this.glm.streamChat(session.messages, signal, {
+          model: session.model,
+          tools: session.toolDefinitions,
+        })) {
+          if (signal.aborted) return { stopReason: "cancelled" };
+
+          if (chunk.thinking) {
+            await this.connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_thought_chunk",
+                content: { type: "text", text: chunk.thinking },
+              },
+            });
+          }
+
+          if (chunk.text) {
+            assistantText += chunk.text;
+            await this.connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: chunk.text },
+              },
+            });
+          }
+
+          if (chunk.toolCall) {
+            debug(`promptLoop: toolCall id=${chunk.toolCall.id} name=${chunk.toolCall.name}`);
+            toolCalls.push(chunk.toolCall);
+          }
+
+          if (chunk.usage) {
+            lastUsage = chunk.usage;
+          }
+
+          if (chunk.done) {
+            lastStopReason = chunk.stopReason;
+          }
+        }
+      } catch (err) {
         if (signal.aborted) return { stopReason: "cancelled" };
 
-        if (chunk.thinking) {
-          await this.connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_thought_chunk",
-              content: { type: "text", text: chunk.thinking },
-            },
-          });
+        const body = (err as { error?: { code?: string | number } })?.error;
+        if (body?.code === ERR_CONTEXT_OVERFLOW || body?.code === String(ERR_CONTEXT_OVERFLOW)) {
+          debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
+          const window = getContextWindow(session.model);
+          session.messages = compactMessages(session.messages, Math.floor(window * 0.7));
+          retryTurn = true;
+        } else {
+          throw err;
         }
+      }
 
-        if (chunk.text) {
-          assistantText += chunk.text;
-          await this.connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: chunk.text },
-            },
-          });
-        }
-
-        if (chunk.toolCall) {
-          debug(`promptLoop: toolCall id=${chunk.toolCall.id} name=${chunk.toolCall.name}`);
-          toolCalls.push(chunk.toolCall);
-        }
-
-        if (chunk.usage) {
-          lastUsage = chunk.usage;
-        }
-
-        if (chunk.done) {
-          lastStopReason = chunk.stopReason;
-        }
+      if (retryTurn) {
+        turn--; // Re-run the same turn index
+        continue;
       }
 
       // Record the assistant turn in history so the model has full context for
@@ -953,4 +982,88 @@ async function safeSessionUpdate(
   } catch {
     // best-effort
   }
+}
+
+/**
+ * Heuristically estimate the number of tokens in a list of messages.
+ * Uses a simple 4-character-per-token rule, which is a safe baseline for
+ * English and code.
+ */
+function estimateTokens(messages: GlmMessage[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") {
+      chars += m.content.length;
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if ("text" in part && typeof part.text === "string") {
+          chars += part.text.length;
+        }
+      }
+    }
+    if (m.role === "assistant" && m.tool_calls) {
+      for (const tc of m.tool_calls) {
+        if ("function" in tc) {
+          chars += tc.function.name.length;
+          chars += tc.function.arguments.length;
+        }
+      }
+    }
+  }
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * Prune message history to stay within a target token limit.
+ *
+ * Strategy:
+ * 1. Always keep the System prompt (index 0).
+ * 2. Always keep the last `preserveTurns` messages (default 10) to maintain
+ *    conversation flow.
+ * 3. Evict the largest remaining messages (typically large tool outputs or
+ *    summaries) until the total estimate is below `targetTokens`.
+ */
+function compactMessages(
+  messages: GlmMessage[],
+  targetTokens: number,
+  preserveTurns = 10
+): GlmMessage[] {
+  if (messages.length <= preserveTurns + 1) return messages;
+
+  let currentEstimate = estimateTokens(messages);
+  if (currentEstimate <= targetTokens) return messages;
+
+  debug(`compactMessages: currentEstimate=${currentEstimate} target=${targetTokens}`);
+
+  // Identify candidates for eviction: everything except system prompt and last N.
+  const systemPrompt = messages[0];
+  const tail = messages.slice(-preserveTurns);
+  const candidates = messages
+    .slice(1, -preserveTurns)
+    .map((m, index) => ({
+      message: m,
+      index: index + 1, // index in original array
+      tokens: estimateTokens([m]),
+    }));
+
+  // Sort candidates by size (largest first).
+  candidates.sort((a, b) => b.tokens - a.tokens);
+
+  const evictedIndices = new Set<number>();
+  for (const c of candidates) {
+    if (currentEstimate <= targetTokens) break;
+    evictedIndices.add(c.index);
+    currentEstimate -= c.tokens;
+  }
+
+  const compacted = [systemPrompt];
+  for (let i = 1; i < messages.length - preserveTurns; i++) {
+    if (!evictedIndices.has(i)) {
+      compacted.push(messages[i]);
+    }
+  }
+  compacted.push(...tail);
+
+  debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} count=${compacted.length}`);
+  return compacted;
 }
