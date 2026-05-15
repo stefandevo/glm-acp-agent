@@ -31,11 +31,13 @@ function createConnectionStub(opts: {
     async sessionUpdate(payload: Record<string, unknown>) {
       updates.push(payload);
     },
-    async readTextFile(_params: { sessionId: string; path: string }) {
+    async readTextFile(params: { sessionId: string; path: string }) {
+      void params;
       if (opts.readError) throw new Error("file not found");
       return { content: "hello" };
     },
-    async writeTextFile(_params: { sessionId: string; path: string; content: string }) {
+    async writeTextFile(params: { sessionId: string; path: string; content: string }) {
+      void params;
       if (opts.writeError) throw new Error("permission denied");
     },
     async createTerminal(params: { command: string; args?: string[] }): Promise<StubTerminal> {
