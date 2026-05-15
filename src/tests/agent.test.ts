@@ -1600,3 +1600,48 @@ test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {
     cleanup();
   }
 });
+
+test("prompt performs emergency compaction and retries on 1261 error", async () => {
+  const conn = createConnectionStub();
+  let callCount = 0;
+  let messagesInSecondCall: number = 0;
+
+  const glm = {
+    async *streamChat(messages: ReadonlyArray<{ role: string }>): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      if (callCount === 1) {
+        // Simulate a Z.AI context overflow error (1261).
+        const err = new Error("Prompt exceeds max length");
+        (err as any).error = { code: 1261 };
+        throw err;
+      } else {
+        messagesInSecondCall = messages.length;
+        yield { text: "Recovered." };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  
+  // Seed the session with a bunch of messages to be compacted.
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const session = (agent as any).sessions.get(sessionId);
+  for (let i = 0; i < 50; i++) {
+    session.messages.push({ role: "user", content: "Very long message filler ".repeat(1000) });
+    session.messages.push({ role: "assistant", content: "Intermediate response filler ".repeat(1000) });
+  }
+  const messagesBefore = session.messages.length;
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "Final trigger" }],
+  });
+
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(callCount, 2, "expected two streamChat calls (one failed, one retried)");
+  assert.ok(messagesInSecondCall < messagesBefore, "expected history to be compacted in the second call");
+  // The system prompt (index 0) and the last 10 messages should be preserved.
+  assert.ok(messagesInSecondCall >= 11);
+});
