@@ -1555,6 +1555,11 @@ test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {
   }
 });
 
+type OverflowErrorLike = Error & { error?: { code?: number } };
+type SessionUpdateEnvelope = {
+  update?: { sessionUpdate?: string; content?: { text?: string } };
+};
+
 test("prompt performs emergency compaction and retries on 1261 error", async () => {
   const conn = createConnectionStub();
   let callCount = 0;
@@ -1565,8 +1570,8 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
       callCount++;
       if (callCount === 1) {
         // Simulate a Z.AI context overflow error (1261).
-        const err = new Error("Prompt exceeds max length");
-        (err as any).error = { code: 1261 };
+        const err = new Error("Prompt exceeds max length") as OverflowErrorLike;
+        err.error = { code: 1261 };
         throw err;
       } else {
         messagesInSecondCall = messages.length;
@@ -1581,7 +1586,11 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   
   // Seed the session with a bunch of messages to be compacted.
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  const session = (agent as any).sessions.get(sessionId);
+  const session = (agent as unknown as {
+    sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
+  }).sessions.get(sessionId);
+  assert.ok(session, "expected in-memory session to exist");
+
   for (let i = 0; i < 50; i++) {
     session.messages.push({ role: "user", content: "Very long message filler ".repeat(1000) });
     session.messages.push({ role: "assistant", content: "Intermediate response filler ".repeat(1000) });
@@ -1608,8 +1617,8 @@ test("prompt fails fast when context overflow persists after emergency compactio
     async *streamChat(): AsyncGenerator<GlmStreamChunk> {
       callCount++;
       // Simulate a persistent Z.AI context overflow error (1261).
-      const err = new Error("Prompt still exceeds max length after compaction");
-      (err as any).error = { code: 1261 };
+      const err = new Error("Prompt still exceeds max length after compaction") as OverflowErrorLike;
+      err.error = { code: 1261 };
       throw err;
     },
   };
@@ -1631,10 +1640,13 @@ test("prompt fails fast when context overflow persists after emergency compactio
     // Some errors might bubble up depending on where they are caught in GlmAcpAgent.prompt
   }
 
-  const errorMessages = conn.updates.filter(
-    (u) => (u.update as any).sessionUpdate === "agent_message_chunk" && 
-           (u.update as any).content?.text?.includes("Context overflow persisted")
-  );
+  const errorMessages = conn.updates.filter((u) => {
+    const update = (u as SessionUpdateEnvelope).update;
+    return (
+      update?.sessionUpdate === "agent_message_chunk" &&
+      update.content?.text?.includes("Context overflow persisted")
+    );
+  });
 
   assert.equal(callCount, 2, "expected exactly two calls: initial and one retry after compaction");
   assert.equal(errorMessages.length, 1, "expected an error message reporting persistent overflow");
