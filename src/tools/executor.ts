@@ -13,6 +13,7 @@ import {
 } from "./zai-mcp-client.js";
 import type { SessionMcpTools } from "./session-mcp-client.js";
 import type { VisionMcpClient } from "./vision-mcp-client.js";
+import type { SessionModeId } from "../protocol/agent.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -36,7 +37,8 @@ export class ToolExecutor {
     private signal?: AbortSignal,
     private visionClient: VisionMcpClient | null = null,
     private sessionMcpTools: SessionMcpTools | null = null,
-    private sessionCwd: string = process.cwd()
+    private sessionCwd: string = process.cwd(),
+    private getMode: () => SessionModeId = () => "default"
   ) {}
 
   /**
@@ -161,39 +163,25 @@ export class ToolExecutor {
       },
     });
 
-    // Step 2: request user permission. Treat transport failures here as a
-    // failed tool call instead of letting them escape and abort the loop.
-    let permissionResponse;
-    try {
-      permissionResponse = await this.connection.requestPermission({
-        sessionId: this.sessionId,
-        toolCall: {
-          toolCallId,
-          title: `Write file: ${path}`,
-          kind: "edit",
-          status: "pending",
-          locations: [{ path }],
-          rawInput: args,
-        },
-        options: [
-          { kind: "allow_once", name: "Allow write", optionId: "allow" },
-          { kind: "reject_once", name: "Skip write", optionId: "reject" },
-        ],
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error requesting permission: ${message}` };
-    }
+    // Step 2: request user permission based on the current session mode.
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "write",
+      rawInput: args,
+      title: `Write file: ${path}`,
+      locations: [{ path }],
+    });
 
-    if (permissionResponse.outcome.outcome === "cancelled") {
+    if (permissionResult.type === "error") {
+      const message = `Error requesting permission: ${permissionResult.message}`;
+      await this.markFailed(toolCallId, message);
+      return { content: message };
+    }
+    if (permissionResult.type === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Write cancelled by user." };
     }
-    if (
-      permissionResponse.outcome.outcome === "selected" &&
-      permissionResponse.outcome.optionId === "reject"
-    ) {
+    if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Write rejected by user." };
     }
@@ -319,39 +307,25 @@ export class ToolExecutor {
       },
     });
 
-    // Step 2: request permission. Transport failures here become a failed
-    // tool call so the agent loop can continue.
-    let permissionResponse;
-    try {
-      permissionResponse = await this.connection.requestPermission({
-        sessionId: this.sessionId,
-        toolCall: {
-          toolCallId,
-          title: `Run command: ${command}`,
-          kind: "execute",
-          status: "pending",
-          locations: [],
-          rawInput: args,
-        },
-        options: [
-          { kind: "allow_once", name: "Run command", optionId: "allow" },
-          { kind: "reject_once", name: "Skip command", optionId: "reject" },
-        ],
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error requesting permission: ${message}` };
-    }
+    // Step 2: request permission based on the current session mode.
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "execute",
+      rawInput: args,
+      title: `Run command: ${command}`,
+      locations: [],
+    });
 
-    if (permissionResponse.outcome.outcome === "cancelled") {
+    if (permissionResult.type === "error") {
+      const message = `Error requesting permission: ${permissionResult.message}`;
+      await this.markFailed(toolCallId, message);
+      return { content: message };
+    }
+    if (permissionResult.type === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Command cancelled by user." };
     }
-    if (
-      permissionResponse.outcome.outcome === "selected" &&
-      permissionResponse.outcome.optionId === "reject"
-    ) {
+    if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Command rejected by user." };
     }
@@ -627,6 +601,71 @@ export class ToolExecutor {
   // ---------------------------------------------------------------------------
   // Notification helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Request permission from the user based on the current session mode.
+   *
+   * Returns a result indicating whether to allow, reject, or cancel the operation,
+   * or whether a transport error occurred.
+   */
+  private async maybeRequestPermission(args: {
+    toolCallId: string;
+    kind: "write" | "execute";
+    rawInput: unknown;
+    title: string;
+    locations?: Array<{ path: string }>;
+  }): Promise<
+    | { type: "allow" }
+    | { type: "reject" }
+    | { type: "cancelled" }
+    | { type: "error"; message: string }
+  > {
+    const mode = this.getMode();
+
+    // bypass_permissions: allow everything without prompting
+    if (mode === "bypass_permissions") {
+      return { type: "allow" };
+    }
+
+    // accept_edits: allow writes without prompting, still prompt for commands
+    if (mode === "accept_edits" && args.kind === "write") {
+      return { type: "allow" };
+    }
+
+    // default mode (or accept_edits with execute): prompt for permission
+    try {
+      const permissionResponse = await this.connection.requestPermission({
+        sessionId: this.sessionId,
+        toolCall: {
+          toolCallId: args.toolCallId,
+          title: args.title,
+          kind: args.kind === "write" ? "edit" : "execute",
+          status: "pending",
+          locations: args.locations ?? [],
+          rawInput: args.rawInput,
+        },
+        options: [
+          { kind: "allow_once", name: "Allow", optionId: "allow" },
+          { kind: "reject_once", name: "Skip", optionId: "reject" },
+        ],
+      });
+
+      if (permissionResponse.outcome.outcome === "cancelled") {
+        return { type: "cancelled" };
+      }
+      if (
+        permissionResponse.outcome.outcome === "selected" &&
+        permissionResponse.outcome.optionId === "reject"
+      ) {
+        return { type: "reject" };
+      }
+      return { type: "allow" };
+    } catch (err) {
+      // Transport failure: return error so caller can handle appropriately
+      const message = err instanceof Error ? err.message : String(err);
+      return { type: "error", message };
+    }
+  }
 
   /** Mark an in-progress tool call as failed. */
   private async markFailed(toolCallId: string, message: string): Promise<void> {

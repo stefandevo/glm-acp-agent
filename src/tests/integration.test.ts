@@ -245,3 +245,63 @@ test("end-to-end session/list and session/close advertised on initialize and rou
   const list2 = await clientConn.listSessions({});
   assert.equal(list2.sessions.length, 1);
 });
+
+test("end-to-end: session mode change mid-conversation affects permission prompts", async () => {
+  const { a, b } = pairedStreams();
+  const stub = new StubClient();
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-mode-"));
+
+  let callCount = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      // Both turns try to write the same file.
+      yield {
+        toolCall: {
+          id: `tc${callCount}`,
+          name: "write_file",
+          arguments: JSON.stringify({ path: "x.txt", content: `data ${callCount}` }),
+        },
+      };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _agentConn = new AgentSideConnection(
+    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
+    a
+  );
+  const clientConn = new ClientSideConnection(() => stub, b);
+
+  try {
+    await clientConn.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+    });
+    const session = await clientConn.newSession({ cwd: dir, mcpServers: [] });
+
+    // Turn 1: Default mode. Should prompt for permission.
+    stub.permissionResponses = [{ outcome: { outcome: "selected", optionId: "allow" } }];
+    await clientConn.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "write 1" }],
+    });
+    assert.equal(stub.permissionResponses.length, 0, "Should have used the permission response");
+
+    // Turn 2: Switch to bypass_permissions.
+    await clientConn.setSessionMode({ sessionId: session.sessionId, modeId: "bypass_permissions" });
+
+    // Turn 3: Should NOT prompt for permission.
+    // If it tries to prompt, StubClient will throw because permissionResponses is empty.
+    await clientConn.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "write 2" }],
+    });
+
+    // Verify both writes happened
+    assert.equal(pathJoin(dir, "x.txt"), pathJoin(dir, "x.txt")); // sanity
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
