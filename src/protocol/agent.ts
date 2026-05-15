@@ -808,6 +808,8 @@ export class GlmAcpAgent implements Agent {
 
     let lastUsage: Usage | undefined;
 
+    let overflowRetryCount = 0;
+
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled" };
 
@@ -830,7 +832,6 @@ export class GlmAcpAgent implements Agent {
       let lastStopReason: string | undefined;
 
       let retryTurn = false;
-      let overflowRetryCount = 0;
       try {
         // Stream the GLM response. The session's currently-selected model wins;
         // it's mutated by `unstable_setSessionModel` between turns.
@@ -889,7 +890,7 @@ export class GlmAcpAgent implements Agent {
           overflowRetryCount++;
           retryTurn = true;
         } else if (isOverflow) {
-          throw new Error("Context overflow persisted after emergency compaction");
+          throw new Error("Context overflow persisted after emergency compaction", { cause: err });
         } else {
           throw err;
         }
