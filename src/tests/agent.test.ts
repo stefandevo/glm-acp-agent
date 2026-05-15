@@ -1645,3 +1645,43 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   // The system prompt (index 0) and the last 10 messages should be preserved.
   assert.ok(messagesInSecondCall >= 11);
 });
+
+test("prompt fails fast when context overflow persists after emergency compaction", async () => {
+  const conn = createConnectionStub();
+  let callCount = 0;
+
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      // Simulate a persistent Z.AI context overflow error (1261).
+      const err = new Error("Prompt still exceeds max length after compaction");
+      (err as any).error = { code: 1261 };
+      throw err;
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // Use a try-catch to assert that prompt surfaces the error rather than retrying forever.
+  // The agent.prompt method catches internal errors and emits them as agent messages, 
+  // so we check the updates emitted to the connection.
+  try {
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "Trigger overflow" }],
+    });
+  } catch (err) {
+    // Some errors might bubble up depending on where they are caught in GlmAcpAgent.prompt
+  }
+
+  const errorMessages = conn.updates.filter(
+    (u) => (u.update as any).sessionUpdate === "agent_message_chunk" && 
+           (u.update as any).content?.text?.includes("Context overflow persisted")
+  );
+
+  assert.equal(callCount, 2, "expected exactly two calls: initial and one retry after compaction");
+  assert.equal(errorMessages.length, 1, "expected an error message reporting persistent overflow");
+});

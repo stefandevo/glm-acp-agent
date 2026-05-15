@@ -830,6 +830,7 @@ export class GlmAcpAgent implements Agent {
       let lastStopReason: string | undefined;
 
       let retryTurn = false;
+      let overflowRetryCount = 0;
       try {
         // Stream the GLM response. The session's currently-selected model wins;
         // it's mutated by `unstable_setSessionModel` between turns.
@@ -877,11 +878,18 @@ export class GlmAcpAgent implements Agent {
         if (signal.aborted) return { stopReason: "cancelled" };
 
         const body = (err as { error?: { code?: string | number } })?.error;
-        if (body?.code === ERR_CONTEXT_OVERFLOW || body?.code === String(ERR_CONTEXT_OVERFLOW)) {
+        const isOverflow =
+          body?.code === ERR_CONTEXT_OVERFLOW ||
+          body?.code === String(ERR_CONTEXT_OVERFLOW);
+
+        if (isOverflow && overflowRetryCount < 1) {
           debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
           const window = getContextWindow(session.model);
           session.messages = compactMessages(session.messages, Math.floor(window * 0.7));
+          overflowRetryCount++;
           retryTurn = true;
+        } else if (isOverflow) {
+          throw new Error("Context overflow persisted after emergency compaction");
         } else {
           throw err;
         }
@@ -1087,52 +1095,75 @@ function estimateTokens(messages: GlmMessage[]): number {
  *
  * Strategy:
  * 1. Always keep the System prompt (index 0).
- * 2. Always keep the last `preserveTurns` messages (default 10) to maintain
- *    conversation flow.
- * 3. Evict the largest remaining messages (typically large tool outputs or
- *    summaries) until the total estimate is below `targetTokens`.
+ * 2. Always keep the last `preserveTurns` interaction groups (default 10) to
+ *    maintain conversation flow. An interaction group (turn) typically starts
+ *    with a user message followed by assistant and tool responses.
+ * 3. Evict the largest remaining interaction groups until the total estimate
+ *    is below `targetTokens`.
  */
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,
   preserveTurns = 10
 ): GlmMessage[] {
-  if (messages.length <= preserveTurns + 1) return messages;
+  if (messages.length <= 1) return messages;
+
+  const systemPrompt = messages[0];
+  const remaining = messages.slice(1);
+
+  // Group messages into interaction turns. A turn starts with a "user" message.
+  const turns: GlmMessage[][] = [];
+  let currentTurn: GlmMessage[] = [];
+
+  for (const m of remaining) {
+    if (m.role === "user" && currentTurn.length > 0) {
+      turns.push(currentTurn);
+      currentTurn = [];
+    }
+    currentTurn.push(m);
+  }
+  if (currentTurn.length > 0) {
+    turns.push(currentTurn);
+  }
+
+  // If we have fewer turns than we want to preserve, just return the messages.
+  if (turns.length <= preserveTurns) return messages;
 
   let currentEstimate = estimateTokens(messages);
   if (currentEstimate <= targetTokens) return messages;
 
-  debug(`compactMessages: currentEstimate=${currentEstimate} target=${targetTokens}`);
+  debug(`compactMessages: currentEstimate=${currentEstimate} target=${targetTokens} turns=${turns.length}`);
 
-  // Identify candidates for eviction: everything except system prompt and last N.
-  const systemPrompt = messages[0];
-  const tail = messages.slice(-preserveTurns);
-  const candidates = messages
-    .slice(1, -preserveTurns)
-    .map((m, index) => ({
-      message: m,
-      index: index + 1, // index in original array
-      tokens: estimateTokens([m]),
+  // Identify candidates for eviction: all turns except the last `preserveTurns`.
+  const tail = turns.slice(-preserveTurns);
+  const candidateTurns = turns
+    .slice(0, -preserveTurns)
+    .map((turn, index) => ({
+      turn,
+      index,
+      tokens: estimateTokens(turn),
     }));
 
   // Sort candidates by size (largest first).
-  candidates.sort((a, b) => b.tokens - a.tokens);
+  candidateTurns.sort((a, b) => b.tokens - a.tokens);
 
   const evictedIndices = new Set<number>();
-  for (const c of candidates) {
+  for (const c of candidateTurns) {
     if (currentEstimate <= targetTokens) break;
     evictedIndices.add(c.index);
     currentEstimate -= c.tokens;
   }
 
-  const compacted = [systemPrompt];
-  for (let i = 1; i < messages.length - preserveTurns; i++) {
+  const compacted: GlmMessage[] = [systemPrompt];
+  for (let i = 0; i < turns.length - preserveTurns; i++) {
     if (!evictedIndices.has(i)) {
-      compacted.push(messages[i]);
+      compacted.push(...turns[i]);
     }
   }
-  compacted.push(...tail);
+  for (const turn of tail) {
+    compacted.push(...turn);
+  }
 
-  debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} count=${compacted.length}`);
+  debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} messageCount=${compacted.length}`);
   return compacted;
 }
