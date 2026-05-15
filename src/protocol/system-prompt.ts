@@ -77,10 +77,8 @@ const WORKFLOW = `<problem_solving_workflow>
 Prefer fixing the root cause over papering over a symptom. If you hit an obstacle, diagnose it rather than reaching for a destructive shortcut.
 </problem_solving_workflow>`;
 
-// Annotation tag names (<image_analysis>, <image_attached>, <image_analysis_error>) must
-// match the literals emitted by preprocessImageBlocks() in image-preprocessor.ts.
 const IMAGE_HANDLING = `<image_handling>
-When the user refers to an attached image but the most recent user turn contains no <image_analysis>, <image_attached>, or <image_analysis_error> annotation, no image was received by this agent — this is a client-side attachment problem, not a Vision MCP failure. Do not describe or guess at the image contents. Instead, explain that the agent did not receive an image from the client and ask the user to share it as a local file path (e.g. /home/user/photo.png) or a public URL.
+Attached images may arrive as native multimodal image content for vision-native models, or as text annotations such as <image_analysis>, <image_attached>, <image_analysis_error>, or <image_unsupported_format> when the agent preprocesses or rejects an image. When the user refers to an attached image but the most recent user turn contains neither image content nor one of these annotations, no usable image was received by this agent — this is a client-side attachment problem, not a model or Vision MCP failure. Do not describe or guess at missing image contents. Instead, explain that the agent did not receive a usable image from the client and ask the user to share it as a supported image attachment, local file path, or public URL.
 </image_handling>`;
 
 export function buildSystemPrompt(input: BuildSystemPromptInput): string {

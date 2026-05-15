@@ -44,6 +44,19 @@ function makeClient(stream: ReturnType<typeof fakeStream>): GlmClient {
   return c;
 }
 
+function makeClientWithCreate(
+  create: (body: Record<string, unknown>) => Promise<unknown>
+): GlmClient {
+  process.env["Z_AI_API_KEY"] = "test-key";
+  const c = new GlmClient();
+  (c as unknown as {
+    client: { chat: { completions: { create: (body: Record<string, unknown>) => Promise<unknown> } } };
+  }).client = {
+    chat: { completions: { create } },
+  };
+  return c;
+}
+
 test("streamChat yields text chunks for delta.content", async () => {
   const stream = fakeStream([
     { choices: [{ delta: { content: "Hel" }, finish_reason: null }] },
@@ -158,7 +171,7 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, ["glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.deepEqual(ids, ["glm-5.1", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.5-air"]);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
@@ -177,6 +190,23 @@ test("ACP_GLM_AVAILABLE_MODELS env override still wins over the built-in list", 
     if (old === undefined) delete process.env["ACP_GLM_AVAILABLE_MODELS"];
     else process.env["ACP_GLM_AVAILABLE_MODELS"] = old;
   }
+});
+
+test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5v-turbo" })) {
+    // Drain the stream so the request is made.
+    void chunk;
+  }
+
+  assert.equal(requestBody?.["model"], "glm-5v-turbo");
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
 });
 
 test("streamChat does not flush partial tool calls (missing id or name)", async () => {
