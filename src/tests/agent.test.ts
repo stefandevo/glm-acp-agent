@@ -1773,15 +1773,21 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
 test("prompt fails fast when context overflow persists after emergency compaction", async () => {
   const conn = createConnectionStub();
   let callCount = 0;
+  let secondOverflow: Error | null = null;
 
   const glm = {
     async *streamChat(): AsyncGenerator<GlmStreamChunk> {
       callCount++;
+      if (callCount > 2) {
+        throw new Error("streamChat retried more than once");
+      }
       // Simulate a persistent Z.AI context overflow error (1261).
       const err = new Error("Prompt still exceeds max length after compaction") as OverflowErrorLike;
       err.error = { code: 1261 };
-      if (err) throw err;
-      yield { done: true };
+      if (callCount === 2) {
+        secondOverflow = err;
+      }
+      yield await Promise.reject(err);
     },
   };
 
@@ -1793,13 +1799,14 @@ test("prompt fails fast when context overflow persists after emergency compactio
   // Use a try-catch to assert that prompt surfaces the error rather than retrying forever.
   // The agent.prompt method catches internal errors and emits them as agent messages, 
   // so we check the updates emitted to the connection.
+  let caught: unknown;
   try {
     await agent.prompt({
       sessionId,
       prompt: [{ type: "text", text: "Trigger overflow" }],
     });
-  } catch {
-    // Some errors might bubble up depending on where they are caught in GlmAcpAgent.prompt
+  } catch (error) {
+    caught = error;
   }
 
   const errorMessages = conn.updates.filter((u) => {
@@ -1811,5 +1818,8 @@ test("prompt fails fast when context overflow persists after emergency compactio
   });
 
   assert.equal(callCount, 2, "expected exactly two calls: initial and one retry after compaction");
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.message, "Context overflow persisted after emergency compaction");
+  assert.equal(caught.cause, secondOverflow);
   assert.equal(errorMessages.length, 1, "expected an error message reporting persistent overflow");
 });
