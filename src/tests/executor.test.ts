@@ -657,6 +657,100 @@ test("run_command converts requestPermission transport errors into a failed tool
 });
 
 // ---------------------------------------------------------------------------
+// Session mode permission behavior
+// ---------------------------------------------------------------------------
+
+test("write_file prompts for permission in default mode", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => "default");
+  const result = await exec.execute(
+    "tc1",
+    "write_file",
+    JSON.stringify({ path: "/y.txt", content: "data" })
+  );
+  assert.equal(result.content, "Write rejected by user.");
+  assert.equal(conn.permissionRequests.length, 1);
+});
+
+test("write_file skips permission prompt in accept_edits mode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-accept-edits-"));
+  const path = join(dir, "out.txt");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "accept_edits");
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "hi" })
+    );
+    // In accept_edits mode, writes should NOT request permission
+    assert.equal(conn.permissionRequests.length, 0);
+    // The write should succeed
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "hi");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_file skips permission prompt in bypass_permissions mode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-bypass-"));
+  const path = join(dir, "out.txt");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "bypass_permissions");
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "hi" })
+    );
+    assert.equal(conn.permissionRequests.length, 0);
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "hi");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("run_command prompts for permission in default mode", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => "default");
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "echo hi" })
+  );
+  assert.equal(result.content, "Command rejected by user.");
+  assert.equal(conn.permissionRequests.length, 1);
+});
+
+test("run_command prompts for permission in accept_edits mode", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => "accept_edits");
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "echo hi" })
+  );
+  assert.equal(result.content, "Command rejected by user.");
+  // In accept_edits mode, commands should still prompt
+  assert.equal(conn.permissionRequests.length, 1);
+});
+
+test("run_command skips permission prompt in bypass_permissions mode", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => "bypass_permissions");
+  const result = await exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "echo hi" })
+  );
+  assert.equal(conn.permissionRequests.length, 0);
+  assert.match(result.content, /Exit code: 0/);
+  assert.match(result.content, /STDOUT:\nhi/);
+});
+
+// ---------------------------------------------------------------------------
 // Whitespace path normalization
 // ---------------------------------------------------------------------------
 

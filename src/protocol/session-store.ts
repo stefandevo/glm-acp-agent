@@ -8,7 +8,7 @@ import type { GlmMessage } from "../llm/glm-client.js";
  * shape of `PersistedSession` changes incompatibly so future loaders can
  * migrate (or reject) old records instead of silently producing garbage.
  */
-export const SESSION_SCHEMA_VERSION = 1 as const;
+export const SESSION_SCHEMA_VERSION = 2 as const;
 
 /**
  * On-disk representation of a session. Only fields that need to survive a
@@ -24,6 +24,11 @@ export interface PersistedSession {
   title: string | null;
   updatedAt: string;
   model: string;
+  /**
+   * Permission mode for this session. Defaults to "default" for persisted
+   * sessions from schema versions that didn't include this field.
+   */
+  mode: "default" | "accept_edits" | "bypass_permissions";
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
@@ -33,6 +38,7 @@ export interface PersistedSessionMetadata {
   title: string | null;
   updatedAt: string;
   model: string;
+  mode: "default" | "accept_edits" | "bypass_permissions";
 }
 
 /** Resolve the directory we write session files to, honouring overrides. */
@@ -93,11 +99,21 @@ export class SessionStore {
     } catch {
       return undefined;
     }
-    // Drop records we don't know how to read. Today there's only one schema,
-    // so an unknown version is almost certainly a forward-incompatible record
-    // written by a newer agent build.
-    const version = parsed.schemaVersion ?? SESSION_SCHEMA_VERSION;
-    if (version !== SESSION_SCHEMA_VERSION) return undefined;
+    // Handle schema migrations. We support schema version 1 (pre-modes) and
+    // version 2 (with mode field).
+    const version = parsed.schemaVersion ?? 1;
+    if (version === 1) {
+      // Migration: add mode field with default value.
+      return {
+        ...parsed,
+        mode: "default",
+        schemaVersion: SESSION_SCHEMA_VERSION,
+      };
+    }
+    if (version !== SESSION_SCHEMA_VERSION) {
+      // Forward-incompatible record written by a newer agent build.
+      return undefined;
+    }
     return parsed;
   }
 
@@ -127,6 +143,7 @@ export class SessionStore {
         title: sess.title,
         updatedAt: sess.updatedAt,
         model: sess.model,
+        mode: sess.mode,
       });
     }
     out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));

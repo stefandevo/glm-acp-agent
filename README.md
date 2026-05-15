@@ -28,12 +28,13 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
 - **Tool calling** – agentic loop with up to 20 turns of GLM function calling
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
+- **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Image input via Coding Plan Vision MCP** – `promptCapabilities.image` is advertised; pasted ACP image blocks are routed through Z.AI Vision MCP (`@z_ai/mcp-server`) and the resulting analysis is fed into the main coding model. Direct chat-image (e.g. `glm-4v-plus`) calls are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
-- **Permissioned writes / commands** – every `write_file` and `run_command` call asks the user via `session/request_permission` before doing anything
+- **Configurable permissions** – `write_file` and `run_command` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
 - **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
@@ -65,15 +66,27 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 
 ## Available Tools
 
-| Tool | Runs on | Requires client capability | Description |
-|------|---------|----------------------------|-------------|
-| `read_file` | Agent process | – | Read the text content of a file |
-| `write_file` | Agent process | ACP permission prompt | Write or overwrite a text file (asks for permission) |
-| `list_files` | Agent process | – | List a directory using Node filesystem APIs |
-| `run_command` | Agent process | ACP permission prompt | Run an arbitrary shell command via `sh -c` in the session cwd (asks for permission) |
-| `web_search` | Agent (Z.AI Coding Plan MCP) | – | Search the web — returns titles, URLs, and summaries |
-| `web_reader` | Agent (Z.AI Coding Plan MCP) | – | Fetch and parse a web page (markdown or plain text) |
-| `image_analysis` | Agent (Z.AI Vision MCP, stdio) | – | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
+| Tool | Runs on | Permission behavior | Description |
+|------|---------|---------------------|-------------|
+| `read_file` | Agent process | Always silent | Read the text content of a file |
+| `write_file` | Agent process | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
+| `list_files` | Agent process | Always silent | List a directory using Node filesystem APIs |
+| `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command. Silent only in `bypass_permissions`. |
+| `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
+| `web_reader` | Agent (Z.AI Coding Plan MCP) | Always silent | Fetch and parse a web page (markdown or plain text) |
+| `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Always silent | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
+
+### Session Modes
+
+Clients can use `session/set_mode` to drive the permission policy:
+
+| Mode ID | Name | `write_file` | `run_command` |
+|---|---|---|---|
+| `default` | Ask for permission | **Prompt** | **Prompt** |
+| `accept_edits` | Auto-approve edits | Silent | **Prompt** |
+| `bypass_permissions` | Bypass all permissions | Silent | Silent |
+
+Reads, listings, and MCP tool calls are always silent across all modes.
 
 ---
 

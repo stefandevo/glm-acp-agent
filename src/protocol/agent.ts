@@ -59,6 +59,12 @@ import { debug, error, isDebugEnabled } from "../llm/logger.js";
  */
 const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
 
+/**
+ * ACP session mode identifiers. These control when the agent requests user
+ * permission for tool calls that mutate state.
+ */
+export type SessionModeId = "default" | "accept_edits" | "bypass_permissions";
+
 /** Per-session state */
 interface SessionState {
   cwd: string;
@@ -78,6 +84,8 @@ interface SessionState {
   toolDefinitions: ToolDefinition[];
   /** Connected client-supplied MCP tools for this session. */
   mcpTools: SessionMcpTools | null;
+  /** Active permission mode for this session (clients can change via `session/set_mode`). */
+  mode: SessionModeId;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -275,11 +283,13 @@ export class GlmAcpAgent implements Agent {
       model,
       toolDefinitions,
       mcpTools,
+      mode: "default",
     });
 
     return {
       sessionId,
       models: this.modelsState(model),
+      modes: this.modesState("default"),
     };
   }
 
@@ -324,11 +334,57 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
+  /** Build the SessionModeState we advertise on session create/load/resume/fork. */
+  private modesState(currentModeId: SessionModeId): {
+    availableModes: Array<{ id: SessionModeId; name: string; description: string }>;
+    currentModeId: SessionModeId;
+  } {
+    return {
+      availableModes: [
+        {
+          id: "default",
+          name: "Ask for permission",
+          description: "Prompt before edits and commands.",
+        },
+        {
+          id: "accept_edits",
+          name: "Auto-approve edits",
+          description: "Edits run without prompting. Commands still prompt.",
+        },
+        {
+          id: "bypass_permissions",
+          name: "Bypass all permissions",
+          description: "Edits and commands run without prompting.",
+        },
+      ],
+      currentModeId,
+    };
+  }
+
   async setSessionMode(
-    _params: SetSessionModeRequest
+    params: SetSessionModeRequest
   ): Promise<SetSessionModeResponse> {
-    // We don't advertise modes; this is a no-op accepting any request the
-    // client might send.
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${params.sessionId}`);
+    }
+    const validModeIds: SessionModeId[] = ["default", "accept_edits", "bypass_permissions"];
+    if (!validModeIds.includes(params.modeId as SessionModeId)) {
+      throw new Error(
+        `Invalid modeId: ${params.modeId}. Valid modes are: ${validModeIds.join(", ")}`
+      );
+    }
+    const newMode = params.modeId as SessionModeId;
+    session.mode = newMode;
+    session.updatedAt = new Date().toISOString();
+    this.persistSession(params.sessionId, session);
+    await safeSessionUpdate(this.connection, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "current_mode_update",
+        currentModeId: newMode,
+      },
+    });
     return {};
   }
 
@@ -557,6 +613,7 @@ export class GlmAcpAgent implements Agent {
       model: persisted.model,
       toolDefinitions,
       mcpTools,
+      mode: persisted.mode,
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -565,7 +622,10 @@ export class GlmAcpAgent implements Agent {
     // doesn't render them on its own.
     await this.replayMessages(params.sessionId, persisted.messages);
 
-    return { models: this.modelsState(persisted.model) };
+    return {
+      models: this.modelsState(persisted.model),
+      modes: this.modesState(persisted.mode),
+    };
   }
 
   async unstable_forkSession(
@@ -592,6 +652,7 @@ export class GlmAcpAgent implements Agent {
       model: persisted.model,
       toolDefinitions,
       mcpTools,
+      mode: persisted.mode,
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -599,6 +660,7 @@ export class GlmAcpAgent implements Agent {
     return {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
+      modes: this.modesState(forked.mode),
     };
   }
 
@@ -620,12 +682,16 @@ export class GlmAcpAgent implements Agent {
       model: persisted.model,
       toolDefinitions,
       mcpTools,
+      mode: persisted.mode,
     };
     this.sessions.set(params.sessionId, restored);
 
     // Resume does NOT replay history — the client keeps its own UI state and
     // just wants the agent to pick up where it left off.
-    return { models: this.modelsState(persisted.model) };
+    return {
+      models: this.modelsState(persisted.model),
+      modes: this.modesState(persisted.mode),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -640,6 +706,7 @@ export class GlmAcpAgent implements Agent {
       title: session.title,
       updatedAt: session.updatedAt,
       model: session.model,
+      mode: session.mode,
     };
   }
 
@@ -732,7 +799,9 @@ export class GlmAcpAgent implements Agent {
       signal,
       this.visionClient,
       session.mcpTools,
-      session.cwd
+      session.cwd,
+      // Use a thunk so mode changes mid-turn take effect on the next tool call.
+      () => this.sessions.get(sessionId)?.mode ?? "default"
     );
 
     let lastUsage: Usage | undefined;

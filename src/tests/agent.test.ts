@@ -802,13 +802,55 @@ test("authenticate is a no-op", async () => {
   assert.deepEqual(result, {});
 });
 
-test("setSessionMode is a no-op", async () => {
+test("setSessionMode persists the mode and emits current_mode_update", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    // Close the session to persist it
+    await agent.closeSession({ sessionId });
+
+    // Default mode is "default" after persistence
+    const initial = store.load(sessionId);
+    assert.equal(initial?.mode, "default");
+
+    // Load the session back
+    const loadResult = await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    assert.equal(loadResult.modes?.currentModeId, "default");
+
+    // Change to accept_edits
+    const before = conn.updates.length;
+    const result = await agent.setSessionMode({ sessionId, modeId: "accept_edits" });
+    assert.deepEqual(result, {});
+
+    // Check that the mode was persisted
+    const after = store.load(sessionId);
+    assert.equal(after?.mode, "accept_edits");
+
+    // Check that current_mode_update was emitted
+    const modeUpdates = conn.updates.slice(before).filter(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "current_mode_update"
+    );
+    assert.equal(modeUpdates.length, 1);
+    assert.equal((modeUpdates[0] as { update: { currentModeId?: string } }).update.currentModeId, "accept_edits");
+  } finally {
+    cleanup();
+  }
+});
+
+test("setSessionMode rejects invalid mode ids", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  const result = await agent.setSessionMode({ sessionId, modeId: "ask" });
-  assert.deepEqual(result, {});
+
+  await assert.rejects(
+    agent.setSessionMode({ sessionId, modeId: "invalid_mode" }),
+    /Invalid modeId: invalid_mode/
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1358,6 +1400,7 @@ test("loadSession restores messages and replays them as session updates", async 
       title: "ping pong",
       updatedAt: "2026-01-01T00:00:00.000Z",
       model: "glm-5.1",
+      mode: "default",
     });
 
     const conn = createConnectionStub();
@@ -1429,6 +1472,7 @@ test("resumeSession restores in-memory state without replaying messages", async 
       title: "ping pong",
       updatedAt: "2026-01-01T00:00:00.000Z",
       model: "glm-5.1",
+      mode: "default",
     });
 
     const conn = createConnectionStub();
@@ -1494,6 +1538,7 @@ test("unstable_forkSession works on a session that exists only on disk", async (
       title: "origin",
       updatedAt: "2026-01-01T00:00:00.000Z",
       model: "glm-4.5",
+      mode: "default",
     });
 
     const conn = createConnectionStub();
@@ -1542,6 +1587,7 @@ test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {
       title: "Saved earlier",
       updatedAt: "2026-01-01T00:00:00.000Z",
       model: "glm-5.1",
+      mode: "default",
     });
 
     const conn = createConnectionStub();
