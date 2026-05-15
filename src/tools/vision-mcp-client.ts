@@ -111,9 +111,13 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     } catch (err) {
       const code = (err as { code?: string }).code;
       if (code === "ENOENT") {
-        throw new Error("Vision MCP startup failed: `npx` not found on PATH. Install Node.js / npm 9+ and ensure `npx` is available.");
+        throw new Error("Vision MCP startup failed: `npx` not found on PATH. Install Node.js / npm 9+ and ensure `npx` is available.", {
+          cause: err,
+        });
       }
-      throw new Error(`Vision MCP startup failed: ${(err as Error).message}`);
+      throw new Error(`Vision MCP startup failed: ${(err as Error).message}`, {
+        cause: err,
+      });
     }
     this.child = child;
     child.stdout.setEncoding("utf8");

@@ -319,7 +319,9 @@ class StdioMcpClient implements ConnectedMcpClient {
         env: buildStdioEnv(this.server),
       });
     } catch (err) {
-      throw new Error(`MCP ${this.server.name} startup failed: ${(err as Error).message}`);
+      throw new Error(`MCP ${this.server.name} startup failed: ${(err as Error).message}`, {
+        cause: err,
+      });
     }
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));

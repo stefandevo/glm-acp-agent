@@ -47,7 +47,7 @@ export async function preprocessImageBlocks(
       continue;
     }
 
-    let imageSource = "";
+    let imageSource: string;
     if (typeof block.data === "string" && block.data.length > 0) {
       const dir = await mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
       const ext = guessExtension(block.mimeType);

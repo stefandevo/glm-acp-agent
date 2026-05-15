@@ -45,7 +45,7 @@ import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
-import { preprocessImageBlocks, buildPromptBlockDiagnosticLines, type PreprocessedPrompt } from "./image-preprocessor.js";
+import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
@@ -247,12 +247,13 @@ export class GlmAcpAgent implements Agent {
   }
 
   async authenticate(
-    _params: AuthenticateRequest
+    params: AuthenticateRequest
   ): Promise<AuthenticateResponse> {
     // Authentication is configured externally — either via Z_AI_API_KEY in the
     // environment or via the credentials file written by `glm-acp-agent --setup`.
     // The agent has nothing to do here; failures will surface when the model
     // is first called.
+    void params;
     return {};
   }
 
@@ -435,8 +436,7 @@ export class GlmAcpAgent implements Agent {
         debug(line);
       }
     }
-    let preprocessed: PreprocessedPrompt | undefined;
-    preprocessed = await preprocessImageBlocks(
+    const preprocessed = await preprocessImageBlocks(
       params.prompt,
       this.visionClient,
       abortController.signal
