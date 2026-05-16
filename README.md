@@ -30,7 +30,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
-- **Image input via Coding Plan Vision MCP** – `promptCapabilities.image` is advertised; pasted ACP image blocks are routed through Z.AI Vision MCP (`@z_ai/mcp-server`) and the resulting analysis is fed into the main coding model. Direct chat-image (e.g. `glm-4v-plus`) calls are intentionally not used.
+- **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5v-turbo` sessions send supported image parts directly to the model, while non-native coding models route pasted ACP image blocks through Z.AI Vision MCP (`@z_ai/mcp-server`). Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
@@ -172,18 +172,23 @@ The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 |-------|-------|
 | `glm-5.1` | **Default.** Long-horizon coding model; thinking mode auto-enabled |
 | `glm-5-turbo` | Faster Coding Plan reasoning model |
+| `glm-5v-turbo` | Multimodal Coding Plan model; native image understanding for jpg / jpeg / png inputs |
 | `glm-4.7` | 200K-context reasoning model |
 | `glm-4.5-air` | Lightweight, lower-latency model |
 
-`ACP_GLM_AVAILABLE_MODELS` still lets you advertise custom IDs, but custom IDs sit outside the supported Coding Plan list — the Coding Plan endpoint will reject any model code Z.AI hasn't whitelisted (business code `1211`).
+`ACP_GLM_AVAILABLE_MODELS` still lets you advertise custom IDs, but custom IDs sit outside the supported Coding Plan list — the Coding Plan endpoint will reject any model code Z.AI hasn't whitelisted (business code `1211`). If you override the model list, include `glm-5v-turbo` yourself to keep it visible in the picker.
 
-Vision (`glm-4v-plus` etc.) is **not** advertised as a chat model: vision on the Coding Plan flows through the [Vision MCP](#vision-mcp) section below instead.
+Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. The multimodal coding model `glm-5v-turbo` is advertised because it is on the Coding Plan and receives supported ACP image blocks directly as native `image_url` content parts. Other advertised models keep using the [Vision MCP](#vision-mcp) path for image analysis.
 
-When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or `glm-5.x`, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. Override with `ACP_GLM_THINKING=false` if you want plain completions only.
+When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5v-turbo`. Override with `ACP_GLM_THINKING=false` if you want plain completions only.
+
+`ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, users can pick `glm-5v-turbo` for text work but clients should not offer image attachments.
 
 ### Vision MCP
 
-Pasted ACP image blocks are not sent to the chat-completions endpoint. Instead, the agent boots `@z_ai/mcp-server` over stdio (via `npx -y @z_ai/mcp-server@latest`) and calls its `image_analysis` tool. The text result is spliced into the user message as `<image_analysis index="N">…</image_analysis>` so the regular Coding Plan model can reason about it.
+For `glm-5v-turbo`, pasted ACP image blocks with `image/jpeg`, `image/jpg`, or `image/png` are sent directly to chat completions as `image_url` content parts. HTTPS image URLs are forwarded as URLs; inline base64 data is sent as a `data:<mime>;base64,...` URI. Unsupported image MIME types are rejected client-side with an inline `<image_unsupported_format>` annotation so the prompt can continue without a provider 4xx.
+
+For non-native models, pasted ACP image blocks are not sent to the chat-completions endpoint. Instead, the agent boots `@z_ai/mcp-server` over stdio (via `npx -y @z_ai/mcp-server@latest`) and calls its `image_analysis` tool. The text result is spliced into the user message as `<image_analysis index="N">…</image_analysis>` so the regular Coding Plan model can reason about it.
 
 Prerequisites:
 

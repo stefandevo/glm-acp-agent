@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
+import type { ChatCompletionContentPart } from "openai/resources/index.js";
 import type {
   Agent,
   AgentSideConnection,
@@ -37,6 +38,7 @@ import {
   getAvailableModels,
   getDefaultModel,
   getContextWindow,
+  isVisionNativeModel,
   ERR_CONTEXT_OVERFLOW,
   type GlmMessage,
   type GlmStreamChunk,
@@ -231,7 +233,7 @@ export class GlmAcpAgent implements Agent {
         promptCapabilities: {
           // Baseline (text + resource_link) is implicit; we additionally accept
           // embedded resources for inline file context, plus images for
-          // vision-capable GLM models (e.g. glm-4v-plus).
+          // glm-5v-turbo native vision and the Vision MCP fallback path.
           // Set ACP_GLM_PROMPT_IMAGES=false (or =0) to stop advertising image
           // support so clients like Zed won't offer the image-attachment UI.
           embeddedContext: true,
@@ -429,23 +431,25 @@ export class GlmAcpAgent implements Agent {
       abortController.abort();
     }
 
-    // Convert ACP content blocks into a GLM user message. Baseline: text +
-    // resource_link. Optional: embedded resources. Image blocks are routed
-    // through Z.AI Coding Plan Vision MCP (see image-preprocessor) so the
-    // result is always a plain string for the chat-completions endpoint.
+    // Convert ACP content blocks into a GLM user message. Most models receive
+    // plain text, with images preprocessed through Vision MCP. Native vision
+    // models receive OpenAI-style multimodal content parts directly.
     if (isDebugEnabled()) {
       for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
         debug(line);
       }
     }
-    const preprocessed = await preprocessImageBlocks(
-      params.prompt,
-      this.visionClient,
-      abortController.signal
-    );
-    const { content: userContent, plainText: userText } = renderPromptBlocks(
-      preprocessed.blocks
-    );
+    const visionNative = isVisionNativeModel(session.model);
+    const preprocessed = visionNative
+      ? { blocks: params.prompt, cleanups: [] }
+      : await preprocessImageBlocks(
+          params.prompt,
+          this.visionClient,
+          abortController.signal
+        );
+    const { content: userContent, plainText: userText } = visionNative
+      ? renderVisionNativePromptBlocks(preprocessed.blocks)
+      : renderPromptBlocks(preprocessed.blocks);
     session.messages.push({ role: "user", content: userContent });
 
     // Echo back the client-supplied messageId on every response (success,
@@ -807,7 +811,6 @@ export class GlmAcpAgent implements Agent {
     );
 
     let lastUsage: Usage | undefined;
-
     let overflowRetryCount = 0;
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
@@ -1020,9 +1023,125 @@ function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number
   return { content: plainText, plainText };
 }
 
+function renderVisionNativePromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number]>): {
+  content: ChatCompletionContentPart[];
+  plainText: string;
+} {
+  const content: ChatCompletionContentPart[] = [];
+  const plainTextParts: string[] = [];
+  let imageIndex = 0;
+
+  const pushText = (text: string) => {
+    if (text.length === 0) return;
+    content.push({ type: "text", text });
+    plainTextParts.push(text);
+  };
+
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        pushText(block.text);
+        break;
+      case "resource_link":
+        pushText(`[${block.name}](${block.uri})`);
+        break;
+      case "resource": {
+        const res = block.resource;
+        if ("text" in res && typeof res.text === "string") {
+          pushText(`<resource uri="${res.uri}">\n${res.text}\n</resource>`);
+        } else if ("blob" in res) {
+          pushText(`[binary resource](${res.uri})`);
+        }
+        break;
+      }
+      case "image": {
+        imageIndex += 1;
+        const imageUrl = toVisionNativeImageUrl(block);
+        if (imageUrl) {
+          content.push({ type: "image_url", image_url: { url: imageUrl } });
+          plainTextParts.push(`[image: ${block.mimeType}]`);
+        } else {
+          pushText(
+            `<image_unsupported_format index="${imageIndex}" mime="${escapeAttribute(block.mimeType)}">Only image/jpeg, image/jpg, image/png inputs can be sent to the native vision model. Attach a supported HTTPS image URL or supported base64 image data.</image_unsupported_format>`
+          );
+        }
+        break;
+      }
+      case "audio":
+        pushText("[unsupported audio block]");
+        break;
+      default:
+        pushText(`[unknown block type ${(block as { type: string }).type}]`);
+    }
+  }
+
+  return { content, plainText: plainTextParts.join("\n") };
+}
+
+function toVisionNativeImageUrl(block: Extract<PromptRequest["prompt"][number], { type: "image" }>): string | null {
+  if (!isSupportedVisionMime(block.mimeType)) return null;
+
+  if (typeof block.uri === "string" && block.uri.length > 0) {
+    if (block.uri.startsWith("data:")) return block.uri;
+    try {
+      const url = new URL(block.uri);
+      if (url.protocol === "https:") return block.uri;
+    } catch {
+      // Fall through to inline data when available.
+    }
+  }
+
+  if (typeof block.data === "string" && block.data.length > 0) {
+    return `data:${block.mimeType.toLowerCase()};base64,${block.data}`;
+  }
+
+  return null;
+}
+
+function isSupportedVisionMime(mimeType: string): boolean {
+  switch (mimeType.toLowerCase()) {
+    case "image/jpeg":
+    case "image/jpg":
+    case "image/png":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function escapeAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 /** Flatten the `content` of a user message into a plain string for replay. */
 function stringifyUserMessage(content: unknown): string {
-  return typeof content === "string" ? content : "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (
+        typeof part === "object" &&
+        part !== null &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        return (part as { text: string }).text;
+      }
+      if (
+        typeof part === "object" &&
+        part !== null &&
+        (part as { type?: unknown }).type === "image_url"
+      ) {
+        return "[image]";
+      }
+      return "";
+    })
+    .filter((text) => text.length > 0)
+    .join("\n");
 }
 
 /**

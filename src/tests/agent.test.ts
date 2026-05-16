@@ -733,8 +733,12 @@ test("system prompt includes image_handling fallback instructions", async () => 
 
   assert.ok(ref.value.includes("<image_handling>"), "system prompt must contain image_handling section");
   assert.ok(
-    ref.value.includes("image_analysis_error") || ref.value.includes("image_analysis"),
-    "image_handling must mention the known annotation tags"
+    ref.value.toLowerCase().includes("native multimodal image content"),
+    "image_handling must cover native multimodal image delivery"
+  );
+  assert.ok(
+    ref.value.includes("image_analysis_error") && ref.value.includes("image_unsupported_format"),
+    "image_handling must mention image annotation fallback tags"
   );
   assert.ok(
     ref.value.toLowerCase().includes("client"),
@@ -1255,6 +1259,117 @@ test("prompt with image block runs Vision MCP preprocessing and feeds text into 
   assert.equal(typeof capturedUser, "string");
   assert.match(capturedUser as string, /What is in this image\?/);
   assert.match(capturedUser as string, /<image_analysis index="1">[\s\S]*It is a kitten\.[\s\S]*<\/image_analysis>/);
+});
+
+test("prompt with image block on vision-native model sends native image_url content", async () => {
+  const conn = createConnectionStub();
+  let capturedUser: unknown;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>,
+      _signal?: AbortSignal,
+      options?: { model?: string }
+    ): AsyncGenerator<GlmStreamChunk> {
+      assert.equal(options?.model, "glm-5v-turbo");
+      const userMsg = [...messages].reverse().find((m) => m.role === "user");
+      capturedUser = userMsg?.content;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const visionCalls: Array<Record<string, unknown>> = [];
+  const visionClient = {
+    async callTool(_name: string, args: Record<string, unknown>) {
+      visionCalls.push(args);
+      return { content: [{ type: "text", text: "should not be used" }] };
+    },
+    async dispose() {},
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+
+  await agent.prompt({
+    sessionId,
+    prompt: [
+      { type: "text", text: "What is in this image?" },
+      { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
+    ],
+  });
+
+  assert.equal(visionCalls.length, 0);
+  assert.deepEqual(capturedUser, [
+    { type: "text", text: "What is in this image?" },
+    { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+  ]);
+});
+
+test("prompt with inline image data on vision-native model sends a data URI", async () => {
+  const conn = createConnectionStub();
+  let capturedUser: unknown;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const userMsg = [...messages].reverse().find((m) => m.role === "user");
+      capturedUser = userMsg?.content;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient: null, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+
+  await agent.prompt({
+    sessionId,
+    prompt: [
+      { type: "text", text: "Describe" },
+      { type: "image", data: "AAAA", mimeType: "image/jpeg" },
+    ],
+  });
+
+  assert.deepEqual(capturedUser, [
+    { type: "text", text: "Describe" },
+    { type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } },
+  ]);
+});
+
+test("prompt with unsupported image MIME on vision-native model emits an inline annotation", async () => {
+  const conn = createConnectionStub();
+  let capturedUser: unknown;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const userMsg = [...messages].reverse().find((m) => m.role === "user");
+      capturedUser = userMsg?.content;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, visionClient: null, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+
+  await agent.prompt({
+    sessionId,
+    prompt: [
+      { type: "text", text: "Describe" },
+      { type: "image", data: "AAAA", mimeType: "image/webp" },
+    ],
+  });
+
+  assert.ok(Array.isArray(capturedUser));
+  const text = capturedUser
+    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+  assert.match(text, /<image_unsupported_format index="1" mime="image\/webp">/);
+  assert.match(text, /image\/jpeg, image\/jpg, image\/png/);
 });
 
 test("prompt with image block but no vision client falls back to a text annotation", async () => {

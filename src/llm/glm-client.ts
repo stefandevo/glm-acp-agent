@@ -66,6 +66,11 @@ const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
     description: "Faster Coding Plan reasoning model",
   },
   {
+    modelId: "glm-5v-turbo",
+    name: "GLM-5V Turbo",
+    description: "Multimodal Coding Plan model with native vision",
+  },
+  {
     modelId: "glm-4.7",
     name: "GLM-4.7",
     description: "200K-context reasoning model",
@@ -89,9 +94,17 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
 const MODEL_METADATA: Record<string, { contextWindow: number }> = {
   "glm-5.1": { contextWindow: 128_000 },
   "glm-5-turbo": { contextWindow: 128_000 },
+  "glm-5v-turbo": { contextWindow: 200_000 },
   "glm-4.7": { contextWindow: 200_000 },
   "glm-4.5-air": { contextWindow: 128_000 },
 };
+
+/** Models that accept image content parts directly through chat completions. */
+const VISION_NATIVE_MODELS = new Set(["glm-5v-turbo"]);
+
+export function isVisionNativeModel(modelId: string): boolean {
+  return VISION_NATIVE_MODELS.has(modelId.toLowerCase());
+}
 
 /**
  * Resolve the context window size for a given model ID. Falls back to a safe
