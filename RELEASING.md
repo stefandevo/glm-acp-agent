@@ -35,3 +35,23 @@ npm view glm-acp-agent version    # should match the new tag
   https://www.npmjs.com/package/glm-acp-agent/access — if the workflow file
   is renamed or the repo moves, update it there.
 - `--provenance` in the publish step requires a public repo or paid npm org.
+
+## Troubleshooting: `bun x` failures
+
+If `bun x glm-acp-agent@<version>` fails with `ERR_MODULE_NOT_FOUND` /
+`ERR_UNSUPPORTED_DIR_IMPORT` on one machine but succeeds with a fresh
+`TMPDIR`, the likely cause is a stale or corrupted Bun temp install
+(Bun caches `bun x` packages in a deterministic temp directory).
+
+**Recovery:** clear the cached install for that package/version:
+
+```bash
+# Find and remove the cached bunx install
+rm -rf /private/var/folders/.../T/bunx-<uid>-glm-acp-agent@<version>
+# Or run with a clean temp directory:
+TMPDIR=$(mktemp -d) bun x glm-acp-agent@<version>
+```
+
+This is an operational recovery for corrupted local state — it does **not**
+mean the published tarball is missing `main`, `package.json`, or
+dependencies. Fresh `bun x` installs resolve all dependencies correctly.

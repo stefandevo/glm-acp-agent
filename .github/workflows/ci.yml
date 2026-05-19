@@ -27,3 +27,12 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Bunx smoke test (packed tarball)
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          VERSION=$(node -p "require('./package.json').version")
+          TMPDIR=$(mktemp -d) bun x --package "$RUNNER_TEMP/glm-acp-agent-$VERSION.tgz" glm-acp-agent < /dev/null

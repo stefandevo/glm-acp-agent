@@ -33,3 +33,11 @@ jobs:
 
       - name: Publish
         run: npm publish --provenance --access public
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Verify published package via bun x
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TMPDIR=$(mktemp -d) bun x --package "glm-acp-agent@$VERSION" glm-acp-agent < /dev/null
