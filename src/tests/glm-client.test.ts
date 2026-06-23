@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GlmClient, getAvailableModels } from "../llm/glm-client.js";
+import { GlmClient, getAvailableModels, getContextWindow, getDefaultModel } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
   process.env["Z_AI_API_KEY"] = "test-key";
@@ -171,7 +171,9 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, ["glm-5.1", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.deepEqual(ids, ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.equal(getDefaultModel(), "glm-5.2");
+    assert.equal(getContextWindow("glm-5.2"), 1_000_000);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
