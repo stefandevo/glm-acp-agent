@@ -857,7 +857,7 @@ test("setSessionMode rejects invalid mode ids", async () => {
   );
 });
 
-test("newSession returns configOptions with thought_level selector", async () => {
+test("newSession returns configOptions with thought_level selector for default model", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
@@ -867,6 +867,7 @@ test("newSession returns configOptions with thought_level selector", async () =>
   const tl = result.configOptions!.find((o) => o.category === "thought_level");
   assert.ok(tl, "thought_level option should exist");
   assert.equal(tl!.type, "select");
+  // Default model is glm-5.2 → none/high/max
   assert.equal(tl!.currentValue, "max");
   const values = (tl as { options: Array<{ value: string }> }).options.map((o) => o.value);
   assert.deepEqual(values, ["none", "high", "max"]);
@@ -889,16 +890,23 @@ test("setSessionConfigOption updates thoughtLevel and returns updated options", 
   assert.equal(tl!.currentValue, "high");
 });
 
-test("setSessionConfigOption rejects invalid thought_level values", async () => {
+test("setSessionConfigOption auto-resolves values invalid for the current model", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  // Switch to glm-5.1 which only supports none/on
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
 
-  await assert.rejects(
-    agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "turbo" }),
-    /Invalid thought_level/
-  );
+  // "max" is invalid for glm-5.1 — should auto-resolve to "on"
+  const result = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "max",
+  });
+
+  const tl = result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "on");
 });
 
 test("setSessionConfigOption rejects unknown config ids", async () => {
@@ -911,6 +919,28 @@ test("setSessionConfigOption rejects unknown config ids", async () => {
     agent.setSessionConfigOption({ sessionId, configId: "unknown", value: "x" }),
     /Unknown config option/
   );
+});
+
+test("switching model updates thought_level options via config_option_update", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // Start with glm-5.2 (default) → max, options are none/high/max
+  // Switch to glm-4.7 → thoughtLevel should resolve to "on"
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
+
+  // Find the config_option_update in the connection's sent updates
+  const configUpdates = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  );
+  assert.equal(configUpdates.length, 1);
+  const opts = (configUpdates[0].update as { configOptions: Array<{ id: string; currentValue: string; options: Array<{ value: string }> }> }).configOptions;
+  const tl = opts.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "on");
+  const values = tl!.options.map((o) => o.value);
+  assert.deepEqual(values, ["none", "on"]);
 });
 
 // ---------------------------------------------------------------------------

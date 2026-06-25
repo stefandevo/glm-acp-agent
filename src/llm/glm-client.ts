@@ -10,13 +10,38 @@ import { debug, error } from "./logger.js";
  * SessionConfigOption. These map onto Z.AI's thinking / reasoning_effort
  * parameters (see buildThinkingParams).
  *
- * Only GLM-5.2 distinguishes between "high" and "max"; other thinking-capable
- * models treat both as "thinking enabled".
+ * GLM-5.2 supports three levels: none, high, max.
+ * Other thinking-capable models (GLM-5.1, 5-turbo, 4.7, etc.) only
+ * distinguish between thinking on and off, so they use "none" and "on".
  */
-export type ThoughtLevel = "none" | "high" | "max";
+export type ThoughtLevel = "none" | "on" | "high" | "max";
 
-/** Config option values advertised to ACP clients. */
-export const THOUGHT_LEVEL_VALUES: ThoughtLevel[] = ["none", "high", "max"];
+/** Levels shown when the selected model is GLM-5.2. */
+const LEVELS_52: ThoughtLevel[] = ["none", "high", "max"];
+
+/** Levels shown for every other thinking-capable model. */
+const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
+
+/**
+ * Resolve which thought-level options a model supports.
+ *
+ * reasoning_effort is a GLM-5.2 exclusive per the Z.AI docs — other models
+ * accept the field but it has no effect, so we only expose high/max for 5.2.
+ */
+export function getThoughtLevels(model: string): ThoughtLevel[] {
+  return model.toLowerCase().startsWith("glm-5.2") ? LEVELS_52 : LEVELS_DEFAULT;
+}
+
+/**
+ * Resolve a stored ThoughtLevel to one that's valid for the given model.
+ * Used when switching models or restoring a persisted session: if the old
+ * level isn't in the new model's option list, fall back to the model's
+ * default (max for 5.2, on for everything else).
+ */
+export function resolveThoughtLevel(model: string, level: ThoughtLevel): ThoughtLevel {
+  const valid = getThoughtLevels(model);
+  return valid.includes(level) ? level : valid[valid.length - 1];
+}
 
 /**
  * A single message in the GLM conversation history.
@@ -363,11 +388,15 @@ function supportsThinking(model: string): boolean {
  *
  * Z.AI has two parameters:
  * - `thinking` — on/off gate: `{"type":"enabled"}` or `{"type":"disabled"}`
- * - `reasoning_effort` — only GLM-5.2; controls thinking depth. Other models
- *   accept the field but always think at their default depth.
+ * - `reasoning_effort` — GLM-5.2 only; controls thinking depth.
  *
- * When `effort` is "none", thinking is disabled entirely. When unset, the
- * model defaults are used (thinking enabled for GLM-5.x, no field for others).
+ * ThoughtLevel values map as follows:
+ * - "none"  → thinking disabled
+ * - "on"    → thinking enabled (no reasoning_effort)
+ * - "high"  → thinking enabled + reasoning_effort=high (5.2 only)
+ * - "max"   → thinking enabled + reasoning_effort=max (5.2 only)
+ *
+ * When `effort` is unset, the model defaults are used.
  */
 export function buildThinkingParams(
   model: string,
@@ -386,9 +415,8 @@ export function buildThinkingParams(
 
   params["thinking"] = { type: "enabled" };
 
-  // Only send reasoning_effort when the caller explicitly picked a level.
-  // Z.AI defaults to max when the field is omitted.
-  if (effort) {
+  // reasoning_effort is only meaningful for GLM-5.2 per the Z.AI docs.
+  if (effort && effort !== "on" && model.toLowerCase().startsWith("glm-5.2")) {
     params["reasoning_effort"] = effort;
   }
 

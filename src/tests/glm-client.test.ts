@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GlmClient, getAvailableModels, getContextWindow, getDefaultModel, buildThinkingParams } from "../llm/glm-client.js";
+import { GlmClient, getAvailableModels, getContextWindow, getDefaultModel, buildThinkingParams, getThoughtLevels } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
   process.env["Z_AI_API_KEY"] = "test-key";
@@ -211,7 +211,7 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
 });
 
-test("streamChat sends reasoning_effort when level is set", async () => {
+test("streamChat sends reasoning_effort when level is set on glm-5.2", async () => {
   const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;
   const c = makeClientWithCreate((body) => {
@@ -225,6 +225,22 @@ test("streamChat sends reasoning_effort when level is set", async () => {
 
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
   assert.equal(requestBody?.["reasoning_effort"], "high");
+});
+
+test("streamChat does not send reasoning_effort for non-5.2 models", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.1", reasoningEffort: "on" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+  assert.equal(requestBody?.["reasoning_effort"], undefined);
 });
 
 test("streamChat disables thinking when effort is none", async () => {
@@ -241,6 +257,16 @@ test("streamChat disables thinking when effort is none", async () => {
 
   assert.deepEqual(requestBody?.["thinking"], { type: "disabled" });
   assert.equal(requestBody?.["reasoning_effort"], undefined);
+});
+
+test("getThoughtLevels returns none/high/max for glm-5.2", () => {
+  assert.deepEqual(getThoughtLevels("glm-5.2"), ["none", "high", "max"]);
+});
+
+test("getThoughtLevels returns none/on for non-5.2 models", () => {
+  assert.deepEqual(getThoughtLevels("glm-5.1"), ["none", "on"]);
+  assert.deepEqual(getThoughtLevels("glm-4.7"), ["none", "on"]);
+  assert.deepEqual(getThoughtLevels("glm-5-turbo"), ["none", "on"]);
 });
 
 test("buildThinkingParams omits fields for non-thinking models", () => {

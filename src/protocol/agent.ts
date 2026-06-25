@@ -43,7 +43,8 @@ import {
   getContextWindow,
   isVisionNativeModel,
   ERR_CONTEXT_OVERFLOW,
-  THOUGHT_LEVEL_VALUES,
+  getThoughtLevels,
+  resolveThoughtLevel,
   type GlmMessage,
   type GlmStreamChunk,
   type StreamChatOptions,
@@ -284,6 +285,7 @@ export class GlmAcpAgent implements Agent {
     };
 
     const model = getDefaultModel();
+    const thoughtLevel = resolveThoughtLevel(model, "max");
 
     this.sessions.set(sessionId, {
       cwd: params.cwd,
@@ -296,14 +298,14 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: "default",
-      thoughtLevel: "max",
+      thoughtLevel,
     });
 
     return {
       sessionId,
       models: this.modelsState(model),
       modes: this.modesState("default"),
-      configOptions: this.configOptionsState("max"),
+      configOptions: this.configOptionsState(model, thoughtLevel),
     };
   }
 
@@ -324,6 +326,7 @@ export class GlmAcpAgent implements Agent {
       );
     }
     session.model = params.modelId;
+    session.thoughtLevel = resolveThoughtLevel(params.modelId, session.thoughtLevel);
     session.updatedAt = new Date().toISOString();
     // Notify clients so any UI that displays the active model refreshes
     // immediately, instead of waiting for the next prompt to complete.
@@ -334,11 +337,21 @@ export class GlmAcpAgent implements Agent {
         updatedAt: session.updatedAt,
       },
     });
+    // Push updated thought_level options — the set of valid levels may
+    // differ between models (e.g. switching from 5.2 to 4.7 drops "high").
+    await safeSessionUpdate(this.connection, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: this.configOptionsState(session.model, session.thoughtLevel),
+      },
+    });
     return {};
   }
 
-  /** Build the thought_level config option for session responses. */
-  private configOptionsState(thoughtLevel: ThoughtLevel): SessionConfigOption[] {
+  /** Build the thought_level config option for the given model. */
+  private configOptionsState(model: string, thoughtLevel: ThoughtLevel): SessionConfigOption[] {
+    const levels = getThoughtLevels(model);
     return [
       {
         id: "thought_level",
@@ -347,10 +360,14 @@ export class GlmAcpAgent implements Agent {
         category: "thought_level",
         type: "select" as const,
         currentValue: thoughtLevel,
-        options: THOUGHT_LEVEL_VALUES.map((level) => ({
+        options: levels.map((level) => ({
           value: level,
-          name: level === "none" ? "Off" : level.charAt(0).toUpperCase() + level.slice(1),
-          isDefault: level === "max",
+          name: level === "none"
+            ? "Off"
+            : level === "on"
+              ? "On"
+              : level.charAt(0).toUpperCase() + level.slice(1),
+          isDefault: level === levels[levels.length - 1],
         })),
       },
     ];
@@ -431,17 +448,19 @@ export class GlmAcpAgent implements Agent {
     if (params.configId !== "thought_level") {
       throw new Error(`Unknown config option: ${params.configId}`);
     }
-    const value = params.value as ThoughtLevel;
-    if (!THOUGHT_LEVEL_VALUES.includes(value)) {
-      throw new Error(
-        `Invalid thought_level value: ${params.value}. Valid values: ${THOUGHT_LEVEL_VALUES.join(", ")}`
-      );
-    }
-    session.thoughtLevel = value;
+    // Auto-resolve the value if it's not valid for the current model.
+    // This happens when the client (e.g. Paseo) caches a thoughtLevel from
+    // a previous session and re-sends it for a different model.
+    const requested = params.value as ThoughtLevel;
+    const valid = getThoughtLevels(session.model);
+    const resolved = valid.includes(requested)
+      ? requested
+      : resolveThoughtLevel(session.model, requested);
+    session.thoughtLevel = resolved;
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);
     return {
-      configOptions: this.configOptionsState(value),
+      configOptions: this.configOptionsState(session.model, resolved),
     };
   }
 
@@ -672,7 +691,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
-      thoughtLevel: persisted.thoughtLevel ?? "max",
+      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -684,7 +703,7 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.thoughtLevel),
+      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
     };
   }
 
@@ -713,7 +732,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
-      thoughtLevel: persisted.thoughtLevel ?? "max",
+      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -722,7 +741,7 @@ export class GlmAcpAgent implements Agent {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
       modes: this.modesState(forked.mode),
-      configOptions: this.configOptionsState(forked.thoughtLevel),
+      configOptions: this.configOptionsState(forked.model, forked.thoughtLevel),
     };
   }
 
@@ -745,7 +764,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
-      thoughtLevel: persisted.thoughtLevel ?? "max",
+      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -754,7 +773,7 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.thoughtLevel),
+      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
     };
   }
 

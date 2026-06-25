@@ -33,7 +33,7 @@ export interface PersistedSession {
    * Reasoning effort level. Defaults to "max" for sessions persisted before
    * the thought_level config option was added.
    */
-  thoughtLevel?: "none" | "high" | "max";
+  thoughtLevel?: "none" | "on" | "high" | "max";
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
