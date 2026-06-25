@@ -9,7 +9,7 @@
  * Environment variables:
  *   Z_AI_API_KEY      - API key for the Z.AI / Zhipu AI service. If unset,
  *                       falls back to the credentials file written by --setup.
- *   ACP_GLM_MODEL     - (optional) Override the default model (default: glm-5.1)
+ *   ACP_GLM_MODEL     - (optional) Override the default model (default: glm-5.2)
  */
 import { startConnection } from "./protocol/connection.js";
 import { runSetup } from "./setup.js";
@@ -36,7 +36,7 @@ if (args.includes("--setup")) {
       "",
       "Environment variables:",
       "  Z_AI_API_KEY                   API key (overrides the stored credentials)",
-      "  ACP_GLM_MODEL                  Default model id (e.g. glm-5.1)",
+      "  ACP_GLM_MODEL                  Default model id (e.g. glm-5.2)",
       "  ACP_GLM_AVAILABLE_MODELS       Comma-separated list of advertised models",
       "  ACP_GLM_BASE_URL               Override the Z.AI API base URL",
       "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default 8192)",

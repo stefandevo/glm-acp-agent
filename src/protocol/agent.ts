@@ -28,6 +28,9 @@ import type {
   ResumeSessionResponse,
   SetSessionModelRequest,
   SetSessionModelResponse,
+  SetSessionConfigOptionRequest,
+  SetSessionConfigOptionResponse,
+  SessionConfigOption,
   ModelInfo,
   StopReason,
   Usage,
@@ -40,9 +43,11 @@ import {
   getContextWindow,
   isVisionNativeModel,
   ERR_CONTEXT_OVERFLOW,
+  THOUGHT_LEVEL_VALUES,
   type GlmMessage,
   type GlmStreamChunk,
   type StreamChatOptions,
+  type ThoughtLevel,
 } from "../llm/glm-client.js";
 import { ToolExecutor } from "../tools/executor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
@@ -90,6 +95,8 @@ interface SessionState {
   mcpTools: SessionMcpTools | null;
   /** Active permission mode for this session (clients can change via `session/set_mode`). */
   mode: SessionModeId;
+  /** Reasoning effort for this session, controlled via thought_level config option. */
+  thoughtLevel: ThoughtLevel;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -289,12 +296,14 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: "default",
+      thoughtLevel: "max",
     });
 
     return {
       sessionId,
       models: this.modelsState(model),
       modes: this.modesState("default"),
+      configOptions: this.configOptionsState("max"),
     };
   }
 
@@ -326,6 +335,25 @@ export class GlmAcpAgent implements Agent {
       },
     });
     return {};
+  }
+
+  /** Build the thought_level config option for session responses. */
+  private configOptionsState(thoughtLevel: ThoughtLevel): SessionConfigOption[] {
+    return [
+      {
+        id: "thought_level",
+        name: "Thinking",
+        description: "Reasoning effort",
+        category: "thought_level",
+        type: "select" as const,
+        currentValue: thoughtLevel,
+        options: THOUGHT_LEVEL_VALUES.map((level) => ({
+          value: level,
+          name: level === "none" ? "Off" : level.charAt(0).toUpperCase() + level.slice(1),
+          isDefault: level === "max",
+        })),
+      },
+    ];
   }
 
   /** Build the SessionModelState we advertise on session create/load/resume/fork. */
@@ -391,6 +419,30 @@ export class GlmAcpAgent implements Agent {
       },
     });
     return {};
+  }
+
+  async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest
+  ): Promise<SetSessionConfigOptionResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${params.sessionId}`);
+    }
+    if (params.configId !== "thought_level") {
+      throw new Error(`Unknown config option: ${params.configId}`);
+    }
+    const value = params.value as ThoughtLevel;
+    if (!THOUGHT_LEVEL_VALUES.includes(value)) {
+      throw new Error(
+        `Invalid thought_level value: ${params.value}. Valid values: ${THOUGHT_LEVEL_VALUES.join(", ")}`
+      );
+    }
+    session.thoughtLevel = value;
+    session.updatedAt = new Date().toISOString();
+    this.persistSession(params.sessionId, session);
+    return {
+      configOptions: this.configOptionsState(value),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -620,6 +672,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
+      thoughtLevel: persisted.thoughtLevel ?? "max",
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -631,6 +684,7 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
+      configOptions: this.configOptionsState(restored.thoughtLevel),
     };
   }
 
@@ -659,6 +713,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
+      thoughtLevel: persisted.thoughtLevel ?? "max",
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -667,6 +722,7 @@ export class GlmAcpAgent implements Agent {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
       modes: this.modesState(forked.mode),
+      configOptions: this.configOptionsState(forked.thoughtLevel),
     };
   }
 
@@ -689,6 +745,7 @@ export class GlmAcpAgent implements Agent {
       toolDefinitions,
       mcpTools,
       mode: persisted.mode,
+      thoughtLevel: persisted.thoughtLevel ?? "max",
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -697,6 +754,7 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
+      configOptions: this.configOptionsState(restored.thoughtLevel),
     };
   }
 
@@ -713,6 +771,7 @@ export class GlmAcpAgent implements Agent {
       updatedAt: session.updatedAt,
       model: session.model,
       mode: session.mode,
+      thoughtLevel: session.thoughtLevel,
     };
   }
 
@@ -841,6 +900,7 @@ export class GlmAcpAgent implements Agent {
         for await (const chunk of this.glm.streamChat(session.messages, signal, {
           model: session.model,
           tools: session.toolDefinitions,
+          reasoningEffort: session.thoughtLevel,
         })) {
           if (signal.aborted) return { stopReason: "cancelled" };
 

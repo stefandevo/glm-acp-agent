@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GlmClient, getAvailableModels } from "../llm/glm-client.js";
+import { GlmClient, getAvailableModels, getContextWindow, getDefaultModel, buildThinkingParams } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
   process.env["Z_AI_API_KEY"] = "test-key";
@@ -171,7 +171,9 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, ["glm-5.1", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.deepEqual(ids, ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.5-air"]);
+    assert.equal(getDefaultModel(), "glm-5.2");
+    assert.equal(getContextWindow("glm-5.2"), 1_000_000);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
@@ -207,6 +209,50 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
 
   assert.equal(requestBody?.["model"], "glm-5v-turbo");
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+});
+
+test("streamChat sends reasoning_effort when level is set", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2", reasoningEffort: "high" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+  assert.equal(requestBody?.["reasoning_effort"], "high");
+});
+
+test("streamChat disables thinking when effort is none", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2", reasoningEffort: "none" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "disabled" });
+  assert.equal(requestBody?.["reasoning_effort"], undefined);
+});
+
+test("buildThinkingParams omits fields for non-thinking models", () => {
+  delete process.env["ACP_GLM_THINKING"];
+  const params = buildThinkingParams("some-other-model");
+  assert.deepEqual(params, {});
+});
+
+test("buildThinkingParams defaults to enabled with no effort", () => {
+  delete process.env["ACP_GLM_THINKING"];
+  const params = buildThinkingParams("glm-5.2");
+  assert.deepEqual(params, { thinking: { type: "enabled" } });
 });
 
 test("streamChat does not flush partial tool calls (missing id or name)", async () => {

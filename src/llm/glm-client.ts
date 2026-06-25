@@ -6,6 +6,19 @@ import { resolveApiKey } from "./credentials.js";
 import { debug, error } from "./logger.js";
 
 /**
+ * Reasoning effort levels exposed to ACP clients via the thought_level
+ * SessionConfigOption. These map onto Z.AI's thinking / reasoning_effort
+ * parameters (see buildThinkingParams).
+ *
+ * Only GLM-5.2 distinguishes between "high" and "max"; other thinking-capable
+ * models treat both as "thinking enabled".
+ */
+export type ThoughtLevel = "none" | "high" | "max";
+
+/** Config option values advertised to ACP clients. */
+export const THOUGHT_LEVEL_VALUES: ThoughtLevel[] = ["none", "high", "max"];
+
+/**
  * A single message in the GLM conversation history.
  */
 export type GlmMessage = ChatCompletionMessageParam;
@@ -38,13 +51,15 @@ export interface StreamChatOptions {
   model: string;
   /** Tool schemas available in this specific session. */
   tools?: ToolDefinition[];
+  /** Reasoning effort for this call, or undefined to use defaults. */
+  reasoningEffort?: ThoughtLevel;
 }
 
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 
 /** Default GLM model when neither client nor user has chosen one. */
-export const DEFAULT_MODEL = "glm-5.1";
+export const DEFAULT_MODEL = "glm-5.2";
 
 /**
  * Curated list of GLM models the agent advertises to ACP clients via
@@ -56,9 +71,14 @@ export const DEFAULT_MODEL = "glm-5.1";
  */
 const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
   {
+    modelId: "glm-5.2",
+    name: "GLM-5.2",
+    description: "1M-context coding model with thinking mode",
+  },
+  {
     modelId: "glm-5.1",
     name: "GLM-5.1",
-    description: "Latest GLM reasoning model with thinking mode",
+    description: "Long-horizon coding model with thinking mode",
   },
   {
     modelId: "glm-5-turbo",
@@ -92,6 +112,7 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
  * Context window sizes (in tokens) for GLM series models.
  */
 const MODEL_METADATA: Record<string, { contextWindow: number }> = {
+  "glm-5.2": { contextWindow: 1_000_000 },
   "glm-5.1": { contextWindow: 128_000 },
   "glm-5-turbo": { contextWindow: 128_000 },
   "glm-5v-turbo": { contextWindow: 200_000 },
@@ -176,7 +197,7 @@ export class GlmClient {
     options?: StreamChatOptions
   ): AsyncGenerator<GlmStreamChunk> {
     const model = options?.model ?? getDefaultModel();
-    const thinkingEnabled = parseThinking(model);
+    const thinkingParams = buildThinkingParams(model, options?.reasoningEffort);
     const tools: ChatCompletionTool[] = (options?.tools ?? TOOL_DEFINITIONS).map((t) => ({
       type: "function" as const,
       function: {
@@ -187,15 +208,12 @@ export class GlmClient {
     }));
 
     debug(
-      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${thinkingEnabled}`
+      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${JSON.stringify(thinkingParams)}`
     );
 
     // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
-    // that to pass GLM-specific fields like `thinking`.
-    const extraBody: Record<string, unknown> = {};
-    if (thinkingEnabled) {
-      extraBody["thinking"] = { type: "enabled" };
-    }
+    // that to pass GLM-specific fields like `thinking` and `reasoning_effort`.
+    const extraBody: Record<string, unknown> = { ...thinkingParams };
 
     let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>>;
     try {
@@ -326,16 +344,53 @@ function parseIntEnv(name: string, fallback: number): number {
 }
 
 /**
- * Decide whether to enable GLM "thinking" mode for a given model name.
+ * Decide whether a model supports GLM thinking mode based on its name.
  *
  * The user can force on/off via `ACP_GLM_THINKING=true|false`. Otherwise,
  * we enable thinking for any model whose name suggests it supports it
  * (the GLM-4.5 / GLM-4.6 / GLM-4.7 / GLM-5.x families).
  */
-function parseThinking(model: string): boolean {
+function supportsThinking(model: string): boolean {
   const override = process.env["ACP_GLM_THINKING"];
   if (override !== undefined) {
     return override.toLowerCase() === "true" || override === "1";
   }
   return /^glm-(?:4\.[567]|5)/i.test(model);
+}
+
+/**
+ * Build the Z.AI thinking / reasoning_effort extra-body params for a call.
+ *
+ * Z.AI has two parameters:
+ * - `thinking` — on/off gate: `{"type":"enabled"}` or `{"type":"disabled"}`
+ * - `reasoning_effort` — only GLM-5.2; controls thinking depth. Other models
+ *   accept the field but always think at their default depth.
+ *
+ * When `effort` is "none", thinking is disabled entirely. When unset, the
+ * model defaults are used (thinking enabled for GLM-5.x, no field for others).
+ */
+export function buildThinkingParams(
+  model: string,
+  effort?: ThoughtLevel
+): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+
+  const canThink = supportsThinking(model);
+
+  if (effort === "none") {
+    if (canThink) params["thinking"] = { type: "disabled" };
+    return params;
+  }
+
+  if (!canThink) return params;
+
+  params["thinking"] = { type: "enabled" };
+
+  // Only send reasoning_effort when the caller explicitly picked a level.
+  // Z.AI defaults to max when the field is omitted.
+  if (effort) {
+    params["reasoning_effort"] = effort;
+  }
+
+  return params;
 }

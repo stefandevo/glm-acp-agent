@@ -857,6 +857,62 @@ test("setSessionMode rejects invalid mode ids", async () => {
   );
 });
 
+test("newSession returns configOptions with thought_level selector", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  assert.ok(result.configOptions, "configOptions should be present");
+  const tl = result.configOptions!.find((o) => o.category === "thought_level");
+  assert.ok(tl, "thought_level option should exist");
+  assert.equal(tl!.type, "select");
+  assert.equal(tl!.currentValue, "max");
+  const values = (tl as { options: Array<{ value: string }> }).options.map((o) => o.value);
+  assert.deepEqual(values, ["none", "high", "max"]);
+});
+
+test("setSessionConfigOption updates thoughtLevel and returns updated options", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+
+  assert.ok(result.configOptions);
+  const tl = result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "high");
+});
+
+test("setSessionConfigOption rejects invalid thought_level values", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "turbo" }),
+    /Invalid thought_level/
+  );
+});
+
+test("setSessionConfigOption rejects unknown config ids", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "unknown", value: "x" }),
+    /Unknown config option/
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Prompt loop
 // ---------------------------------------------------------------------------
@@ -1747,6 +1803,7 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   
   // Seed the session with a bunch of messages to be compacted.
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
   const session = (agent as unknown as {
     sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
   }).sessions.get(sessionId);
