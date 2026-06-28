@@ -368,19 +368,18 @@ function parseIntEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/**
- * Decide whether a model supports GLM thinking mode based on its name.
- *
- * The user can force on/off via `ACP_GLM_THINKING=true|false`. Otherwise,
- * we enable thinking for any model whose name suggests it supports it
- * (the GLM-4.5 / GLM-4.6 / GLM-4.7 / GLM-5.x families).
- */
-function supportsThinking(model: string): boolean {
+/** Decide whether a model supports GLM thinking based on its name. */
+function modelSupportsThinking(model: string): boolean {
+  return /^glm-(?:4\.[567]|5)/i.test(model);
+}
+
+/** Parse the `ACP_GLM_THINKING` env override, or undefined when unset. */
+function thinkingOverride(): boolean | undefined {
   const override = process.env["ACP_GLM_THINKING"];
   if (override !== undefined) {
     return override.toLowerCase() === "true" || override === "1";
   }
-  return /^glm-(?:4\.[567]|5)/i.test(model);
+  return undefined;
 }
 
 /**
@@ -404,9 +403,17 @@ export function buildThinkingParams(
 ): Record<string, unknown> {
   const params: Record<string, unknown> = {};
 
-  const canThink = supportsThinking(model);
+  const override = thinkingOverride();
+  const modelCanThink = modelSupportsThinking(model);
 
-  if (effort === "none") {
+  if (override === false) {
+    if (modelCanThink) params["thinking"] = { type: "disabled" };
+    return params;
+  }
+
+  const canThink = override === true || modelCanThink;
+
+  if (effort === "none" && override !== true) {
     if (canThink) params["thinking"] = { type: "disabled" };
     return params;
   }

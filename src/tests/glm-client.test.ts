@@ -235,7 +235,7 @@ test("streamChat does not send reasoning_effort for non-5.2 models", async () =>
     return Promise.resolve(stream);
   });
 
-  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.1", reasoningEffort: "on" })) {
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.1", reasoningEffort: "high" })) {
     void chunk;
   }
 
