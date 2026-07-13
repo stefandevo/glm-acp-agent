@@ -44,7 +44,7 @@ export interface StreamChatOptions {
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 
 /** Default GLM model when neither client nor user has chosen one. */
-export const DEFAULT_MODEL = "glm-5.1";
+export const DEFAULT_MODEL = "glm-5.2";
 
 /**
  * Curated list of GLM models the agent advertises to ACP clients via
@@ -56,9 +56,14 @@ export const DEFAULT_MODEL = "glm-5.1";
  */
 const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
   {
+    modelId: "glm-5.2",
+    name: "GLM-5.2",
+    description: "Flagship GLM model with 1M-token context for long-horizon tasks",
+  },
+  {
     modelId: "glm-5.1",
     name: "GLM-5.1",
-    description: "Latest GLM reasoning model with thinking mode",
+    description: "GLM reasoning model with thinking mode",
   },
   {
     modelId: "glm-5-turbo",
@@ -92,6 +97,7 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
  * Context window sizes (in tokens) for GLM series models.
  */
 const MODEL_METADATA: Record<string, { contextWindow: number }> = {
+  "glm-5.2": { contextWindow: 1_000_000 },
   "glm-5.1": { contextWindow: 128_000 },
   "glm-5-turbo": { contextWindow: 128_000 },
   "glm-5v-turbo": { contextWindow: 200_000 },

@@ -1748,9 +1748,13 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   // Seed the session with a bunch of messages to be compacted.
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
   const session = (agent as unknown as {
-    sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
+    sessions: Map<string, { messages: Array<{ role: string; content?: string }>; model: string }>;
   }).sessions.get(sessionId);
   assert.ok(session, "expected in-memory session to exist");
+  // Use glm-5.1 (128K context) so the seeded messages actually exceed the
+  // emergency compaction threshold. The default glm-5.2 has a 1M context,
+  // which would make the test messages too small to trigger compaction.
+  session.model = "glm-5.1";
 
   for (let i = 0; i < 50; i++) {
     session.messages.push({ role: "user", content: "Very long message filler ".repeat(1000) });
