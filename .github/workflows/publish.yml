@@ -13,10 +13,10 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: "npm"
@@ -40,4 +40,15 @@ jobs:
       - name: Verify published package via bun x
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          TMPDIR=$(mktemp -d) bun x --package "glm-acp-agent@$VERSION" glm-acp-agent < /dev/null
+          # npm's registry cache can lag a few seconds behind a fresh publish,
+          # so retry until the just-published version is resolvable.
+          for i in $(seq 1 10); do
+            if TMPDIR=$(mktemp -d) bun x --package "glm-acp-agent@$VERSION" glm-acp-agent < /dev/null; then
+              echo "Verified glm-acp-agent@$VERSION via bun x"
+              exit 0
+            fi
+            echo "Attempt $i: glm-acp-agent@$VERSION not resolvable yet, waiting 15s for npm propagation..."
+            sleep 15
+          done
+          echo "::error::glm-acp-agent@$VERSION did not become resolvable via bun x after retries"
+          exit 1
