@@ -1,6 +1,6 @@
 # glm-acp-agent
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.1, GLM-4.7, GLM-4.6, …) as its reasoning core.
+An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.2, GLM-5.1, GLM-4.7, …) as its reasoning core.
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
@@ -139,7 +139,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
-| `ACP_GLM_MODEL` | No | `glm-5.1` | Default GLM model for new sessions |
+| `ACP_GLM_MODEL` | No | `glm-5.2` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
@@ -170,7 +170,8 @@ The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 
 | Model | Notes |
 |-------|-------|
-| `glm-5.1` | **Default.** Long-horizon coding model; thinking mode auto-enabled |
+| `glm-5.2` | **Default.** Newest 1M-context coding model; thinking mode auto-enabled |
+| `glm-5.1` | Long-horizon coding model; thinking mode auto-enabled |
 | `glm-5-turbo` | Faster Coding Plan reasoning model |
 | `glm-5v-turbo` | Multimodal Coding Plan model; native image understanding for jpg / jpeg / png inputs |
 | `glm-4.7` | 200K-context reasoning model |
@@ -314,7 +315,7 @@ If `Z_AI_API_KEY` is set in the environment **and** a credentials file exists, t
 2. Open the **agent panel** (use the command palette: `agent panel: toggle focus`).
 3. In the agent picker, select **glm** — Zed labels external agents by their `agent_servers` key.
 4. Start a new thread and send a small prompt that exercises a tool, e.g. `Read package.json and tell me the project name.`
-5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.1`) reasoning surfaced as a separate thought block.
+5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.2`) reasoning surfaced as a separate thought block.
 
 #### 5. Iterating on the agent
 

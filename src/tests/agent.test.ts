@@ -1745,8 +1745,11 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   
-  // Seed the session with a bunch of messages to be compacted.
+  // Seed the session with a bunch of messages to be compacted. Pin the session
+  // to a 128K-window model so the seeded history triggers the proactive/
+  // emergency compaction paths (the default model now has a 1M window).
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
   const session = (agent as unknown as {
     sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
   }).sessions.get(sessionId);
