@@ -5,6 +5,9 @@ import {
   getAvailableModels,
   getDefaultModel,
   getContextWindow,
+  getThoughtLevels,
+  resolveThoughtLevel,
+  buildThinkingParams,
 } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
@@ -233,6 +236,119 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
 
   assert.equal(requestBody?.["model"], "glm-5v-turbo");
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+});
+
+test("streamChat sends reasoning_effort when level is set on glm-5.2", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2", reasoningEffort: "high" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+  assert.equal(requestBody?.["reasoning_effort"], "high");
+});
+
+test("streamChat does not send reasoning_effort for non-5.2 models", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.1", reasoningEffort: "high" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+  assert.equal(requestBody?.["reasoning_effort"], undefined);
+});
+
+test("streamChat disables thinking when effort is none", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2", reasoningEffort: "none" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "disabled" });
+  assert.equal(requestBody?.["reasoning_effort"], undefined);
+});
+
+test("getThoughtLevels returns none/high/max for glm-5.2", () => {
+  assert.deepEqual(getThoughtLevels("glm-5.2"), ["none", "high", "max"]);
+});
+
+test("getThoughtLevels returns none/on for non-5.2 models", () => {
+  assert.deepEqual(getThoughtLevels("glm-5.1"), ["none", "on"]);
+  assert.deepEqual(getThoughtLevels("glm-4.7"), ["none", "on"]);
+  assert.deepEqual(getThoughtLevels("glm-5-turbo"), ["none", "on"]);
+});
+
+test("resolveThoughtLevel clamps invalid levels to the model default", () => {
+  // "high"/"max" are 5.2-only; other models fall back to "on".
+  assert.equal(resolveThoughtLevel("glm-5.1", "max"), "on");
+  assert.equal(resolveThoughtLevel("glm-4.7", "high"), "on");
+  // Valid levels are preserved.
+  assert.equal(resolveThoughtLevel("glm-5.2", "high"), "high");
+  assert.equal(resolveThoughtLevel("glm-5.1", "none"), "none");
+});
+
+test("buildThinkingParams omits fields for non-thinking models", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    assert.deepEqual(buildThinkingParams("some-other-model"), {});
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams defaults to enabled with no effort", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    assert.deepEqual(buildThinkingParams("glm-5.2"), { thinking: { type: "enabled" } });
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams never emits reasoning_effort='none' when thinking is force-enabled", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  process.env["ACP_GLM_THINKING"] = "true";
+  try {
+    // Force-on + level "none" on glm-5.2: thinking is enabled, but "none" is
+    // not a valid reasoning_effort value, so the field must be omitted.
+    // Exact deep-equality proves reasoning_effort is absent (not "none").
+    assert.deepEqual(buildThinkingParams("glm-5.2", "none"), { thinking: { type: "enabled" } });
+  } finally {
+    if (old === undefined) delete process.env["ACP_GLM_THINKING"];
+    else process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams honours ACP_GLM_THINKING=false override", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  process.env["ACP_GLM_THINKING"] = "false";
+  try {
+    // Forced off even when a level requests thinking.
+    assert.deepEqual(buildThinkingParams("glm-5.2", "max"), { thinking: { type: "disabled" } });
+  } finally {
+    if (old === undefined) delete process.env["ACP_GLM_THINKING"];
+    else process.env["ACP_GLM_THINKING"] = old;
+  }
 });
 
 test("streamChat does not flush partial tool calls (missing id or name)", async () => {

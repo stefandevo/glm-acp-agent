@@ -183,6 +183,17 @@ Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. The multimo
 
 When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5v-turbo`. Override with `ACP_GLM_THINKING=false` if you want plain completions only.
 
+#### Thought level (reasoning effort)
+
+The agent advertises a `thought_level` [SessionConfigOption](https://agentclientprotocol.com) so clients that support config options (e.g. a "Thinking" selector) can control reasoning effort per session. The available levels depend on the active model:
+
+| Model | Levels | Mapping to the Z.AI request |
+|-------|--------|-----------------------------|
+| `glm-5.2` | `Off` / `High` / `Max` | `Off` → `thinking: { type: "disabled" }`; `High`/`Max` → `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
+| other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
+
+`reasoning_effort` is a GLM-5.2 extra — other models never receive it. New sessions default to the model's own default effort (`Max` on GLM-5.2, which is also Z.AI's default when the field is omitted), so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (e.g. a `High` selection reverts to `On` when you move off GLM-5.2) and pushes a `config_option_update`. The `ACP_GLM_THINKING` env override still wins: `false` forces thinking off regardless of the selected level. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, users can pick `glm-5v-turbo` for text work but clients should not offer image attachments.
 
 ### Vision MCP

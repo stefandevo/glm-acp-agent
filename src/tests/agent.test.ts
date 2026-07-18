@@ -858,6 +858,216 @@ test("setSessionMode rejects invalid mode ids", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Thought level / config options
+// ---------------------------------------------------------------------------
+
+test("newSession returns configOptions with thought_level selector for default model", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  assert.ok(result.configOptions, "configOptions should be present");
+  const tl = result.configOptions!.find((o) => o.category === "thought_level");
+  assert.ok(tl, "thought_level option should exist");
+  assert.equal(tl!.type, "select");
+  // Default model is glm-5.2 → none/high/max, defaulting to max.
+  assert.equal(tl!.currentValue, "max");
+  const values = (tl as { options: Array<{ value: string }> }).options.map((o) => o.value);
+  assert.deepEqual(values, ["none", "high", "max"]);
+});
+
+test("setSessionConfigOption updates thoughtLevel and returns updated options", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+
+  assert.ok(result.configOptions);
+  const tl = result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "high");
+});
+
+test("setSessionConfigOption auto-resolves values invalid for the current model", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  // Switch to glm-5.1 which only supports none/on.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
+
+  // "max" is invalid for glm-5.1 — should auto-resolve to "on".
+  const result = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "max",
+  });
+
+  const tl = result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "on");
+});
+
+test("setSessionConfigOption rejects unknown config ids", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "unknown", value: "x" }),
+    /Unknown config option/
+  );
+});
+
+test("setSessionConfigOption rejects values that aren't a known thought level", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // "medium" is not a ThoughtLevel at all — reject rather than silently coerce.
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" }),
+    /Invalid thought_level value/
+  );
+  // A cross-model-but-known value ("max" while on the default glm-5.2) is fine.
+  const ok = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "max",
+  });
+  assert.equal(ok.configOptions.find((o) => o.id === "thought_level")!.currentValue, "max");
+});
+
+test("switching model updates thought_level options via config_option_update", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // Start with glm-5.2 (default) → max, options none/high/max.
+  // Switch to glm-4.7 → thoughtLevel should resolve to "on".
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
+
+  const configUpdates = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  );
+  assert.equal(configUpdates.length, 1);
+  const opts = (configUpdates[0]!.update as {
+    configOptions: Array<{ id: string; currentValue: string; options: Array<{ value: string }> }>;
+  }).configOptions;
+  const tl = opts.find((o) => o.id === "thought_level");
+  assert.equal(tl!.currentValue, "on");
+  const values = tl!.options.map((o) => o.value);
+  assert.deepEqual(values, ["none", "on"]);
+});
+
+test("thoughtLevel is forwarded to streamChat as reasoningEffort", async () => {
+  const conn = createConnectionStub();
+  let seenEffort: string | undefined;
+  const glm = {
+    async *streamChat(
+      _messages: ReadonlyArray<{ role: string }>,
+      _signal?: AbortSignal,
+      options?: { reasoningEffort?: string }
+    ): AsyncGenerator<GlmStreamChunk> {
+      seenEffort = options?.reasoningEffort;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "high" });
+
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  assert.equal(seenEffort, "high");
+});
+
+test("thoughtLevel round-trips through fork via persistence", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-thoughtlevel-"));
+  try {
+    const store = new SessionStore(dir);
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "high" });
+
+    const forked = await agent.unstable_forkSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    const tl = forked.configOptions!.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "high");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("model switch persists model + clamped thoughtLevel before any prompt (fork sees it)", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-switch-"));
+  try {
+    const store = new SessionStore(dir);
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    // Switch model with no prompt in between: glm-5.2/max → glm-4.7, which
+    // clamps the level to "on". Both must survive a fork that reads from disk.
+    await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
+
+    const forked = await agent.unstable_forkSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    assert.equal(forked.models!.currentModelId, "glm-4.7");
+    const tl = forked.configOptions!.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "on");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on load", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-migrate-"));
+  const sessionId = "abcd1234-abcd-abcd-abcd-abcdabcd1234";
+  try {
+    // Write a raw v2 record: has `mode` but no `thoughtLevel`.
+    const v2 = {
+      schemaVersion: 2,
+      sessionId,
+      cwd: "/tmp",
+      messages: [{ role: "system", content: "you are a coding assistant" }],
+      title: "old session",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.1",
+      mode: "default",
+    };
+    writeFileSync(pathJoin(dir, `${sessionId}.json`), JSON.stringify(v2), "utf8");
+
+    // The store migrates the raw record, defaulting thoughtLevel to "max".
+    const store = new SessionStore(dir);
+    const migrated = store.load(sessionId);
+    assert.equal(migrated?.schemaVersion, 3);
+    assert.equal(migrated?.thoughtLevel, "max");
+
+    // On load the agent clamps that to the session's model (glm-5.1 → "on").
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const result = await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    const tl = result.configOptions!.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "on");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Prompt loop
 // ---------------------------------------------------------------------------
 
