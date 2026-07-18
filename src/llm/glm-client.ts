@@ -6,6 +6,57 @@ import { resolveApiKey } from "./credentials.js";
 import { debug, error } from "./logger.js";
 
 /**
+ * Reasoning effort levels exposed to ACP clients via the `thought_level`
+ * SessionConfigOption. These map onto Z.AI's `thinking` / `reasoning_effort`
+ * request parameters (see {@link buildThinkingParams}).
+ *
+ * GLM-5.2 supports three levels: `none`, `high`, `max`. Other thinking-capable
+ * models (GLM-5.1, 5-turbo, 4.7, …) only distinguish thinking on vs. off, so
+ * they use `none` and `on`.
+ */
+export type ThoughtLevel = "none" | "on" | "high" | "max";
+
+/** Levels shown when the selected model is GLM-5.2. */
+const LEVELS_52: ThoughtLevel[] = ["none", "high", "max"];
+
+/** Levels shown for every other thinking-capable model. */
+const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
+
+/** Whether a model id is in the GLM-5.2 family (case-insensitive). */
+function isGlm52(model: string): boolean {
+  return model.toLowerCase().startsWith("glm-5.2");
+}
+
+/** The complete set of thought levels the agent understands. */
+const ALL_THOUGHT_LEVELS: readonly ThoughtLevel[] = ["none", "on", "high", "max"];
+
+/** Type guard: whether an arbitrary string is a known ThoughtLevel. */
+export function isThoughtLevel(value: string): value is ThoughtLevel {
+  return (ALL_THOUGHT_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve which thought-level options a model supports.
+ *
+ * `reasoning_effort` is a GLM-5.2 exclusive per the Z.AI docs — other models
+ * accept the field but it has no effect, so we only expose high/max for 5.2.
+ */
+export function getThoughtLevels(model: string): ThoughtLevel[] {
+  return isGlm52(model) ? LEVELS_52 : LEVELS_DEFAULT;
+}
+
+/**
+ * Resolve a stored ThoughtLevel to one that's valid for the given model.
+ * Used when switching models or restoring a persisted session: if the old
+ * level isn't in the new model's option list, fall back to the model's
+ * default (max for 5.2, on for everything else — the last entry in the list).
+ */
+export function resolveThoughtLevel(model: string, level: ThoughtLevel): ThoughtLevel {
+  const valid = getThoughtLevels(model);
+  return valid.includes(level) ? level : valid[valid.length - 1]!;
+}
+
+/**
  * A single message in the GLM conversation history.
  */
 export type GlmMessage = ChatCompletionMessageParam;
@@ -38,6 +89,8 @@ export interface StreamChatOptions {
   model: string;
   /** Tool schemas available in this specific session. */
   tools?: ToolDefinition[];
+  /** Reasoning effort for this call, or undefined to use the model defaults. */
+  reasoningEffort?: ThoughtLevel;
 }
 
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
@@ -182,7 +235,7 @@ export class GlmClient {
     options?: StreamChatOptions
   ): AsyncGenerator<GlmStreamChunk> {
     const model = options?.model ?? getDefaultModel();
-    const thinkingEnabled = parseThinking(model);
+    const thinkingParams = buildThinkingParams(model, options?.reasoningEffort);
     const tools: ChatCompletionTool[] = (options?.tools ?? TOOL_DEFINITIONS).map((t) => ({
       type: "function" as const,
       function: {
@@ -193,15 +246,12 @@ export class GlmClient {
     }));
 
     debug(
-      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${thinkingEnabled}`
+      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${JSON.stringify(thinkingParams)}`
     );
 
     // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
-    // that to pass GLM-specific fields like `thinking`.
-    const extraBody: Record<string, unknown> = {};
-    if (thinkingEnabled) {
-      extraBody["thinking"] = { type: "enabled" };
-    }
+    // that to pass GLM-specific fields like `thinking` and `reasoning_effort`.
+    const extraBody: Record<string, unknown> = { ...thinkingParams };
 
     let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>>;
     try {
@@ -332,16 +382,78 @@ function parseIntEnv(name: string, fallback: number): number {
 }
 
 /**
- * Decide whether to enable GLM "thinking" mode for a given model name.
- *
- * The user can force on/off via `ACP_GLM_THINKING=true|false`. Otherwise,
- * we enable thinking for any model whose name suggests it supports it
+ * Decide whether a model supports GLM "thinking" mode based on its name
  * (the GLM-4.5 / GLM-4.6 / GLM-4.7 / GLM-5.x families).
  */
-function parseThinking(model: string): boolean {
+function modelSupportsThinking(model: string): boolean {
+  return /^glm-(?:4\.[567]|5)/i.test(model);
+}
+
+/**
+ * Parse the `ACP_GLM_THINKING` env override into an explicit boolean, or
+ * `undefined` when the variable is unset. `true`/`1` force thinking on;
+ * anything else forces it off.
+ */
+function thinkingOverride(): boolean | undefined {
   const override = process.env["ACP_GLM_THINKING"];
   if (override !== undefined) {
     return override.toLowerCase() === "true" || override === "1";
   }
-  return /^glm-(?:4\.[567]|5)/i.test(model);
+  return undefined;
+}
+
+/**
+ * Build the Z.AI `thinking` / `reasoning_effort` extra-body params for a call.
+ *
+ * Z.AI exposes two parameters:
+ * - `thinking` — an on/off gate: `{"type":"enabled"}` or `{"type":"disabled"}`
+ * - `reasoning_effort` — GLM-5.2 only; controls thinking depth (`high`/`max`,
+ *   defaulting to `max` when omitted).
+ *
+ * {@link ThoughtLevel} values map as follows:
+ * - `none` → thinking disabled
+ * - `on`   → thinking enabled (no reasoning_effort)
+ * - `high` → thinking enabled + reasoning_effort=high (5.2 only)
+ * - `max`  → thinking enabled + reasoning_effort=max (5.2 only)
+ *
+ * The `ACP_GLM_THINKING` env override still wins: `false` forces thinking off,
+ * `true` forces it on (ignoring a `none` level). When `effort` is unset the
+ * model defaults are used, preserving the pre-thought-level behaviour.
+ */
+export function buildThinkingParams(
+  model: string,
+  effort?: ThoughtLevel
+): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+
+  const override = thinkingOverride();
+  const modelCanThink = modelSupportsThinking(model);
+
+  // Explicit env override to disable wins over everything.
+  if (override === false) {
+    if (modelCanThink) params["thinking"] = { type: "disabled" };
+    return params;
+  }
+
+  const canThink = override === true || modelCanThink;
+
+  // A `none` level disables thinking, unless the env override forces it on.
+  if (effort === "none" && override !== true) {
+    if (canThink) params["thinking"] = { type: "disabled" };
+    return params;
+  }
+
+  if (!canThink) return params;
+
+  params["thinking"] = { type: "enabled" };
+
+  // reasoning_effort is only meaningful for GLM-5.2 per the Z.AI docs, and Z.AI
+  // only accepts the "high"/"max" values there. Other levels ("on", and "none"
+  // when thinking is force-enabled via the env override) carry no valid
+  // reasoning_effort, so we omit the field entirely.
+  if ((effort === "high" || effort === "max") && isGlm52(model)) {
+    params["reasoning_effort"] = effort;
+  }
+
+  return params;
 }

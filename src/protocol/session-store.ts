@@ -1,14 +1,14 @@
 import { mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { GlmMessage } from "../llm/glm-client.js";
+import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
 
 /**
  * Schema version embedded in every persisted session file. Bump whenever the
  * shape of `PersistedSession` changes incompatibly so future loaders can
  * migrate (or reject) old records instead of silently producing garbage.
  */
-export const SESSION_SCHEMA_VERSION = 2 as const;
+export const SESSION_SCHEMA_VERSION = 3 as const;
 
 /**
  * On-disk representation of a session. Only fields that need to survive a
@@ -29,6 +29,12 @@ export interface PersistedSession {
    * sessions from schema versions that didn't include this field.
    */
   mode: "default" | "accept_edits" | "bypass_permissions";
+  /**
+   * Reasoning effort level, controlled via the `thought_level` config option.
+   * Optional so sessions persisted before this field was added still parse;
+   * the migration (and load-time resolution) default it to "max".
+   */
+  thoughtLevel?: ThoughtLevel;
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
@@ -99,14 +105,25 @@ export class SessionStore {
     } catch {
       return undefined;
     }
-    // Handle schema migrations. We support schema version 1 (pre-modes) and
-    // version 2 (with mode field).
+    // Handle schema migrations. We support v1 (pre-modes), v2 (with mode
+    // field), and v3 (with thoughtLevel). Defaulting thoughtLevel to "max"
+    // is safe: it's GLM-5.2's own default effort, and load-time resolution
+    // clamps it to a valid level for the session's actual model.
     const version = parsed.schemaVersion ?? 1;
     if (version === 1) {
-      // Migration: add mode field with default value.
+      // Migration: add mode + thoughtLevel fields with default values.
       return {
         ...parsed,
         mode: "default",
+        thoughtLevel: "max",
+        schemaVersion: SESSION_SCHEMA_VERSION,
+      };
+    }
+    if (version === 2) {
+      // Migration: add thoughtLevel field with default value.
+      return {
+        ...parsed,
+        thoughtLevel: "max",
         schemaVersion: SESSION_SCHEMA_VERSION,
       };
     }
