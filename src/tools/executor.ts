@@ -851,20 +851,26 @@ function runShellCommand(
       settled = true;
       reject(err);
     });
-    child.on("exit", (exitCode, exitSignal) => {
+    child.on("exit", () => {
+      // The shell exited. Normal commands will close their streams immediately,
+      // firing "close" within milliseconds. For daemons that inherit stdio and
+      // keep pipes open, forcefully destroy the streams after a brief grace
+      // period so "close" fires and the Promise can resolve.
+      setTimeout(() => {
+        if (!settled) {
+          child.stdout.destroy();
+          child.stderr.destroy();
+        }
+      }, 50);
+    });
+    child.on("close", (exitCode, closeSignal) => {
       if (settled) return;
-      // Resolve on "exit" instead of "close". The "close" event waits until
-      // all stdio streams are closed, but background processes spawned with
-      // nohup/disown inherit the pipe FDs and keep them open indefinitely.
-      // "exit" fires as soon as the sh -c process terminates, regardless of
-      // inherited pipes. Any output written before exit is already in the
-      // kernel pipe buffer and will be read by Node's data handlers.
       settled = true;
       resolve({
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         exitCode,
-        signal: exitSignal,
+        signal: closeSignal,
       });
     });
   });
