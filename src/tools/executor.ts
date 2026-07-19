@@ -831,8 +831,15 @@ function runShellCommand(
     const child = spawn("sh", ["-c", command], {
       cwd,
       signal,
+      detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Detach the child process group from this agent's event loop so that
+    // background processes (nohup, disown, &) don't keep the Node process
+    // alive after the main sh -c exits. Combined with "exit" (not "close")
+    // this lets run_command return immediately for scripts that spawn
+    // long-running daemons (e.g. llama-server, mcp-bridges).
+    child.unref();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;
@@ -844,14 +851,20 @@ function runShellCommand(
       settled = true;
       reject(err);
     });
-    child.on("close", (exitCode, closeSignal) => {
+    child.on("exit", (exitCode, exitSignal) => {
       if (settled) return;
+      // Resolve on "exit" instead of "close". The "close" event waits until
+      // all stdio streams are closed, but background processes spawned with
+      // nohup/disown inherit the pipe FDs and keep them open indefinitely.
+      // "exit" fires as soon as the sh -c process terminates, regardless of
+      // inherited pipes. Any output written before exit is already in the
+      // kernel pipe buffer and will be read by Node's data handlers.
       settled = true;
       resolve({
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         exitCode,
-        signal: closeSignal,
+        signal: exitSignal,
       });
     });
   });
