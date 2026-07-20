@@ -831,8 +831,15 @@ function runShellCommand(
     const child = spawn("sh", ["-c", command], {
       cwd,
       signal,
+      detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Detach the child process group from this agent's event loop so that
+    // background processes (nohup, disown, &) don't keep the Node process
+    // alive after the main sh -c exits. Combined with "exit" (not "close")
+    // this lets run_command return immediately for scripts that spawn
+    // long-running daemons (e.g. llama-server, mcp-bridges).
+    child.unref();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;
@@ -843,6 +850,18 @@ function runShellCommand(
       if (settled) return;
       settled = true;
       reject(err);
+    });
+    child.on("exit", () => {
+      // The shell exited. Normal commands will close their streams immediately,
+      // firing "close" within milliseconds. For daemons that inherit stdio and
+      // keep pipes open, forcefully destroy the streams after a brief grace
+      // period so "close" fires and the Promise can resolve.
+      setTimeout(() => {
+        if (!settled) {
+          child.stdout.destroy();
+          child.stderr.destroy();
+        }
+      }, 50);
     });
     child.on("close", (exitCode, closeSignal) => {
       if (settled) return;
