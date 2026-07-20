@@ -385,6 +385,39 @@ test("run_command includes stderr and non-zero exit code in the tool result", as
   assert.equal(last.update.rawOutput?.stderr, "bad");
 });
 
+test(
+  "run_command returns promptly when a script spawns a background process (#67)",
+  { timeout: 10_000 },
+  async () => {
+    // Regression test for #67, fixed by PR #66.
+    // A backgrounded process (`&`, `nohup`, `disown`) inherits the stdout/stderr
+    // pipe FDs and holds them open after the shell exits; resolving on "close"
+    // hung forever. The fix detaches the child and force-destroys the streams
+    // shortly after the shell exits. Without the fix this test never resolves
+    // and fails via the test timeout.
+    const conn = createConnectionStub();
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+
+    const start = Date.now();
+    const result = await exec.execute(
+      "tc1",
+      "run_command",
+      // `sleep 3` outlives the shell and keeps the inherited pipes open.
+      JSON.stringify({ command: "sleep 3 & echo spawned; exit 0" })
+    );
+    const elapsed = Date.now() - start;
+
+    assert.match(result.content, /Exit code: 0/);
+    assert.match(result.content, /STDOUT:\nspawned/);
+    // Must return well before the 3s background sleep finishes — proves we did
+    // not block on the inherited pipe FDs.
+    assert.ok(elapsed < 2000, `run_command took ${elapsed}ms; expected < 2000ms`);
+
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "completed");
+  }
+);
+
 test("run_command rejected by user marks call failed and skips execution", async () => {
   const conn = createConnectionStub({ permission: "reject" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
