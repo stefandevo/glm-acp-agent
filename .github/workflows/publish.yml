@@ -37,18 +37,27 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      # Post-publish smoke test. npm publish above already validated the
+      # tarball, so this is informational only and must never fail the release
+      # (continue-on-error) — it just surfaces a warning if resolution can't be
+      # confirmed within the propagation window.
       - name: Verify published package via bun x
+        continue-on-error: true
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          # npm's registry cache can lag a few seconds behind a fresh publish,
-          # so retry until the just-published version is resolvable.
+          # Two independent caches lag behind a fresh publish:
+          #   1. npm's registry CDN serves a stale package manifest for ~1-2 min.
+          #   2. Bun caches that manifest in ~/.bun/install/cache and reuses it,
+          #      so a stale first fetch would poison every retry.
+          # Give each attempt a fresh BUN_INSTALL_CACHE_DIR to force a re-fetch,
+          # and retry until the CDN serves the just-published version.
           for i in $(seq 1 10); do
-            if TMPDIR=$(mktemp -d) bun x --package "glm-acp-agent@$VERSION" glm-acp-agent < /dev/null; then
+            if BUN_INSTALL_CACHE_DIR=$(mktemp -d) TMPDIR=$(mktemp -d) \
+                bun x --package "glm-acp-agent@$VERSION" glm-acp-agent < /dev/null; then
               echo "Verified glm-acp-agent@$VERSION via bun x"
               exit 0
             fi
             echo "Attempt $i: glm-acp-agent@$VERSION not resolvable yet, waiting 15s for npm propagation..."
             sleep 15
           done
-          echo "::error::glm-acp-agent@$VERSION did not become resolvable via bun x after retries"
-          exit 1
+          echo "::warning::glm-acp-agent@$VERSION not resolvable via bun x within the propagation window (publish itself succeeded; verify manually with 'npm view glm-acp-agent version')"

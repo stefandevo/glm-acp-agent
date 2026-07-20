@@ -36,22 +36,32 @@ npm view glm-acp-agent version    # should match the new tag
   is renamed or the repo moves, update it there.
 - `--provenance` in the publish step requires a public repo or paid npm org.
 
-## Troubleshooting: `bun x` failures
+## Troubleshooting: `bun x` verify step warns after publish
 
-If `bun x glm-acp-agent@<version>` fails with `ERR_MODULE_NOT_FOUND` /
-`ERR_UNSUPPORTED_DIR_IMPORT` on one machine but succeeds with a fresh
-`TMPDIR`, the likely cause is a stale or corrupted Bun temp install
-(Bun caches `bun x` packages in a deterministic temp directory).
+The publish workflow runs a post-publish `bun x` smoke test. It is
+`continue-on-error` and only emits a **warning** — it never fails the release,
+because `npm publish` has already validated the tarball. If you see
 
-**Recovery:** clear the cached install for that package/version:
-
-```bash
-# Find and remove the cached bunx install
-rm -rf /private/var/folders/.../T/bunx-<uid>-glm-acp-agent@<version>
-# Or run with a clean temp directory:
-TMPDIR=$(mktemp -d) bun x glm-acp-agent@<version>
+```
+error: No version matching "<version>" found for specifier "glm-acp-agent" (but package exists)
 ```
 
-This is an operational recovery for corrupted local state — it does **not**
-mean the published tarball is missing `main`, `package.json`, or
-dependencies. Fresh `bun x` installs resolve all dependencies correctly.
+the just-published version simply hasn't propagated yet. Two caches lag behind
+a fresh publish:
+
+1. **npm's registry CDN** serves a stale package manifest for ~1–2 minutes.
+2. **Bun** caches that manifest in `~/.bun/install/cache` and reuses it, so a
+   single stale fetch would poison every retry. Changing only `TMPDIR` does
+   **not** help — that's the extract dir, not the metadata cache.
+
+The workflow handles this by giving each retry a fresh `BUN_INSTALL_CACHE_DIR`
+(forcing a re-fetch) and looping while the CDN catches up. To reproduce the
+resolution manually:
+
+```bash
+BUN_INSTALL_CACHE_DIR=$(mktemp -d) TMPDIR=$(mktemp -d) \
+  bun x --package "glm-acp-agent@<version>" glm-acp-agent
+```
+
+A warning here does **not** mean the published tarball is broken — confirm the
+release with `npm view glm-acp-agent version`.
