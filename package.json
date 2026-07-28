@@ -32,7 +32,7 @@
   "bugs": {
     "url": "https://github.com/stefandevo/glm-acp-agent/issues"
   },
-  "author": "",
+  "author": "Stefan de Vogelaere <stefan.de.vogelaere@gmail.com>",
   "license": "Apache-2.0",
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.20.0",
