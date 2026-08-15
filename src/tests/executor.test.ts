@@ -420,6 +420,12 @@ test(
   }
 );
 
+// The helpers run serially inside one test, so the test timeout must exceed
+// attempts × per-helper budget — otherwise a loaded runner can kill the test
+// while every helper is still individually within budget (greptile, PR #85).
+const PROBE_ATTEMPTS = 8;
+const PROBE_HELPER_TIMEOUT_MS = 8_000;
+
 // Runs inside a bare node process whose only pending work is a sequence of
 // run_command calls: with an unref'd child the event loop can drain mid-await
 // on fast commands and the process exits with the promise still unsettled.
@@ -450,7 +456,7 @@ process.stdout.write("SETTLED 15\\n");
 
 test(
   "run_command keeps the event loop alive until the command settles (#82)",
-  { timeout: 10_000 },
+  { timeout: PROBE_ATTEMPTS * PROBE_HELPER_TIMEOUT_MS + 5_000 },
   async () => {
     // Regression test for #82. runShellCommand unref()ed the sh -c child, so a
     // node:test file process with no other pending work could drain its event
@@ -466,21 +472,20 @@ test(
       const helperPath = join(dir, "loop-probe.mjs");
       writeFileSync(helperPath, LOOP_PROBE_HELPER, "utf8");
       const executorModule = fileURLToPath(new URL("../tools/executor.js", import.meta.url));
-      const attempts = 8;
-      for (let attempt = 1; attempt <= attempts; attempt++) {
+      for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
         let stdout = "";
         try {
           stdout = execFileSync(process.execPath, [helperPath, executorModule, dir], {
             encoding: "utf8",
-            timeout: 8_000,
+            timeout: PROBE_HELPER_TIMEOUT_MS,
           });
         } catch (err) {
           assert.fail(
-            `helper ${attempt}/${attempts} exited before the tool calls settled: ` +
+            `helper ${attempt}/${PROBE_ATTEMPTS} exited before the tool calls settled: ` +
               `${(err as Error).message}`
           );
         }
-        assert.match(stdout, /SETTLED 15/, `helper ${attempt}/${attempts} output`);
+        assert.match(stdout, /SETTLED 15/, `helper ${attempt}/${PROBE_ATTEMPTS} output`);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
