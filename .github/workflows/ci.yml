@@ -28,6 +28,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Check registry manifest version sync
+        run: node dist/registry/sync-manifest.js --check
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
