@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor } from "../tools/executor.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
@@ -415,6 +417,74 @@ test(
 
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "completed");
+  }
+);
+
+// Runs inside a bare node process whose only pending work is a sequence of
+// run_command calls: with an unref'd child the event loop can drain mid-await
+// on fast commands and the process exits with the promise still unsettled.
+const LOOP_PROBE_HELPER = `
+import { pathToFileURL } from "node:url";
+const [executorModule, cwd] = process.argv.slice(2);
+const { ToolExecutor } = await import(pathToFileURL(executorModule).href);
+const connection = {
+  async sessionUpdate() {},
+  async requestPermission() {
+    return { outcome: { outcome: "selected", optionId: "allow" } };
+  },
+};
+const exec = new ToolExecutor(connection, "s1", { fs: {} }, undefined, null, null, cwd);
+for (let i = 1; i <= 15; i++) {
+  const result = await exec.execute(
+    "tc" + i,
+    "run_command",
+    JSON.stringify({ command: "echo loop-alive-" + i })
+  );
+  if (!result.content.includes("loop-alive-" + i)) {
+    process.stdout.write("BAD OUTPUT AT " + i + "\\n");
+    process.exit(1);
+  }
+}
+process.stdout.write("SETTLED 15\\n");
+`;
+
+test(
+  "run_command keeps the event loop alive until the command settles (#82)",
+  { timeout: 10_000 },
+  async () => {
+    // Regression test for #82. runShellCommand unref()ed the sh -c child, so a
+    // node:test file process with no other pending work could drain its event
+    // loop while a fast run_command was still in flight. The runner then
+    // cancelled every remaining test in the file with "Promise resolution is
+    // still pending but the event loop has already resolved" — flaky,
+    // load-dependent blocks of 6–30 cancelled subtests per run. The unfixed
+    // race is per command (~40% observed), so several bare helper processes
+    // are probed; each must settle all of its tool calls rather than exit
+    // early. With the child ref'd every process settles deterministically.
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-loop-"));
+    try {
+      const helperPath = join(dir, "loop-probe.mjs");
+      writeFileSync(helperPath, LOOP_PROBE_HELPER, "utf8");
+      const executorModule = fileURLToPath(new URL("../tools/executor.js", import.meta.url));
+      const attempts = 8;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        let stdout = "";
+        try {
+          stdout = execFileSync(process.execPath, [helperPath, executorModule, dir], {
+            encoding: "utf8",
+            timeout: 8_000,
+          });
+        } catch (err) {
+          assert.fail(
+            `helper ${attempt}/${attempts} exited before the tool calls settled: ` +
+              `${(err as Error).message}`
+          );
+        }
+        assert.match(stdout, /SETTLED 15/, `helper ${attempt}/${attempts} output`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 );
 
