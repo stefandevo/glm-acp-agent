@@ -286,8 +286,8 @@ export class GlmAcpAgent implements Agent {
     };
 
     const model = getDefaultModel();
-    // Default to the model's own default effort ("max" for 5.2, "on"
-    // otherwise) so out-of-the-box behaviour matches the pre-thought-level
+    // Default to the model's own default effort ("max" on the 5.3 family,
+    // "on" otherwise) so out-of-the-box behaviour matches the pre-thought-level
     // default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
@@ -330,7 +330,7 @@ export class GlmAcpAgent implements Agent {
       );
     }
     session.model = params.modelId;
-    // The valid thought levels differ per model (e.g. 5.2 offers high/max
+    // The valid thought levels differ per model (e.g. 5.3 offers high/max
     // while others only offer none/on), so clamp the current level to what
     // the new model supports.
     session.thoughtLevel = resolveThoughtLevel(params.modelId, session.thoughtLevel);
@@ -407,7 +407,7 @@ export class GlmAcpAgent implements Agent {
     // Auto-resolve a *known* level that isn't valid for the current model to
     // that model's default. This happens when a client caches a thoughtLevel
     // from a previous session (or model) and re-sends it for a model with a
-    // different level set (e.g. "max" from glm-5.2 sent while on glm-4.7).
+    // different level set (e.g. "max" from glm-5.3 sent while on glm-4.7).
     session.thoughtLevel = resolveThoughtLevel(session.model, params.value);
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);

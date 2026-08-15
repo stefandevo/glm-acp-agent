@@ -1,6 +1,6 @@
 # glm-acp-agent
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.2, GLM-5.1, GLM-4.7, …) as its reasoning core.
+An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.3, GLM-5 Turbo, GLM-4.7) as its reasoning core.
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
@@ -30,7 +30,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
-- **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5v-turbo` sessions send supported image parts directly to the model, while non-native coding models route pasted ACP image blocks through Z.AI Vision MCP (`@z_ai/mcp-server`). Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
+- **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; the advertised coding models route pasted ACP image blocks through Z.AI Vision MCP (`@z_ai/mcp-server`), while `glm-5v-turbo` sessions — opt-in via `ACP_GLM_AVAILABLE_MODELS`, since it is no longer on the Coding Plan allowlist — send supported image parts directly to the model. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Six built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
@@ -139,7 +139,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
-| `ACP_GLM_MODEL` | No | `glm-5.2` | Default GLM model for new sessions |
+| `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
@@ -170,18 +170,17 @@ The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 
 | Model | Notes |
 |-------|-------|
-| `glm-5.2` | **Default.** Newest 1M-context coding model; thinking mode auto-enabled |
-| `glm-5.1` | Long-horizon coding model; thinking mode auto-enabled |
-| `glm-5-turbo` | Faster Coding Plan reasoning model |
-| `glm-5v-turbo` | Multimodal Coding Plan model; native image understanding for jpg / jpeg / png inputs |
+| `glm-5.3` | **Default.** Newest 1M-context coding model; thinking mode always on |
+| `glm-5-turbo` | Faster Coding Plan reasoning model; 128K context |
 | `glm-4.7` | 200K-context reasoning model |
-| `glm-4.5-air` | Lightweight, lower-latency model |
 
-`ACP_GLM_AVAILABLE_MODELS` still lets you advertise custom IDs, but custom IDs sit outside the supported Coding Plan list — the Coding Plan endpoint will reject any model code Z.AI hasn't whitelisted (business code `1211`). If you override the model list, include `glm-5v-turbo` yourself to keep it visible in the picker.
+Only models the Coding Plan endpoint serves **under their own name** are advertised. Several ids that used to be listed are now aliases: a request for `glm-5.2` or `glm-5.1` comes back with `"model": "glm-5.3"`, and `glm-4.5-air` comes back as `glm-4.7`. They still work, but advertising them would report a model you are not actually talking to. `glm-5v-turbo` is no longer on the Coding Plan allowlist — selecting it fails with business code `1311` ("subscription plan does not yet include access").
 
-Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. The multimodal coding model `glm-5v-turbo` is advertised because it is on the Coding Plan and receives supported ACP image blocks directly as native `image_url` content parts. Other advertised models keep using the [Vision MCP](#vision-mcp) path for image analysis.
+`ACP_GLM_AVAILABLE_MODELS` lets you advertise any id you like, including the ones above. Custom ids sit outside the supported Coding Plan list — the endpoint rejects any model code Z.AI hasn't whitelisted (business code `1211`). The native-vision path is unchanged, so if your plan does include `glm-5v-turbo`, add it back with `ACP_GLM_AVAILABLE_MODELS` and image blocks still reach it as native `image_url` content parts.
 
-When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5v-turbo`. Override with `ACP_GLM_THINKING=false` if you want plain completions only.
+Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. Every advertised model uses the [Vision MCP](#vision-mcp) path for image analysis.
+
+When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5v-turbo`. `ACP_GLM_THINKING=false` asks for plain completions instead — but note it has no effect on GLM-5.3, which ignores every attempt to turn thinking off (see [Thought level](#thought-level-reasoning-effort) below).
 
 #### Thought level (reasoning effort)
 
@@ -189,12 +188,16 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 
 | Model | Levels | Mapping to the Z.AI request |
 |-------|--------|-----------------------------|
-| `glm-5.2` | `Off` / `High` / `Max` | `Off` → `thinking: { type: "disabled" }`; `High`/`Max` → `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
+| `glm-5.3` (and `glm-5.2`, which routes to it) | `High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
 | other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
 
-`reasoning_effort` is a GLM-5.2 extra — other models never receive it. New sessions default to the model's own default effort (`Max` on GLM-5.2, which is also Z.AI's default when the field is omitted), so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (e.g. a `High` selection reverts to `On` when you move off GLM-5.2) and pushes a `config_option_update`. The `ACP_GLM_THINKING` env override still wins: `false` forces thinking off regardless of the selected level. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+**GLM-5.3 has no `Off` level, because thinking cannot be turned off on it.** The endpoint accepts both `thinking: { type: "disabled" }` and `reasoning_effort: "none"` without error, but keeps emitting reasoning either way — so `ACP_GLM_THINKING=false` is a no-op on GLM-5.3. Use `glm-4.7` if you need non-reasoning completions.
 
-`ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, users can pick `glm-5v-turbo` for text work but clients should not offer image attachments.
+`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (a `High` selection reverts to `On` when you move to GLM-4.7, and an `Off` selection becomes `Max` when you move to GLM-5.3) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+
+The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max`; the agent currently exposes only `high` and `max` as thought levels.
+
+`ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 
 ### Vision MCP
 
@@ -326,7 +329,7 @@ If `Z_AI_API_KEY` is set in the environment **and** a credentials file exists, t
 2. Open the **agent panel** (use the command palette: `agent panel: toggle focus`).
 3. In the agent picker, select **glm** — Zed labels external agents by their `agent_servers` key.
 4. Start a new thread and send a small prompt that exercises a tool, e.g. `Read package.json and tell me the project name.`
-5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.2`) reasoning surfaced as a separate thought block.
+5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.3`) reasoning surfaced as a separate thought block.
 
 #### 5. Iterating on the agent
 

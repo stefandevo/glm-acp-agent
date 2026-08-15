@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir as osTmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import {
   GlmClient,
   getAvailableModels,
@@ -166,11 +169,20 @@ test("streamChat captures usage from the trailing usage chunk", async () => {
 
 test("constructor throws if Z_AI_API_KEY is missing", () => {
   const old = process.env["Z_AI_API_KEY"];
+  const oldXdg = process.env["XDG_CONFIG_HOME"];
   delete process.env["Z_AI_API_KEY"];
+  // resolveApiKey() also reads $XDG_CONFIG_HOME/glm-acp-agent/credentials.json,
+  // so point it at an empty dir — otherwise this fails on any machine where the
+  // developer has actually run `--setup`.
+  const emptyConfig = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-noconfig-"));
+  process.env["XDG_CONFIG_HOME"] = emptyConfig;
   try {
     assert.throws(() => new GlmClient(), /Z_AI_API_KEY/);
   } finally {
     if (old !== undefined) process.env["Z_AI_API_KEY"] = old;
+    if (oldXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = oldXdg;
+    rmSync(emptyConfig, { recursive: true, force: true });
   }
 });
 
@@ -179,34 +191,46 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, [
-      "glm-5.2",
-      "glm-5.1",
-      "glm-5-turbo",
-      "glm-5v-turbo",
-      "glm-4.7",
-      "glm-4.5-air",
-    ]);
+    assert.deepEqual(ids, ["glm-5.3", "glm-5-turbo", "glm-4.7"]);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
+    // Aliases: the Coding Plan endpoint answers these with a different model
+    // (5.2/5.1 → glm-5.3, 4.5-air → glm-4.7), so advertising them would report
+    // a model the user is not actually talking to.
+    assert.ok(!ids.includes("glm-5.2"), "glm-5.2 is an alias for glm-5.3");
+    assert.ok(!ids.includes("glm-5.1"), "glm-5.1 is an alias for glm-5.3");
+    assert.ok(!ids.includes("glm-4.5-air"), "glm-4.5-air is an alias for glm-4.7");
+    // Not on the Coding Plan allowlist — selecting it fails with code 1311.
+    assert.ok(!ids.includes("glm-5v-turbo"), "glm-5v-turbo is not Coding Plan accessible");
   } finally {
     if (old !== undefined) process.env["ACP_GLM_AVAILABLE_MODELS"] = old;
   }
 });
 
-test("getDefaultModel returns glm-5.2 without an env override", () => {
+test("getDefaultModel returns glm-5.3 without an env override", () => {
   const old = process.env["ACP_GLM_MODEL"];
   delete process.env["ACP_GLM_MODEL"];
   try {
-    assert.equal(getDefaultModel(), "glm-5.2");
+    assert.equal(getDefaultModel(), "glm-5.3");
   } finally {
     if (old !== undefined) process.env["ACP_GLM_MODEL"] = old;
   }
 });
 
+test("getContextWindow reports the 1M window for glm-5.3", () => {
+  assert.equal(getContextWindow("glm-5.3"), 1_000_000);
+});
+
 test("getContextWindow reports the 1M window for glm-5.2", () => {
   assert.equal(getContextWindow("glm-5.2"), 1_000_000);
+});
+
+test("getContextWindow reports the routed window for de-listed aliases", () => {
+  // glm-5.1 is served by glm-5.3 (1M) and glm-4.5-air by glm-4.7 (200K).
+  // Reporting the old standalone windows would compact these sessions early.
+  assert.equal(getContextWindow("glm-5.1"), 1_000_000);
+  assert.equal(getContextWindow("glm-4.5-air"), 200_000);
 });
 
 test("ACP_GLM_AVAILABLE_MODELS env override still wins over the built-in list", () => {
@@ -238,6 +262,22 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
 });
 
+test("streamChat sends reasoning_effort when level is set on glm-5.3", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3", reasoningEffort: "max" })) {
+    void chunk;
+  }
+
+  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+  assert.equal(requestBody?.["reasoning_effort"], "max");
+});
+
 test("streamChat sends reasoning_effort when level is set on glm-5.2", async () => {
   const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;
@@ -254,7 +294,7 @@ test("streamChat sends reasoning_effort when level is set on glm-5.2", async () 
   assert.equal(requestBody?.["reasoning_effort"], "high");
 });
 
-test("streamChat does not send reasoning_effort for non-5.2 models", async () => {
+test("streamChat does not send reasoning_effort for models that ignore it", async () => {
   const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;
   const c = makeClientWithCreate((body) => {
@@ -262,7 +302,7 @@ test("streamChat does not send reasoning_effort for non-5.2 models", async () =>
     return Promise.resolve(stream);
   });
 
-  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.1", reasoningEffort: "high" })) {
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-4.7", reasoningEffort: "high" })) {
     void chunk;
   }
 
@@ -278,7 +318,7 @@ test("streamChat disables thinking when effort is none", async () => {
     return Promise.resolve(stream);
   });
 
-  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2", reasoningEffort: "none" })) {
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-4.7", reasoningEffort: "none" })) {
     void chunk;
   }
 
@@ -286,23 +326,34 @@ test("streamChat disables thinking when effort is none", async () => {
   assert.equal(requestBody?.["reasoning_effort"], undefined);
 });
 
-test("getThoughtLevels returns none/high/max for glm-5.2", () => {
-  assert.deepEqual(getThoughtLevels("glm-5.2"), ["none", "high", "max"]);
+test("getThoughtLevels omits none for reasoning-effort models", () => {
+  // Thinking cannot be turned off on glm-5.3: the endpoint accepts
+  // `thinking: { type: "disabled" }` and `reasoning_effort: "none"` but keeps
+  // emitting reasoning either way, so offering an "Off" option would lie.
+  assert.deepEqual(getThoughtLevels("glm-5.3"), ["high", "max"]);
+  // glm-5.2 is served by glm-5.3, so it behaves identically.
+  assert.deepEqual(getThoughtLevels("glm-5.2"), ["high", "max"]);
 });
 
-test("getThoughtLevels returns none/on for non-5.2 models", () => {
-  assert.deepEqual(getThoughtLevels("glm-5.1"), ["none", "on"]);
+test("getThoughtLevels returns none/on for models without reasoning_effort", () => {
   assert.deepEqual(getThoughtLevels("glm-4.7"), ["none", "on"]);
   assert.deepEqual(getThoughtLevels("glm-5-turbo"), ["none", "on"]);
 });
 
 test("resolveThoughtLevel clamps invalid levels to the model default", () => {
-  // "high"/"max" are 5.2-only; other models fall back to "on".
-  assert.equal(resolveThoughtLevel("glm-5.1", "max"), "on");
+  // "high"/"max" only apply to the reasoning-effort models; others get "on".
+  assert.equal(resolveThoughtLevel("glm-4.7", "max"), "on");
   assert.equal(resolveThoughtLevel("glm-4.7", "high"), "on");
   // Valid levels are preserved.
-  assert.equal(resolveThoughtLevel("glm-5.2", "high"), "high");
-  assert.equal(resolveThoughtLevel("glm-5.1", "none"), "none");
+  assert.equal(resolveThoughtLevel("glm-5.3", "high"), "high");
+  assert.equal(resolveThoughtLevel("glm-4.7", "none"), "none");
+});
+
+test("resolveThoughtLevel clamps a persisted none up to max on glm-5.3", () => {
+  // A session saved on a model where "Off" was valid must still load cleanly
+  // when switched to glm-5.3, which has no "none" level.
+  assert.equal(resolveThoughtLevel("glm-5.3", "none"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.3", "on"), "max");
 });
 
 test("buildThinkingParams omits fields for non-thinking models", () => {
@@ -320,6 +371,35 @@ test("buildThinkingParams defaults to enabled with no effort", () => {
   delete process.env["ACP_GLM_THINKING"];
   try {
     assert.deepEqual(buildThinkingParams("glm-5.2"), { thinking: { type: "enabled" } });
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams treats glm-5.3 as a thinking model", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    // Proves modelSupportsThinking() matches glm-5.3 — no reasoning_effort is
+    // attached without an explicit level, so the model default applies.
+    assert.deepEqual(buildThinkingParams("glm-5.3"), { thinking: { type: "enabled" } });
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams attaches reasoning_effort on glm-5.3", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    assert.deepEqual(buildThinkingParams("glm-5.3", "high"), {
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+    });
+    assert.deepEqual(buildThinkingParams("glm-5.3", "max"), {
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
+    });
   } finally {
     if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
   }
