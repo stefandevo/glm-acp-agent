@@ -15,64 +15,42 @@ interface AgentManifest {
   distribution?: { npx?: { package?: unknown } };
 }
 
-const escapeRegExp = (value: string) =>
-  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const VERSION_FIELD = /^(\s*"version"\s*:\s*")[^"]*(")/;
-
 /**
  * Rewrite an agent.json manifest so both version pins match the package.
  *
- * The edit is surgical — only the `"version"` field and the
- * `distribution.npx.package` pin change, so hand formatting (inline arrays,
- * field order) survives and release diffs stay reviewable. Anything
- * unexpected (unparseable JSON, missing fields, a pin that no longer targets
- * this package) throws instead of shipping a half-synced manifest.
+ * The pins are updated through the parsed object — `version` and
+ * `distribution.npx.package` by path — so a nested `"version"` field or a
+ * sibling distribution pin elsewhere in the manifest can neither be mistaken
+ * for the real pins nor silently clobbered. Anything unexpected —
+ * unparseable JSON, a missing field, or a pin no longer targeting this
+ * package — throws instead of shipping a half-synced manifest.
+ *
+ * Output uses normalized `JSON.stringify` formatting: an unnormalized input
+ * is rewritten once, and every later sync is byte-stable.
  */
 export function syncManifestContent(
   content: string,
   pkg: PackageIdentity
 ): string {
-  parseManifest(content);
-
-  const pin = new RegExp(
-    `^(\\s*"package"\\s*:\\s*")${escapeRegExp(pkg.name)}@[^"]*(")`
-  );
-  let versionRewritten = false;
-  let pinRewritten = false;
-  const rewritten = content
-    .split("\n")
-    .map((line) => {
-      if (!versionRewritten && VERSION_FIELD.test(line)) {
-        versionRewritten = true;
-        return line.replace(VERSION_FIELD, `$1${pkg.version}$2`);
-      }
-      if (!pinRewritten && pin.test(line)) {
-        pinRewritten = true;
-        return line.replace(pin, `$1${pkg.name}@${pkg.version}$2`);
-      }
-      return line;
-    })
-    .join("\n");
-
-  // Belt over the line matching above: verify the result semantically.
-  const updated = parseManifest(rewritten);
-  if (updated.version !== pkg.version || !versionRewritten) {
+  const manifest = parseManifest(content);
+  if (typeof manifest.version !== "string") {
     throw new Error(
-      `"version" field not found (or not rewritable) in ${MANIFEST_PATH} — ` +
-        `expected it to become ${pkg.version}`
+      `"version" field not found (or not a string) in ${MANIFEST_PATH}`
     );
   }
+  const npx = manifest.distribution?.npx;
   if (
-    updated.distribution?.npx?.package !== `${pkg.name}@${pkg.version}` ||
-    !pinRewritten
+    !npx ||
+    typeof npx.package !== "string" ||
+    !npx.package.startsWith(`${pkg.name}@`)
   ) {
     throw new Error(
-      `distribution.npx.package pin not found (or not targeting ${pkg.name}) ` +
-        `in ${MANIFEST_PATH} — expected it to become ${pkg.name}@${pkg.version}`
+      `distribution.npx.package pin not found (or not targeting ${pkg.name}) in ${MANIFEST_PATH}`
     );
   }
-  return rewritten;
+  manifest.version = pkg.version;
+  npx.package = `${pkg.name}@${pkg.version}`;
+  return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
 function parseManifest(content: string): AgentManifest {
@@ -86,10 +64,14 @@ function parseManifest(content: string): AgentManifest {
   }
 }
 
+const describeValue = (value: unknown) =>
+  typeof value === "string" ? value : "(missing)";
+
 /**
  * CLI entry. Default mode rewrites the manifest and `git add`s it so the
  * `version` lifecycle hook can fold it into the `npm version` release commit;
- * `--check` only verifies (used by CI) and never writes.
+ * `--check` only verifies (used by CI) and never writes. Both modes compare
+ * pin values, not file formatting.
  */
 function main(argv: string[]): number {
   const check = argv.includes("--check");
@@ -97,20 +79,22 @@ function main(argv: string[]): number {
     readFileSync("package.json", "utf8")
   ) as PackageIdentity;
   const content = readFileSync(MANIFEST_PATH, "utf8");
-  const updated = syncManifestContent(content, pkg);
 
-  if (updated === content) {
-    if (!check) {
-      console.log(`${MANIFEST_PATH} already at ${pkg.version} — nothing to do`);
-    }
-    return 0;
-  }
   if (check) {
-    const manifest = JSON.parse(content) as AgentManifest;
+    const manifest = parseManifest(content);
+    const pin = manifest.distribution?.npx?.package;
+    if (
+      manifest.version === pkg.version &&
+      pin === `${pkg.name}@${pkg.version}`
+    ) {
+      return 0;
+    }
     console.error(`${MANIFEST_PATH} is out of sync with package.json:`);
-    console.error(`  version:        ${String(manifest.version)} (expected ${pkg.version})`);
     console.error(
-      `  npx package:    ${String(manifest.distribution?.npx?.package)} (expected ${pkg.name}@${pkg.version})`
+      `  version:        ${describeValue(manifest.version)} (expected ${pkg.version})`
+    );
+    console.error(
+      `  npx package:    ${describeValue(pin)} (expected ${pkg.name}@${pkg.version})`
     );
     console.error(
       `Fix: run \`npm run build && node dist/registry/sync-manifest.js\` and commit the result.`
@@ -118,6 +102,11 @@ function main(argv: string[]): number {
     return 1;
   }
 
+  const updated = syncManifestContent(content, pkg);
+  if (updated === content) {
+    console.log(`${MANIFEST_PATH} already at ${pkg.version} — nothing to do`);
+    return 0;
+  }
   writeFileSync(MANIFEST_PATH, updated);
   console.log(`${MANIFEST_PATH} synced to ${pkg.version}`);
   const staged = spawnSync("git", ["add", MANIFEST_PATH]);

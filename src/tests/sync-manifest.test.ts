@@ -47,15 +47,59 @@ test("syncManifestContent: rewrites the npx distribution pin", () => {
   assert.match(result, /"package": "glm-acp-agent@1\.4\.1"/);
 });
 
-test("syncManifestContent: preserves unrelated formatting (inline arrays, field order)", () => {
+test("syncManifestContent: preserves field order and unrelated values, normalizing formatting", () => {
   const result = syncManifestContent(MANIFEST, PACKAGE);
-  // The surgical rewrite must not reformat the whole file — only the two
-  // version occurrences may change.
-  assert.equal(
-    result,
-    MANIFEST.replaceAll("1.3.0", "1.4.1"),
-    "everything except the two version pins should be byte-identical"
+  const parsed = JSON.parse(result) as Record<string, unknown>;
+  // JSON.stringify keeps parse insertion order, so after the one-time
+  // normalization the field layout is stable and diffs stay reviewable.
+  assert.deepEqual(Object.keys(parsed), [
+    "id",
+    "name",
+    "version",
+    "description",
+    "repository",
+    "authors",
+    "license",
+    "icon",
+    "distribution",
+  ]);
+  assert.deepEqual(parsed.authors, ["Stefan de Vogelaere"]);
+  assert.equal(parsed.description, "ACP agent powered by Zhipu AI's GLM Coding Plan models.");
+  assert.equal(result, `${JSON.stringify(parsed, null, 2)}\n`);
+});
+
+test("syncManifestContent: leaves a nested version field alone even when the top-level pin is already current", () => {
+  // Regression (PR #83 review): a line-based rewrite hit the FIRST "version"
+  // line, so with the top-level field already current it silently rewrote
+  // unrelated nested metadata while validation still passed.
+  const nested = MANIFEST.replace(
+    /^ {2}"id": "glm-acp-agent",\n/m,
+    `  "metadata": { "version": "9.9.9" },\n  "id": "glm-acp-agent",\n`
+  ).replace(/^ {2}"version": "1\.3\.0",\n/m, `  "version": "1.4.1",\n`);
+  const parsed = JSON.parse(syncManifestContent(nested, PACKAGE)) as {
+    version: string;
+    metadata: { version: string };
+    distribution: { npx: { package: string } };
+  };
+  assert.equal(parsed.metadata.version, "9.9.9");
+  assert.equal(parsed.version, "1.4.1");
+  assert.equal(parsed.distribution.npx.package, "glm-acp-agent@1.4.1");
+});
+
+test("syncManifestContent: updates the npx pin without touching a sibling distribution's pin", () => {
+  // Regression (PR #83 review): a line-based rewrite hit the FIRST "package"
+  // line, so a sibling distribution carrying the same pin made the sync throw
+  // on an otherwise valid manifest and blocked CI / `npm version`.
+  const sibling = MANIFEST.replace(
+    /^ {4}"npx": \{\n/m,
+    `    "pip": {\n      "package": "glm-acp-agent@1.3.0"\n    },\n    "npx": {\n`
   );
+  const parsed = JSON.parse(syncManifestContent(sibling, PACKAGE)) as {
+    distribution: { pip: { package: string }; npx: { package: string } };
+  };
+  assert.equal(parsed.distribution.npx.package, "glm-acp-agent@1.4.1");
+  // Only the npx distribution is managed by this script.
+  assert.equal(parsed.distribution.pip.package, "glm-acp-agent@1.3.0");
 });
 
 test("syncManifestContent: is idempotent when already in sync", () => {
