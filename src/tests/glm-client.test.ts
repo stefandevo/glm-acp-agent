@@ -270,12 +270,16 @@ test("streamChat sends reasoning_effort when level is set on glm-5.3", async () 
     return Promise.resolve(stream);
   });
 
-  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3", reasoningEffort: "max" })) {
-    void chunk;
-  }
+  // Spot-check across the ladder: endpoints, a middle level, and the one
+  // non-capitalized id ("xhigh") that would break on naive name mangling.
+  for (const effort of ["max", "medium", "minimal", "xhigh"] as const) {
+    for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3", reasoningEffort: effort })) {
+      void chunk;
+    }
 
-  assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
-  assert.equal(requestBody?.["reasoning_effort"], "max");
+    assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+    assert.equal(requestBody?.["reasoning_effort"], effort);
+  }
 });
 
 test("streamChat sends reasoning_effort on the de-listed aliases routed to 5.3", async () => {
@@ -347,11 +351,13 @@ test("getThoughtLevels omits none for reasoning-effort models", () => {
   // Thinking cannot be turned off on glm-5.3: the endpoint accepts
   // `thinking: { type: "disabled" }` and `reasoning_effort: "none"` but keeps
   // emitting reasoning either way, so offering an "Off" option would lie.
-  assert.deepEqual(getThoughtLevels("glm-5.3"), ["high", "max"]);
+  // Everything else on the validated ladder is exposed, in ladder order.
+  const ladder = ["minimal", "low", "medium", "high", "xhigh", "max"];
+  assert.deepEqual(getThoughtLevels("glm-5.3"), ladder);
   // glm-5.2 and glm-5.1 are both served by glm-5.3, so they behave identically
   // — including the fact that "Off" would not actually turn thinking off.
-  assert.deepEqual(getThoughtLevels("glm-5.2"), ["high", "max"]);
-  assert.deepEqual(getThoughtLevels("glm-5.1"), ["high", "max"]);
+  assert.deepEqual(getThoughtLevels("glm-5.2"), ladder);
+  assert.deepEqual(getThoughtLevels("glm-5.1"), ladder);
 });
 
 test("getThoughtLevels returns none/on for models without reasoning_effort", () => {
@@ -360,11 +366,15 @@ test("getThoughtLevels returns none/on for models without reasoning_effort", () 
 });
 
 test("resolveThoughtLevel clamps invalid levels to the model default", () => {
-  // "high"/"max" only apply to the reasoning-effort models; others get "on".
+  // Effort-ladder levels only apply to the reasoning-effort models; others
+  // get "on".
   assert.equal(resolveThoughtLevel("glm-4.7", "max"), "on");
   assert.equal(resolveThoughtLevel("glm-4.7", "high"), "on");
-  // Valid levels are preserved.
+  assert.equal(resolveThoughtLevel("glm-4.7", "xhigh"), "on");
+  // Valid levels are preserved, across the whole ladder.
   assert.equal(resolveThoughtLevel("glm-5.3", "high"), "high");
+  assert.equal(resolveThoughtLevel("glm-5.3", "minimal"), "minimal");
+  assert.equal(resolveThoughtLevel("glm-5.3", "xhigh"), "xhigh");
   assert.equal(resolveThoughtLevel("glm-4.7", "none"), "none");
 });
 
@@ -411,13 +421,16 @@ test("buildThinkingParams attaches reasoning_effort on glm-5.3", () => {
   const old = process.env["ACP_GLM_THINKING"];
   delete process.env["ACP_GLM_THINKING"];
   try {
-    assert.deepEqual(buildThinkingParams("glm-5.3", "high"), {
+    // Every level on the exposed ladder maps to its own reasoning_effort.
+    for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+      assert.deepEqual(buildThinkingParams("glm-5.3", level), {
+        thinking: { type: "enabled" },
+        reasoning_effort: level,
+      });
+    }
+    // "on" carries no effort, so it stays a plain thinking toggle.
+    assert.deepEqual(buildThinkingParams("glm-5.3", "on"), {
       thinking: { type: "enabled" },
-      reasoning_effort: "high",
-    });
-    assert.deepEqual(buildThinkingParams("glm-5.3", "max"), {
-      thinking: { type: "enabled" },
-      reasoning_effort: "max",
     });
   } finally {
     if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;

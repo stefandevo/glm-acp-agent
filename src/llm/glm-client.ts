@@ -11,20 +11,37 @@ import { debug, error } from "./logger.js";
  * request parameters (see {@link buildThinkingParams}).
  *
  * GLM-5.3 (and GLM-5.2, which the Coding Plan endpoint serves with 5.3)
- * supports `high` and `max`. Other thinking-capable models (5-turbo, 4.7, …)
- * only distinguish thinking on vs. off, so they use `none` and `on`.
+ * supports the full effort ladder: `minimal | low | medium | high | xhigh |
+ * max`. Other thinking-capable models (5-turbo, 4.7, …) only distinguish
+ * thinking on vs. off, so they use `none` and `on`.
  */
-export type ThoughtLevel = "none" | "on" | "high" | "max";
+export type ThoughtLevel =
+  | "none"
+  | "on"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 
 /**
- * Levels shown for the models that honour `reasoning_effort`.
+ * Levels shown for the models that honour `reasoning_effort` — the endpoint's
+ * full validated ladder minus `none`.
  *
  * Deliberately has no `none`: probing the Coding Plan endpoint on 2026-08-15
  * showed GLM-5.3 keeps emitting `reasoning_content` whether you send
  * `thinking: { type: "disabled" }` or `reasoning_effort: "none"`, so an "Off"
  * option would advertise something the model does not do.
  */
-const LEVELS_REASONING_EFFORT: ThoughtLevel[] = ["high", "max"];
+const LEVELS_REASONING_EFFORT: ThoughtLevel[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
 
 /** Levels shown for every other thinking-capable model. */
 const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
@@ -45,7 +62,11 @@ function isReasoningEffortModel(model: string): boolean {
 }
 
 /** The complete set of thought levels the agent understands. */
-const ALL_THOUGHT_LEVELS: readonly ThoughtLevel[] = ["none", "on", "high", "max"];
+const ALL_THOUGHT_LEVELS: readonly ThoughtLevel[] = [
+  "none",
+  "on",
+  ...LEVELS_REASONING_EFFORT,
+];
 
 /** Type guard: whether an arbitrary string is a known ThoughtLevel. */
 export function isThoughtLevel(value: string): value is ThoughtLevel {
@@ -432,8 +453,8 @@ function thinkingOverride(): boolean | undefined {
  * {@link ThoughtLevel} values map as follows:
  * - `none` → thinking disabled
  * - `on`   → thinking enabled (no reasoning_effort)
- * - `high` → thinking enabled + reasoning_effort=high (5.3 family only)
- * - `max`  → thinking enabled + reasoning_effort=max (5.3 family only)
+ * - `minimal` … `max` → thinking enabled + reasoning_effort=<level>
+ *   (5.3 family only)
  *
  * Caveat: GLM-5.3 ignores every attempt to turn thinking off — it keeps
  * emitting `reasoning_content` for `thinking: { type: "disabled" }` and for
@@ -476,7 +497,7 @@ export function buildThinkingParams(
   // and glm-4.7 accept it without validating it and answer identically either
   // way. The remaining levels ("on", and "none" when thinking is force-enabled
   // via the env override) carry no valid effort, so we omit the field.
-  if ((effort === "high" || effort === "max") && isReasoningEffortModel(model)) {
+  if (effort !== undefined && LEVELS_REASONING_EFFORT.includes(effort) && isReasoningEffortModel(model)) {
     params["reasoning_effort"] = effort;
   }
 

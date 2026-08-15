@@ -188,14 +188,14 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 
 | Model | Levels | Mapping to the Z.AI request |
 |-------|--------|-----------------------------|
-| `glm-5.3` (and `glm-5.2` / `glm-5.1`, which route to it) | `High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
+| `glm-5.3` (and `glm-5.2` / `glm-5.1`, which route to it) | `Minimal` / `Low` / `Medium` / `High` / `X-High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort` set to the matching value |
 | other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
 
 **GLM-5.3 has no `Off` level, because thinking cannot be turned off on it.** The endpoint accepts both `thinking: { type: "disabled" }` and `reasoning_effort: "none"` without error, but keeps emitting reasoning either way — so `ACP_GLM_THINKING=false` is a no-op on GLM-5.3. Use `glm-4.7` if you need non-reasoning completions.
 
-`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (a `High` selection reverts to `On` when you move to GLM-4.7, and an `Off` selection becomes `Max` when you move to GLM-5.3) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (an effort-ladder selection reverts to `On` when you move to GLM-4.7, and an `Off` selection becomes `Max` when you move to GLM-5.3) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
 
-The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max`; the agent currently exposes only `high` and `max` as thought levels.
+The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max`; the agent exposes every one of those values as a thought level except `none`, which GLM-5.3 ignores (see above).
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 
