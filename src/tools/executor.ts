@@ -831,15 +831,17 @@ function runShellCommand(
     const child = spawn("sh", ["-c", command], {
       cwd,
       signal,
+      // Run the shell in its own process group so that background processes
+      // (nohup, disown, &) survive after the main sh -c exits and don't
+      // receive signals aimed at this agent. The child must stay ref'd: while
+      // the tool call is in flight it is real pending work, and an unref'd
+      // child let the event loop drain mid-await whenever nothing else was
+      // pending (#82). Combined with the post-"exit" stream destroy below,
+      // daemons that inherit the pipes still can't keep this process alive
+      // after the shell exits.
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    // Detach the child process group from this agent's event loop so that
-    // background processes (nohup, disown, &) don't keep the Node process
-    // alive after the main sh -c exits. Combined with "exit" (not "close")
-    // this lets run_command return immediately for scripts that spawn
-    // long-running daemons (e.g. llama-server, mcp-bridges).
-    child.unref();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;
