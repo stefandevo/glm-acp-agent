@@ -188,7 +188,7 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 
 | Model | Levels | Mapping to the Z.AI request |
 |-------|--------|-----------------------------|
-| `glm-5.3` (and `glm-5.2`, which routes to it) | `High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
+| `glm-5.3` (and `glm-5.2` / `glm-5.1`, which route to it) | `High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` / `"max"` |
 | other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
 
 **GLM-5.3 has no `Off` level, because thinking cannot be turned off on it.** The endpoint accepts both `thinking: { type: "disabled" }` and `reasoning_effort: "none"` without error, but keeps emitting reasoning either way — so `ACP_GLM_THINKING=false` is a no-op on GLM-5.3. Use `glm-4.7` if you need non-reasoning completions.

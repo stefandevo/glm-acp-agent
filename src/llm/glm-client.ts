@@ -33,14 +33,15 @@ const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
  * Whether a model id is one the Coding Plan endpoint serves with GLM-5.3 —
  * the models that validate and honour `reasoning_effort` (case-insensitive).
  *
- * `glm-5.2` is included because the endpoint routes it to 5.3 (confirmed by
- * probe: a `glm-5.2` request comes back with `"model": "glm-5.3"`). `glm-5.1`
- * routes there too but is no longer advertised, so it keeps the conservative
- * on/off treatment.
+ * `glm-5.2` and `glm-5.1` are included because the endpoint routes both to 5.3
+ * (confirmed by probe: either request comes back with `"model": "glm-5.3"`).
+ * They are no longer advertised, but a user can still reach them through
+ * `ACP_GLM_AVAILABLE_MODELS` or a persisted session — and when they do, the
+ * levels must describe the model that actually answers.
  */
 function isReasoningEffortModel(model: string): boolean {
   const id = model.toLowerCase();
-  return id.startsWith("glm-5.3") || id.startsWith("glm-5.2");
+  return id.startsWith("glm-5.3") || id.startsWith("glm-5.2") || id.startsWith("glm-5.1");
 }
 
 /** The complete set of thought levels the agent understands. */
