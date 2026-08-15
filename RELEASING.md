@@ -9,20 +9,20 @@ no `NPM_TOKEN` secret is required.
 
 ### 1. Sync the local registry manifest (if needed)
 
-If the npm version is about to change, update the pinned version in
-`registry/glm-acp-agent/agent.json` — both `version` and
-`distribution.npx.package` must match the version you're about to publish:
+The pinned versions in `registry/glm-acp-agent/agent.json` stay in sync
+automatically: the `version` npm lifecycle script
+([`src/registry/sync-manifest.ts`](./src/registry/sync-manifest.ts)) rewrites
+both `version` and `distribution.npx.package` to match `package.json` and
+stages the file, so `npm version` (step 2) folds the manifest bump into the
+release commit. CI enforces the invariant — a `--check` step in
+[`ci.yml`](./.github/workflows/ci.yml) and
+[`publish.yml`](./.github/workflows/publish.yml) fails the build if the two
+ever drift apart.
 
-```bash
-# In your editor, update both occurrences of the old version:
-#   "version": "<old>"       →  "version": "<new>"
-#   "package": "glm-acp-agent@<old>"  →  "package": "glm-acp-agent@<new>"
-```
-
-Also update the `description` field if the model catalog, feature set, or
-capabilities have changed since the last registry update.
-
-Open a PR for this change and merge it to `main` before proceeding.
+Manual work is only needed when other fields in `agent.json` change — the
+`description` (model catalog, feature set, capabilities), `icon`, or
+distribution metadata. Open a PR for those and merge it to `main` before
+proceeding.
 
 > **Note:** After the initial registry submission is merged upstream, version
 > bumps are automatic — the registry runs an hourly cron that picks up the latest
@@ -39,9 +39,11 @@ npm version minor -m "chore(release): %s"   # or: patch / major / X.Y.Z
 git push --follow-tags
 ```
 
-`npm version` does three things atomically:
+`npm version` does four things atomically:
 - bumps `"version"` in `package.json` (and writes `package-lock.json`),
-- creates a `chore(release): vX.Y.Z` commit, and
+- runs the `version` lifecycle script, which syncs
+  `registry/glm-acp-agent/agent.json` to the new version and stages it,
+- creates a `chore(release): vX.Y.Z` commit that includes the manifest, and
 - tags it `vX.Y.Z`.
 
 After pushing, the tag and commit arrive on GitHub.
@@ -63,6 +65,9 @@ Watch the **Actions** tab. When `Publish to npm` goes green:
 npm view glm-acp-agent version    # should match the new tag
 ```
 
+`registry/glm-acp-agent/agent.json` should already show the same version — it
+rode along in the release commit (see step 2).
+
 The workflow also runs a post-publish `bun x` smoke test; see the
 [Troubleshooting](#troubleshooting-bun-x-verify-step-warns-after-publish)
 section below if it emits a warning.
@@ -71,6 +76,9 @@ section below if it emits a warning.
 
 - `package.json` version and the git tag must agree. `npm version` keeps them
   in sync; don't tag manually.
+- `package.json`, the git tag, and the registry manifest must all agree. The
+  first two are handled by `npm version`; the manifest is synced by the
+  `version` lifecycle script and guarded by the CI `--check` step.
 - Trusted Publisher is configured at
   https://www.npmjs.com/package/glm-acp-agent/access — if the workflow file
   is renamed or the repo moves, update it there.
