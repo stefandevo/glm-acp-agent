@@ -1008,11 +1008,13 @@ test("thoughtLevel round-trips through fork via persistence", async () => {
     const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
     const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-    await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "high" });
+    // "medium" is a new-ladder value: proves it survives persist → fork →
+    // resolveThoughtLevel, not just the pre-existing high/max levels.
+    await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" });
 
     const forked = await agent.unstable_forkSession({ sessionId, cwd: "/tmp", mcpServers: [] });
     const tl = forked.configOptions!.find((o) => o.id === "thought_level");
-    assert.equal(tl!.currentValue, "high");
+    assert.equal(tl!.currentValue, "medium");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
