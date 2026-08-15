@@ -178,7 +178,7 @@ Only models the Coding Plan endpoint serves **under their own name** are adverti
 
 `ACP_GLM_AVAILABLE_MODELS` lets you advertise any id you like, including the ones above. Custom ids sit outside the supported Coding Plan list — the endpoint rejects any model code Z.AI hasn't whitelisted (business code `1211`). The native-vision path is unchanged, so if your plan does include `glm-5v-turbo`, add it back with `ACP_GLM_AVAILABLE_MODELS` and image blocks still reach it as native `image_url` content parts.
 
-Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. Every advertised model uses the [Vision MCP](#vision-mcp) path for image analysis.
+Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. Every built-in advertised model uses the [Vision MCP](#vision-mcp) path for image analysis; `glm-5v-turbo`, when re-added via the override above, is the one exception and keeps native `image_url` handling.
 
 When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5v-turbo`. `ACP_GLM_THINKING=false` asks for plain completions instead — but note it has no effect on GLM-5.3, which ignores every attempt to turn thinking off (see [Thought level](#thought-level-reasoning-effort) below).
 
