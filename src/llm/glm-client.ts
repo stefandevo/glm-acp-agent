@@ -10,21 +10,37 @@ import { debug, error } from "./logger.js";
  * SessionConfigOption. These map onto Z.AI's `thinking` / `reasoning_effort`
  * request parameters (see {@link buildThinkingParams}).
  *
- * GLM-5.2 supports three levels: `none`, `high`, `max`. Other thinking-capable
- * models (GLM-5.1, 5-turbo, 4.7, …) only distinguish thinking on vs. off, so
- * they use `none` and `on`.
+ * GLM-5.3 (and GLM-5.2, which the Coding Plan endpoint serves with 5.3)
+ * supports `high` and `max`. Other thinking-capable models (5-turbo, 4.7, …)
+ * only distinguish thinking on vs. off, so they use `none` and `on`.
  */
 export type ThoughtLevel = "none" | "on" | "high" | "max";
 
-/** Levels shown when the selected model is GLM-5.2. */
-const LEVELS_52: ThoughtLevel[] = ["none", "high", "max"];
+/**
+ * Levels shown for the models that honour `reasoning_effort`.
+ *
+ * Deliberately has no `none`: probing the Coding Plan endpoint on 2026-08-15
+ * showed GLM-5.3 keeps emitting `reasoning_content` whether you send
+ * `thinking: { type: "disabled" }` or `reasoning_effort: "none"`, so an "Off"
+ * option would advertise something the model does not do.
+ */
+const LEVELS_REASONING_EFFORT: ThoughtLevel[] = ["high", "max"];
 
 /** Levels shown for every other thinking-capable model. */
 const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
 
-/** Whether a model id is in the GLM-5.2 family (case-insensitive). */
-function isGlm52(model: string): boolean {
-  return model.toLowerCase().startsWith("glm-5.2");
+/**
+ * Whether a model id is one the Coding Plan endpoint serves with GLM-5.3 —
+ * the models that validate and honour `reasoning_effort` (case-insensitive).
+ *
+ * `glm-5.2` is included because the endpoint routes it to 5.3 (confirmed by
+ * probe: a `glm-5.2` request comes back with `"model": "glm-5.3"`). `glm-5.1`
+ * routes there too but is no longer advertised, so it keeps the conservative
+ * on/off treatment.
+ */
+function isReasoningEffortModel(model: string): boolean {
+  const id = model.toLowerCase();
+  return id.startsWith("glm-5.3") || id.startsWith("glm-5.2");
 }
 
 /** The complete set of thought levels the agent understands. */
@@ -38,18 +54,19 @@ export function isThoughtLevel(value: string): value is ThoughtLevel {
 /**
  * Resolve which thought-level options a model supports.
  *
- * `reasoning_effort` is a GLM-5.2 exclusive per the Z.AI docs — other models
- * accept the field but it has no effect, so we only expose high/max for 5.2.
+ * Only the GLM-5.3 family honours `reasoning_effort`; on `glm-5-turbo` and
+ * `glm-4.7` the endpoint accepts the field without validating it and the
+ * response depth does not change, so those models only get on/off.
  */
 export function getThoughtLevels(model: string): ThoughtLevel[] {
-  return isGlm52(model) ? LEVELS_52 : LEVELS_DEFAULT;
+  return isReasoningEffortModel(model) ? LEVELS_REASONING_EFFORT : LEVELS_DEFAULT;
 }
 
 /**
  * Resolve a stored ThoughtLevel to one that's valid for the given model.
  * Used when switching models or restoring a persisted session: if the old
  * level isn't in the new model's option list, fall back to the model's
- * default (max for 5.2, on for everything else — the last entry in the list).
+ * default (max on 5.3, on for everything else — the last entry in the list).
  */
 export function resolveThoughtLevel(model: string, level: ThoughtLevel): ThoughtLevel {
   const valid = getThoughtLevels(model);
@@ -97,7 +114,7 @@ export interface StreamChatOptions {
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 
 /** Default GLM model when neither client nor user has chosen one. */
-export const DEFAULT_MODEL = "glm-5.2";
+export const DEFAULT_MODEL = "glm-5.3";
 
 /**
  * Curated list of GLM models the agent advertises to ACP clients via
@@ -106,17 +123,19 @@ export const DEFAULT_MODEL = "glm-5.2";
  *
  * The descriptions are intentionally short — clients render them in compact
  * model pickers.
+ *
+ * Only models the Coding Plan endpoint actually serves under their own name
+ * are listed. Probing on 2026-08-15 showed `glm-5.2` and `glm-5.1` come back
+ * as `glm-5.3`, `glm-4.5-air` comes back as `glm-4.7`, and `glm-5v-turbo` is
+ * rejected with business code 1311 ("subscription plan does not yet include
+ * access"). Advertising those would report a model the user is not talking to.
+ * All of them remain selectable via `ACP_GLM_AVAILABLE_MODELS`.
  */
 const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
   {
-    modelId: "glm-5.2",
-    name: "GLM-5.2",
+    modelId: "glm-5.3",
+    name: "GLM-5.3",
     description: "Newest 1M-context coding model with thinking mode",
-  },
-  {
-    modelId: "glm-5.1",
-    name: "GLM-5.1",
-    description: "Long-horizon coding model with thinking mode",
   },
   {
     modelId: "glm-5-turbo",
@@ -124,19 +143,9 @@ const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
     description: "Faster Coding Plan reasoning model",
   },
   {
-    modelId: "glm-5v-turbo",
-    name: "GLM-5V Turbo",
-    description: "Multimodal Coding Plan model with native vision",
-  },
-  {
     modelId: "glm-4.7",
     name: "GLM-4.7",
     description: "200K-context reasoning model",
-  },
-  {
-    modelId: "glm-4.5-air",
-    name: "GLM-4.5 Air",
-    description: "Lightweight, lower-latency model",
   },
 ];
 
@@ -148,14 +157,22 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
 
 /**
  * Context window sizes (in tokens) for GLM series models.
+ *
+ * De-listed ids are kept here so `ACP_GLM_AVAILABLE_MODELS` users still get an
+ * accurate window, and they report the window of the model that actually
+ * answers them rather than their own historical spec.
  */
 const MODEL_METADATA: Record<string, { contextWindow: number }> = {
-  "glm-5.2": { contextWindow: 1_000_000 },
-  "glm-5.1": { contextWindow: 128_000 },
+  "glm-5.3": { contextWindow: 1_000_000 },
   "glm-5-turbo": { contextWindow: 128_000 },
-  "glm-5v-turbo": { contextWindow: 200_000 },
   "glm-4.7": { contextWindow: 200_000 },
-  "glm-4.5-air": { contextWindow: 128_000 },
+  // Routed to glm-5.3 by the Coding Plan endpoint.
+  "glm-5.2": { contextWindow: 1_000_000 },
+  "glm-5.1": { contextWindow: 1_000_000 },
+  // Routed to glm-4.7 by the Coding Plan endpoint.
+  "glm-4.5-air": { contextWindow: 200_000 },
+  // Not Coding Plan accessible, but the native-vision path still supports it.
+  "glm-5v-turbo": { contextWindow: 200_000 },
 };
 
 /** Models that accept image content parts directly through chat completions. */
@@ -407,14 +424,21 @@ function thinkingOverride(): boolean | undefined {
  *
  * Z.AI exposes two parameters:
  * - `thinking` — an on/off gate: `{"type":"enabled"}` or `{"type":"disabled"}`
- * - `reasoning_effort` — GLM-5.2 only; controls thinking depth (`high`/`max`,
- *   defaulting to `max` when omitted).
+ * - `reasoning_effort` — controls thinking depth. The endpoint validates it
+ *   against `none | minimal | low | medium | high | xhigh | max` (an invalid
+ *   value returns business code 1210) but only the GLM-5.3 family acts on it.
  *
  * {@link ThoughtLevel} values map as follows:
  * - `none` → thinking disabled
  * - `on`   → thinking enabled (no reasoning_effort)
- * - `high` → thinking enabled + reasoning_effort=high (5.2 only)
- * - `max`  → thinking enabled + reasoning_effort=max (5.2 only)
+ * - `high` → thinking enabled + reasoning_effort=high (5.3 family only)
+ * - `max`  → thinking enabled + reasoning_effort=max (5.3 family only)
+ *
+ * Caveat: GLM-5.3 ignores every attempt to turn thinking off — it keeps
+ * emitting `reasoning_content` for `thinking: { type: "disabled" }` and for
+ * `reasoning_effort: "none"` alike. `none` is therefore not offered as a level
+ * for those models (see {@link getThoughtLevels}), and the `ACP_GLM_THINKING=false`
+ * override below is a no-op there even though the request is still sent.
  *
  * The `ACP_GLM_THINKING` env override still wins: `false` forces thinking off,
  * `true` forces it on (ignoring a `none` level). When `effort` is unset the
@@ -447,11 +471,11 @@ export function buildThinkingParams(
 
   params["thinking"] = { type: "enabled" };
 
-  // reasoning_effort is only meaningful for GLM-5.2 per the Z.AI docs, and Z.AI
-  // only accepts the "high"/"max" values there. Other levels ("on", and "none"
-  // when thinking is force-enabled via the env override) carry no valid
-  // reasoning_effort, so we omit the field entirely.
-  if ((effort === "high" || effort === "max") && isGlm52(model)) {
+  // reasoning_effort is only meaningful for the GLM-5.3 family — glm-5-turbo
+  // and glm-4.7 accept it without validating it and answer identically either
+  // way. The remaining levels ("on", and "none" when thinking is force-enabled
+  // via the env override) carry no valid effort, so we omit the field.
+  if ((effort === "high" || effort === "max") && isReasoningEffortModel(model)) {
     params["reasoning_effort"] = effort;
   }
 

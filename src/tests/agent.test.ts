@@ -871,10 +871,11 @@ test("newSession returns configOptions with thought_level selector for default m
   const tl = result.configOptions!.find((o) => o.category === "thought_level");
   assert.ok(tl, "thought_level option should exist");
   assert.equal(tl!.type, "select");
-  // Default model is glm-5.2 → none/high/max, defaulting to max.
+  // Default model is glm-5.3 → high/max, defaulting to max. There is no "Off"
+  // level because thinking cannot be disabled on 5.3.
   assert.equal(tl!.currentValue, "max");
   const values = (tl as { options: Array<{ value: string }> }).options.map((o) => o.value);
-  assert.deepEqual(values, ["none", "high", "max"]);
+  assert.deepEqual(values, ["high", "max"]);
 });
 
 test("setSessionConfigOption updates thoughtLevel and returns updated options", async () => {
@@ -899,10 +900,10 @@ test("setSessionConfigOption auto-resolves values invalid for the current model"
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  // Switch to glm-5.1 which only supports none/on.
-  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
+  // Switch to glm-4.7 which only supports none/on.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
-  // "max" is invalid for glm-5.1 — should auto-resolve to "on".
+  // "max" is invalid for glm-4.7 — should auto-resolve to "on".
   const result = await agent.setSessionConfigOption({
     sessionId,
     configId: "thought_level",
@@ -936,7 +937,7 @@ test("setSessionConfigOption rejects values that aren't a known thought level", 
     agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" }),
     /Invalid thought_level value/
   );
-  // A cross-model-but-known value ("max" while on the default glm-5.2) is fine.
+  // A cross-model-but-known value ("max" while on the default glm-5.3) is fine.
   const ok = await agent.setSessionConfigOption({
     sessionId,
     configId: "thought_level",
@@ -951,7 +952,7 @@ test("switching model updates thought_level options via config_option_update", a
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-  // Start with glm-5.2 (default) → max, options none/high/max.
+  // Start with glm-5.3 (default) → max, options high/max.
   // Switch to glm-4.7 → thoughtLevel should resolve to "on".
   await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
@@ -1019,7 +1020,7 @@ test("model switch persists model + clamped thoughtLevel before any prompt (fork
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
     const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-    // Switch model with no prompt in between: glm-5.2/max → glm-4.7, which
+    // Switch model with no prompt in between: glm-5.3/max → glm-4.7, which
     // clamps the level to "on". Both must survive a fork that reads from disk.
     await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
@@ -1062,6 +1063,42 @@ test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on 
     const result = await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
     const tl = result.configOptions!.find((o) => o.id === "thought_level");
     assert.equal(tl!.currentValue, "on");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a persisted 'none' level clamps up to max when the session is on glm-5.3", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-clamp-"));
+  const sessionId = "abcd1234-abcd-abcd-abcd-abcdabcd5353";
+  try {
+    // A v3 record saved while "Off" was still offered for the 5.x flagship.
+    // glm-5.3 has no "none" level, so load must clamp rather than fail.
+    const v3 = {
+      schemaVersion: 3,
+      sessionId,
+      cwd: "/tmp",
+      messages: [{ role: "system", content: "you are a coding assistant" }],
+      title: "old session",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.3",
+      mode: "default",
+      thoughtLevel: "none",
+    };
+    writeFileSync(pathJoin(dir, `${sessionId}.json`), JSON.stringify(v3), "utf8");
+
+    const store = new SessionStore(dir);
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const result = await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+
+    const tl = result.configOptions!.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "max");
+    assert.deepEqual(
+      (tl as { options: Array<{ value: string }> }).options.map((o) => o.value),
+      ["high", "max"]
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1959,7 +1996,7 @@ test("prompt performs emergency compaction and retries on 1261 error", async () 
   // to a 128K-window model so the seeded history triggers the proactive/
   // emergency compaction paths (the default model now has a 1M window).
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.1" });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
   const session = (agent as unknown as {
     sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
   }).sessions.get(sessionId);

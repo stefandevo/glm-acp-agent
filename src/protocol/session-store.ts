@@ -107,7 +107,7 @@ export class SessionStore {
     }
     // Handle schema migrations. We support v1 (pre-modes), v2 (with mode
     // field), and v3 (with thoughtLevel). Defaulting thoughtLevel to "max"
-    // is safe: it's GLM-5.2's own default effort, and load-time resolution
+    // is safe: it's GLM-5.3's own default effort, and load-time resolution
     // clamps it to a valid level for the session's actual model.
     const version = parsed.schemaVersion ?? 1;
     if (version === 1) {
