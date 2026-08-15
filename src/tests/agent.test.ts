@@ -871,11 +871,18 @@ test("newSession returns configOptions with thought_level selector for default m
   const tl = result.configOptions!.find((o) => o.category === "thought_level");
   assert.ok(tl, "thought_level option should exist");
   assert.equal(tl!.type, "select");
-  // Default model is glm-5.3 → high/max, defaulting to max. There is no "Off"
-  // level because thinking cannot be disabled on 5.3.
+  // Default model is glm-5.3 → the full effort ladder, defaulting to max.
+  // There is no "Off" level because thinking cannot be disabled on 5.3.
   assert.equal(tl!.currentValue, "max");
-  const values = (tl as { options: Array<{ value: string }> }).options.map((o) => o.value);
-  assert.deepEqual(values, ["high", "max"]);
+  const options = (tl as { options: Array<{ value: string; name: string }> }).options;
+  assert.deepEqual(
+    options.map((o) => o.value),
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
+  );
+  assert.deepEqual(
+    options.map((o) => o.name),
+    ["Minimal", "Low", "Medium", "High", "X-High", "Max"]
+  );
 });
 
 test("setSessionConfigOption updates thoughtLevel and returns updated options", async () => {
@@ -932,18 +939,18 @@ test("setSessionConfigOption rejects values that aren't a known thought level", 
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-  // "medium" is not a ThoughtLevel at all — reject rather than silently coerce.
+  // "ultra" is not a ThoughtLevel at all — reject rather than silently coerce.
   await assert.rejects(
-    agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" }),
+    agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "ultra" }),
     /Invalid thought_level value/
   );
-  // A cross-model-but-known value ("max" while on the default glm-5.3) is fine.
+  // A mid-ladder value is valid on the default glm-5.3 and sticks.
   const ok = await agent.setSessionConfigOption({
     sessionId,
     configId: "thought_level",
-    value: "max",
+    value: "medium",
   });
-  assert.equal(ok.configOptions.find((o) => o.id === "thought_level")!.currentValue, "max");
+  assert.equal(ok.configOptions.find((o) => o.id === "thought_level")!.currentValue, "medium");
 });
 
 test("switching model updates thought_level options via config_option_update", async () => {
@@ -952,7 +959,7 @@ test("switching model updates thought_level options via config_option_update", a
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-  // Start with glm-5.3 (default) → max, options high/max.
+  // Start with glm-5.3 (default) → max, options = the full effort ladder.
   // Switch to glm-4.7 → thoughtLevel should resolve to "on".
   await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
@@ -1152,7 +1159,7 @@ test("a persisted 'none' level clamps up to max when the session is on glm-5.3",
     assert.equal(tl!.currentValue, "max");
     assert.deepEqual(
       (tl as { options: Array<{ value: string }> }).options.map((o) => o.value),
-      ["high", "max"]
+      ["minimal", "low", "medium", "high", "xhigh", "max"]
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

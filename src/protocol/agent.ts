@@ -76,6 +76,22 @@ const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
  */
 export type SessionModeId = "default" | "accept_edits" | "bypass_permissions";
 
+/**
+ * Display names for thought levels shown in client UIs. Kept as an exhaustive
+ * map (not capitalize-first-letter) so `xhigh` renders as "X-High" and adding
+ * a level forces a conscious naming decision here.
+ */
+const THOUGHT_LEVEL_NAMES: Record<ThoughtLevel, string> = {
+  none: "Off",
+  on: "On",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "X-High",
+  max: "Max",
+};
+
 /** Per-session state */
 interface SessionState {
   cwd: string;
@@ -330,9 +346,9 @@ export class GlmAcpAgent implements Agent {
       );
     }
     session.model = params.modelId;
-    // The valid thought levels differ per model (e.g. 5.3 offers high/max
-    // while others only offer none/on), so clamp the current level to what
-    // the new model supports.
+    // The valid thought levels differ per model (e.g. 5.3 offers the full
+    // effort ladder while others only offer none/on), so clamp the current
+    // level to what the new model supports.
     session.thoughtLevel = resolveThoughtLevel(params.modelId, session.thoughtLevel);
     session.updatedAt = new Date().toISOString();
     // Persist immediately so a fork/reload before the next prompt doesn't
@@ -348,7 +364,8 @@ export class GlmAcpAgent implements Agent {
       },
     });
     // Push updated thought_level options — the set of valid levels may
-    // differ between models (e.g. switching from 5.2 to 4.7 drops "high").
+    // differ between models (e.g. switching from 5.3 to 4.7 drops the
+    // effort ladder).
     await safeSessionUpdate(this.connection, {
       sessionId: params.sessionId,
       update: {
@@ -378,12 +395,7 @@ export class GlmAcpAgent implements Agent {
         currentValue: thoughtLevel,
         options: levels.map((level) => ({
           value: level,
-          name:
-            level === "none"
-              ? "Off"
-              : level === "on"
-                ? "On"
-                : level.charAt(0).toUpperCase() + level.slice(1),
+          name: THOUGHT_LEVEL_NAMES[level],
         })),
       },
     ];
