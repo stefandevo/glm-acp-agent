@@ -416,13 +416,26 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  /** Build the SessionModelState we advertise on session create/load/resume/fork. */
+  /**
+   * Build the SessionModelState we advertise on session create/load/resume/fork.
+   *
+   * The active model is always included in `availableModels`, even when it
+   * isn't in the advertised list — a session restored from disk can be pinned
+   * to a de-listed id (`glm-5.2` was the previous default), and `ACP_GLM_MODEL`
+   * / `session/set_model` both accept uncatalogued ids on purpose. Returning a
+   * `currentModelId` outside the advertised set leaves pickers unable to
+   * represent the selection the agent is actually using.
+   */
   private modelsState(currentModelId: string): {
     availableModels: ModelInfo[];
     currentModelId: string;
   } {
+    const available = getAvailableModels();
+    if (available.some((m) => m.modelId === currentModelId)) {
+      return { availableModels: available, currentModelId };
+    }
     return {
-      availableModels: getAvailableModels(),
+      availableModels: [...available, { modelId: currentModelId, name: currentModelId }],
       currentModelId,
     };
   }

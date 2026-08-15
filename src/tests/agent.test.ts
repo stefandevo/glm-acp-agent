@@ -1045,7 +1045,7 @@ test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on 
       messages: [{ role: "system", content: "you are a coding assistant" }],
       title: "old session",
       updatedAt: "2026-01-01T00:00:00.000Z",
-      model: "glm-5.1",
+      model: "glm-4.7",
       mode: "default",
     };
     writeFileSync(pathJoin(dir, `${sessionId}.json`), JSON.stringify(v2), "utf8");
@@ -1056,7 +1056,7 @@ test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on 
     assert.equal(migrated?.schemaVersion, 3);
     assert.equal(migrated?.thoughtLevel, "max");
 
-    // On load the agent clamps that to the session's model (glm-5.1 → "on").
+    // On load the agent clamps that to the session's model (glm-4.7 → "on").
     const conn = createConnectionStub();
     const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
@@ -1065,6 +1065,61 @@ test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on 
     assert.equal(tl!.currentValue, "on");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadSession advertises the restored model even when it is de-listed", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-delisted-"));
+  const sessionId = "abcd1234-abcd-abcd-abcd-abcdabcd5252";
+  try {
+    // glm-5.2 was the previous default, so real users have sessions on disk
+    // pinned to it. It is no longer in the built-in list, but the session
+    // keeps using it — so it must still appear in availableModels, otherwise
+    // the client's picker has a currentModelId outside the advertised set.
+    const persisted = {
+      schemaVersion: 3,
+      sessionId,
+      cwd: "/tmp",
+      messages: [{ role: "system", content: "you are a coding assistant" }],
+      title: "old session",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.2",
+      mode: "default",
+      thoughtLevel: "max",
+    };
+    writeFileSync(pathJoin(dir, `${sessionId}.json`), JSON.stringify(persisted), "utf8");
+
+    const store = new SessionStore(dir);
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const result = await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+
+    assert.equal(result.models?.currentModelId, "glm-5.2");
+    const ids = result.models!.availableModels.map((m) => m.modelId);
+    assert.ok(ids.includes("glm-5.2"), `expected glm-5.2 in availableModels, got ${ids.join(", ")}`);
+    // The built-in entries are still advertised alongside it.
+    assert.ok(ids.includes("glm-5.3"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("newSession advertises an ACP_GLM_MODEL override that is not in the built-in list", async () => {
+  const old = process.env["ACP_GLM_MODEL"];
+  process.env["ACP_GLM_MODEL"] = "glm-4.5-air";
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    assert.equal(result.models?.currentModelId, "glm-4.5-air");
+    const ids = result.models!.availableModels.map((m) => m.modelId);
+    assert.ok(ids.includes("glm-4.5-air"), `expected glm-4.5-air in availableModels, got ${ids.join(", ")}`);
+  } finally {
+    if (old === undefined) delete process.env["ACP_GLM_MODEL"];
+    else process.env["ACP_GLM_MODEL"] = old;
   }
 });
 

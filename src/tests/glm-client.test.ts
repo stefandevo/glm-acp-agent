@@ -278,6 +278,23 @@ test("streamChat sends reasoning_effort when level is set on glm-5.3", async () 
   assert.equal(requestBody?.["reasoning_effort"], "max");
 });
 
+test("streamChat sends reasoning_effort on the de-listed aliases routed to 5.3", async () => {
+  for (const model of ["glm-5.2", "glm-5.1"]) {
+    const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+    let requestBody: Record<string, unknown> | undefined;
+    const c = makeClientWithCreate((body) => {
+      requestBody = body;
+      return Promise.resolve(stream);
+    });
+
+    for await (const chunk of c.streamChat([], undefined, { model, reasoningEffort: "high" })) {
+      void chunk;
+    }
+
+    assert.equal(requestBody?.["reasoning_effort"], "high", `expected effort for ${model}`);
+  }
+});
+
 test("streamChat sends reasoning_effort when level is set on glm-5.2", async () => {
   const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;
@@ -331,8 +348,10 @@ test("getThoughtLevels omits none for reasoning-effort models", () => {
   // `thinking: { type: "disabled" }` and `reasoning_effort: "none"` but keeps
   // emitting reasoning either way, so offering an "Off" option would lie.
   assert.deepEqual(getThoughtLevels("glm-5.3"), ["high", "max"]);
-  // glm-5.2 is served by glm-5.3, so it behaves identically.
+  // glm-5.2 and glm-5.1 are both served by glm-5.3, so they behave identically
+  // — including the fact that "Off" would not actually turn thinking off.
   assert.deepEqual(getThoughtLevels("glm-5.2"), ["high", "max"]);
+  assert.deepEqual(getThoughtLevels("glm-5.1"), ["high", "max"]);
 });
 
 test("getThoughtLevels returns none/on for models without reasoning_effort", () => {
