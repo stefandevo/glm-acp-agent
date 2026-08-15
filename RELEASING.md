@@ -1,31 +1,71 @@
 # Releasing
 
-Publishing to npm is automated via [`.github/workflows/publish.yml`](./.github/workflows/publish.yml),
-which fires when a GitHub Release is published. Auth uses npm Trusted Publishing
-(OIDC) — no `NPM_TOKEN` secret is required.
+Publishing to npm is automated via
+[`.github/workflows/publish.yml`](./.github/workflows/publish.yml), which fires
+when a GitHub Release is published. Auth uses npm Trusted Publishing (OIDC) —
+no `NPM_TOKEN` secret is required.
 
-## Cut a release
+## Full release procedure
+
+### 1. Sync the local registry manifest (if needed)
+
+If the npm version is about to change, update the pinned version in
+`registry/glm-acp-agent/agent.json` — both `version` and
+`distribution.npx.package` must match the version you're about to publish:
 
 ```bash
-# Bump version + create a git tag (creates a "chore(release): vX.Y.Z" commit)
-npm version patch -m "chore(release): %s"   # or: minor / major / X.Y.Z
+# In your editor, update both occurrences of the old version:
+#   "version": "<old>"       →  "version": "<new>"
+#   "package": "glm-acp-agent@<old>"  →  "package": "glm-acp-agent@<new>"
+```
 
-# Push the commit and the new tag
+Also update the `description` field if the model catalog, feature set, or
+capabilities have changed since the last registry update.
+
+Open a PR for this change and merge it to `main` before proceeding.
+
+> **Note:** After the initial registry submission is merged upstream, version
+> bumps are automatic — the registry runs an hourly cron that picks up the latest
+> npm version and commits it directly. So this step is only needed when other
+> fields in `agent.json` change (description, icon, distribution metadata).
+
+### 2. Cut the release
+
+From `main`, run:
+
+```bash
+git pull                          # make sure main is up to date
+npm version minor -m "chore(release): %s"   # or: patch / major / X.Y.Z
 git push --follow-tags
 ```
 
-Then on GitHub:
+`npm version` does three things atomically:
+- bumps `"version"` in `package.json` (and writes `package-lock.json`),
+- creates a `chore(release): vX.Y.Z` commit, and
+- tags it `vX.Y.Z`.
+
+After pushing, the tag and commit arrive on GitHub.
+
+### 3. Publish the GitHub Release
 
 1. Go to **Releases** → **Draft a new release**.
-2. Pick the tag you just pushed (e.g. `v1.0.1`).
+2. Pick the tag you just pushed (e.g. `v1.4.0`).
 3. Click **Generate release notes**.
 4. Click **Publish release**.
+
+Publishing the release triggers the **Publish to npm** workflow.
+
+### 4. Verify
 
 Watch the **Actions** tab. When `Publish to npm` goes green:
 
 ```bash
 npm view glm-acp-agent version    # should match the new tag
 ```
+
+The workflow also runs a post-publish `bun x` smoke test; see the
+[Troubleshooting](#troubleshooting-bun-x-verify-step-warns-after-publish)
+section below if it emits a warning.
 
 ## Notes
 
