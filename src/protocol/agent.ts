@@ -77,6 +77,42 @@ const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
 export type SessionModeId = "default" | "accept_edits" | "bypass_permissions";
 
 /**
+ * The session modes we advertise, in the order clients should display them.
+ *
+ * Single source of truth for both the ACP `modes` state (`session/set_mode`)
+ * and the `mode`-category SessionConfigOption. Clients like Zed suppress the
+ * legacy mode selector as soon as an agent advertises any config option, so
+ * the same list has to reach the UI through both channels.
+ */
+const SESSION_MODES: ReadonlyArray<{
+  id: SessionModeId;
+  name: string;
+  description: string;
+}> = [
+  {
+    id: "default",
+    name: "Ask for permission",
+    description: "Prompt before edits and commands.",
+  },
+  {
+    id: "accept_edits",
+    name: "Auto-approve edits",
+    description: "Edits run without prompting. Commands still prompt.",
+  },
+  {
+    id: "bypass_permissions",
+    name: "Bypass all permissions",
+    description: "Edits and commands run without prompting.",
+  },
+];
+
+const SESSION_MODE_IDS: SessionModeId[] = SESSION_MODES.map((mode) => mode.id);
+
+function isSessionModeId(value: unknown): value is SessionModeId {
+  return typeof value === "string" && SESSION_MODE_IDS.includes(value as SessionModeId);
+}
+
+/**
  * Display names for thought levels shown in client UIs. Kept as an exhaustive
  * map (not capitalize-first-letter) so `xhigh` renders as "X-High" and adding
  * a level forces a conscious naming decision here.
@@ -325,7 +361,7 @@ export class GlmAcpAgent implements Agent {
       sessionId,
       models: this.modelsState(model),
       modes: this.modesState("default"),
-      configOptions: this.configOptionsState(model, thoughtLevel),
+      configOptions: this.configOptionsState(model, thoughtLevel, "default"),
     };
   }
 
@@ -370,19 +406,31 @@ export class GlmAcpAgent implements Agent {
       sessionId: params.sessionId,
       update: {
         sessionUpdate: "config_option_update",
-        configOptions: this.configOptionsState(session.model, session.thoughtLevel),
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
       },
     });
     return {};
   }
 
   /**
-   * Build the `thought_level` SessionConfigOption for the given model. The
-   * available levels depend on the model (see {@link getThoughtLevels}).
+   * Build the SessionConfigOptions we advertise: `thought_level` (levels depend
+   * on the model, see {@link getThoughtLevels}) and `mode`.
+   *
+   * The `mode` option mirrors {@link modesState} as a `category: "mode"`
+   * selector. Clients that render config options (Zed) suppress the legacy mode
+   * selector once any config option is advertised, so the permission mode would
+   * otherwise be unreachable from their UI. `currentMode` is always read from
+   * the live session state, so a mode set through `session/set_mode` shows up
+   * here too.
    */
   private configOptionsState(
     model: string,
-    thoughtLevel: ThoughtLevel
+    thoughtLevel: ThoughtLevel,
+    currentMode: SessionModeId
   ): SessionConfigOption[] {
     const levels = getThoughtLevels(model);
     return [
@@ -398,6 +446,18 @@ export class GlmAcpAgent implements Agent {
           name: THOUGHT_LEVEL_NAMES[level],
         })),
       },
+      {
+        id: "mode",
+        name: "Mode",
+        description: "Tool permission mode",
+        category: "mode",
+        type: "select" as const,
+        currentValue: currentMode,
+        options: SESSION_MODES.map((mode) => ({
+          value: mode.id,
+          name: mode.name,
+        })),
+      },
     ];
   }
 
@@ -407,6 +467,31 @@ export class GlmAcpAgent implements Agent {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
+    }
+    if (params.configId === "mode") {
+      // Same reject-don't-coerce policy as thought_level below.
+      if (!isSessionModeId(params.value)) {
+        throw new Error(`Invalid mode value: ${String(params.value)}`);
+      }
+      session.mode = params.value;
+      session.updatedAt = new Date().toISOString();
+      this.persistSession(params.sessionId, session);
+      // Mirror setSessionMode so clients tracking the ACP mode state (rather
+      // than the config option) stay in sync with the dropdown.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: session.mode,
+        },
+      });
+      return {
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
+      };
     }
     if (params.configId !== "thought_level") {
       throw new Error(`Unknown config option: ${params.configId}`);
@@ -424,7 +509,11 @@ export class GlmAcpAgent implements Agent {
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);
     return {
-      configOptions: this.configOptionsState(session.model, session.thoughtLevel),
+      configOptions: this.configOptionsState(
+        session.model,
+        session.thoughtLevel,
+        session.mode
+      ),
     };
   }
 
@@ -458,23 +547,7 @@ export class GlmAcpAgent implements Agent {
     currentModeId: SessionModeId;
   } {
     return {
-      availableModes: [
-        {
-          id: "default",
-          name: "Ask for permission",
-          description: "Prompt before edits and commands.",
-        },
-        {
-          id: "accept_edits",
-          name: "Auto-approve edits",
-          description: "Edits run without prompting. Commands still prompt.",
-        },
-        {
-          id: "bypass_permissions",
-          name: "Bypass all permissions",
-          description: "Edits and commands run without prompting.",
-        },
-      ],
+      availableModes: SESSION_MODES.map((mode) => ({ ...mode })),
       currentModeId,
     };
   }
@@ -486,13 +559,12 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
-    const validModeIds: SessionModeId[] = ["default", "accept_edits", "bypass_permissions"];
-    if (!validModeIds.includes(params.modeId as SessionModeId)) {
+    if (!isSessionModeId(params.modeId)) {
       throw new Error(
-        `Invalid modeId: ${params.modeId}. Valid modes are: ${validModeIds.join(", ")}`
+        `Invalid modeId: ${params.modeId}. Valid modes are: ${SESSION_MODE_IDS.join(", ")}`
       );
     }
-    const newMode = params.modeId as SessionModeId;
+    const newMode = params.modeId;
     session.mode = newMode;
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);
@@ -745,7 +817,11 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
+      configOptions: this.configOptionsState(
+        restored.model,
+        restored.thoughtLevel,
+        restored.mode
+      ),
     };
   }
 
@@ -783,7 +859,11 @@ export class GlmAcpAgent implements Agent {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
       modes: this.modesState(forked.mode),
-      configOptions: this.configOptionsState(forked.model, forked.thoughtLevel),
+      configOptions: this.configOptionsState(
+        forked.model,
+        forked.thoughtLevel,
+        forked.mode
+      ),
     };
   }
 
@@ -815,7 +895,11 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
+      configOptions: this.configOptionsState(
+        restored.model,
+        restored.thoughtLevel,
+        restored.mode
+      ),
     };
   }
 
