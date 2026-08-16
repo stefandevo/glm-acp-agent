@@ -575,6 +575,20 @@ export class GlmAcpAgent implements Agent {
         currentModeId: newMode,
       },
     });
+    // Config options are a separate state channel: re-publish them so a mode
+    // dropdown (category "mode") doesn't keep a stale currentValue when the
+    // mode changes through the classic ACP path.
+    await safeSessionUpdate(this.connection, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
+      },
+    });
     return {};
   }
 

@@ -1067,6 +1067,32 @@ test("setSessionConfigOption rejects values that aren't a session mode", async (
   assert.equal(after.configOptions.find((o) => o.id === "mode")!.currentValue, "default");
 });
 
+test("setSessionMode immediately pushes a config_option_update with the new mode", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const updatesBefore = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  ).length;
+
+  await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+
+  const configUpdates = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  );
+  assert.equal(
+    configUpdates.length,
+    updatesBefore + 1,
+    "setSessionMode should emit exactly one config_option_update"
+  );
+  const pushed = (configUpdates.at(-1)!.update as {
+    configOptions: Array<{ id: string; currentValue: string }>;
+  }).configOptions;
+  assert.equal(pushed.find((o) => o.id === "mode")!.currentValue, "bypass_permissions");
+});
+
 test("a mode set via session/set_mode shows up in the next configOptions payload", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
