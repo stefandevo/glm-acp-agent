@@ -977,6 +977,139 @@ test("switching model updates thought_level options via config_option_update", a
 });
 
 // ---------------------------------------------------------------------------
+// Model as a config option (category: "model")
+// ---------------------------------------------------------------------------
+
+test("newSession advertises the model as a config option next to thought_level and mode", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  assert.ok(result.configOptions, "configOptions should be present");
+  const model = result.configOptions!.find((o) => o.id === "model");
+  assert.ok(model, "model option should exist");
+  assert.equal(model!.category, "model");
+  assert.equal(model!.type, "select");
+  assert.equal(model!.name, "Model");
+  // Default model is glm-5.3.
+  assert.equal(model!.currentValue, "glm-5.3");
+  const options = (model as { options: Array<{ value: string; name: string }> }).options;
+  assert.deepEqual(
+    options.map((o) => o.value),
+    ["glm-5.3", "glm-5-turbo", "glm-4.7"]
+  );
+  // Names must match the models state so both surfaces read the same.
+  assert.deepEqual(
+    options.map((o) => o.name),
+    result.models!.availableModels.map((m) => m.name)
+  );
+});
+
+test("setSessionConfigOption('model') switches the model, re-clamps thought level, and pushes updates", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const before = conn.updates.length;
+    const result = await agent.setSessionConfigOption({
+      sessionId,
+      configId: "model",
+      value: "glm-4.7",
+    });
+
+    const model = result.configOptions.find((o) => o.id === "model");
+    assert.equal(model!.currentValue, "glm-4.7");
+    // 5.3-family "max" is invalid on 4.7 — must have been clamped to "on".
+    const tl = result.configOptions.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "on");
+    // The other options are returned unchanged.
+    const mode = result.configOptions.find((o) => o.id === "mode");
+    assert.equal(mode!.currentValue, "default");
+
+    assert.equal(store.load(sessionId)?.model, "glm-4.7");
+
+    // Exactly one config_option_update push with the new thought-level set.
+    const configUpdates = conn.updates.slice(before).filter(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+    );
+    assert.equal(configUpdates.length, 1);
+    const pushed = (configUpdates[0] as { update: { configOptions: Array<{ id: string; currentValue: string }> } }).update.configOptions;
+    assert.equal(pushed.find((o) => o.id === "model")!.currentValue, "glm-4.7");
+    assert.equal(pushed.find((o) => o.id === "thought_level")!.currentValue, "on");
+  } finally {
+    cleanup();
+  }
+});
+
+test("setSessionConfigOption rejects values that aren't a model id at all", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "model", value: 42 as unknown as string }),
+    /Invalid model value/
+  );
+  // The rejected value must not have leaked into the session state.
+  const after = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+  assert.equal(after.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.3");
+});
+
+test("a model set via session/set_model shows up in the next configOptions payload", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // The classic ACP path and the config option share `session.model`, so a
+  // set_model call must not leave the dropdown showing a stale value.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+
+  const viaConfig = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "low",
+  });
+  assert.equal(
+    viaConfig.configOptions.find((o) => o.id === "model")!.currentValue,
+    "glm-5-turbo"
+  );
+});
+
+test("a session pinned to a de-listed model keeps it selectable in the model dropdown", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // glm-5.2 is de-listed (the endpoint routes it to glm-5.3), but a restored
+  // session can still be pinned to it.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.2" });
+
+  const viaConfig = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "medium",
+  });
+  const model = viaConfig.configOptions.find((o) => o.id === "model")!;
+  assert.equal(model.currentValue, "glm-5.2");
+  const options = (model as unknown as { options: Array<{ value: string }> }).options;
+  assert.ok(
+    options.some((o) => o.value === "glm-5.2"),
+    "de-listed id stays selectable so the dropdown represents the model in use"
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Session mode as a config option (category: "mode")
 // ---------------------------------------------------------------------------
 
