@@ -418,7 +418,7 @@ export class GlmAcpAgent implements Agent {
 
   /**
    * Build the SessionConfigOptions we advertise: `thought_level` (levels depend
-   * on the model, see {@link getThoughtLevels}) and `mode`.
+   * on the model, see {@link getThoughtLevels}), `mode`, and `model`.
    *
    * The `mode` option mirrors {@link modesState} as a `category: "mode"`
    * selector. Clients that render config options (Zed) suppress the legacy mode
@@ -426,6 +426,12 @@ export class GlmAcpAgent implements Agent {
    * otherwise be unreachable from their UI. `currentMode` is always read from
    * the live session state, so a mode set through `session/set_mode` shows up
    * here too.
+   *
+   * The `model` option mirrors {@link modelsState} as a `category: "model"`
+   * selector for the same reason: clients that render config options suppress
+   * the legacy model selector too, so the active model would otherwise be
+   * unreachable. `currentModel` is read from the live session state, so a model
+   * set through `session/set_model` shows up here as well.
    */
   private configOptionsState(
     model: string,
@@ -433,6 +439,12 @@ export class GlmAcpAgent implements Agent {
     currentMode: SessionModeId
   ): SessionConfigOption[] {
     const levels = getThoughtLevels(model);
+    const models = getAvailableModels();
+    // A restored session can be pinned to a de-listed id (see modelsState);
+    // keep it selectable so the dropdown represents the model actually in use.
+    const modelOptions = models.some((m) => m.modelId === model)
+      ? models
+      : [...models, { modelId: model, name: model }];
     return [
       {
         id: "thought_level",
@@ -456,6 +468,18 @@ export class GlmAcpAgent implements Agent {
         options: SESSION_MODES.map((mode) => ({
           value: mode.id,
           name: mode.name,
+        })),
+      },
+      {
+        id: "model",
+        name: "Model",
+        description: "GLM model for this session",
+        category: "model",
+        type: "select" as const,
+        currentValue: model,
+        options: modelOptions.map((m) => ({
+          value: m.modelId,
+          name: m.name,
         })),
       },
     ];
@@ -483,6 +507,56 @@ export class GlmAcpAgent implements Agent {
         update: {
           sessionUpdate: "current_mode_update",
           currentModeId: session.mode,
+        },
+      });
+      return {
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
+      };
+    }
+    if (params.configId === "model") {
+      // Same reject-don't-coerce policy as thought_level below, but only for
+      // values that aren't model ids at all. Uncatalogued ids are allowed on
+      // purpose, mirroring unstable_setSessionModel / ACP_GLM_MODEL.
+      if (typeof params.value !== "string" || params.value.length === 0) {
+        throw new Error(`Invalid model value: ${String(params.value)}`);
+      }
+      const known = getAvailableModels().find((m) => m.modelId === params.value);
+      if (!known) {
+        process.stderr.write(
+          `[glm-acp-agent] warning: model "${params.value}" is not in the advertised list; using as-is.\n`
+        );
+      }
+      session.model = params.value;
+      // The valid thought levels differ per model (the 5.3 family offers the
+      // full effort ladder, others only none/on), so clamp like set_model.
+      session.thoughtLevel = resolveThoughtLevel(params.value, session.thoughtLevel);
+      session.updatedAt = new Date().toISOString();
+      this.persistSession(params.sessionId, session);
+      // Mirror unstable_setSessionModel so clients tracking the ACP model
+      // state (rather than the config option) stay in sync with the dropdown.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          updatedAt: session.updatedAt,
+        },
+      });
+      // The thought-level set may have changed with the model — push the
+      // updated config options so the effort dropdown doesn't keep showing
+      // a level the new model doesn't offer.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: this.configOptionsState(
+            session.model,
+            session.thoughtLevel,
+            session.mode
+          ),
         },
       });
       return {
