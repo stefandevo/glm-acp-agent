@@ -26,7 +26,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 
 - **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
-- **Tool calling** – agentic loop with up to 20 turns of GLM function calling
+- **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 20; see `ACP_GLM_MAX_TURNS` / `--max-turns`)
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
