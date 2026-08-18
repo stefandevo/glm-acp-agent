@@ -2066,7 +2066,7 @@ test("invalid maxTurns falls back to the default", async () => {
   const conn = createConnectionStub();
   const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
 
-  for (const bad of [0, -1, NaN, Number.POSITIVE_INFINITY]) {
+  for (const bad of [0, -1, NaN, Number.POSITIVE_INFINITY, 0.5]) {
     const agent = new GlmAcpAgent(conn as never, { glm: { ...glm }, maxTurns: bad, sessionStore: null });
     assert.equal((agent as unknown as { maxTurns: number }).maxTurns, 20);
   }
@@ -2090,6 +2090,11 @@ test("maxTurns falls back to $ACP_GLM_MAX_TURNS and the default", async () => {
     process.env["ACP_GLM_MAX_TURNS"] = "not-a-number";
     const invalid = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
     assert.equal((invalid as unknown as { maxTurns: number }).maxTurns, 20);
+
+    // Fractional values that floor below 1 are invalid, not silently floored.
+    process.env["ACP_GLM_MAX_TURNS"] = "0.5";
+    const fractional = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
+    assert.equal((fractional as unknown as { maxTurns: number }).maxTurns, 20);
   } finally {
     if (prev === undefined) delete process.env["ACP_GLM_MAX_TURNS"];
     else process.env["ACP_GLM_MAX_TURNS"] = prev;

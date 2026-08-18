@@ -196,18 +196,20 @@ export interface GlmAcpAgentOptions {
  * GLM series models (via `GlmClient`), providing a full prompt loop with
  * tool-calling and streaming support.
  */
-const DEFAULT_MAX_TURNS = 20;
+export const DEFAULT_MAX_TURNS = 20;
 
 /**
  * Resolve the fallback maxTurns from `$ACP_GLM_MAX_TURNS` when the caller did
  * not pass an explicit value. Returns `undefined` when unset or invalid (the
  * constructor then applies the default, and logs a warning on invalid input).
+ * Values that floor below 1 (e.g. 0.5) count as invalid — flooring them to 0
+ * would just be silently replaced by the default in the constructor.
  */
 function envMaxTurns(): number | undefined {
   const raw = process.env["ACP_GLM_MAX_TURNS"];
   if (raw === undefined || raw === "") return undefined;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (!Number.isFinite(parsed) || Math.floor(parsed) < 1) {
     process.stderr.write(
       `glm-acp-agent: ignoring invalid ACP_GLM_MAX_TURNS="${raw}"\n`
     );
@@ -231,10 +233,9 @@ export class GlmAcpAgent implements Agent {
   ) {
     this._glm = options.glm ?? null;
     const candidateMaxTurns = options.maxTurns ?? envMaxTurns() ?? DEFAULT_MAX_TURNS;
+    const floored = Math.floor(candidateMaxTurns);
     this.maxTurns =
-      Number.isFinite(candidateMaxTurns) && candidateMaxTurns > 0
-        ? Math.floor(candidateMaxTurns)
-        : DEFAULT_MAX_TURNS;
+      Number.isFinite(floored) && floored >= 1 ? floored : DEFAULT_MAX_TURNS;
     this.sessionStore =
       options.sessionStore === null
         ? null
