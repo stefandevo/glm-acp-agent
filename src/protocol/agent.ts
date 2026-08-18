@@ -372,38 +372,49 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    await this.applySessionModel(params.sessionId, session, params.modelId);
+    return {};
+  }
+
+  /**
+   * Switch a session to a new model id — shared by `session/set_model` and the
+   * `model` config option. Uncatalogued ids are allowed on purpose (Z.AI may
+   * offer models we haven't catalogued), but log a stderr hint. Persists,
+   * notifies clients via `session_info_update`, and pushes a
+   * `config_option_update` because the valid thought levels may differ between
+   * models (e.g. switching from 5.3 to 4.7 drops the effort ladder).
+   */
+  private async applySessionModel(
+    sessionId: string,
+    session: SessionState,
+    modelId: string
+  ): Promise<void> {
     const available = getAvailableModels();
-    const known = available.find((m) => m.modelId === params.modelId);
+    const known = available.find((m) => m.modelId === modelId);
     if (!known) {
-      // Allow the caller to pick any model id even if not in the curated list
-      // (Z.AI may offer models we haven't catalogued), but log a stderr hint.
       process.stderr.write(
-        `[glm-acp-agent] warning: model "${params.modelId}" is not in the advertised list; using as-is.\n`
+        `[glm-acp-agent] warning: model "${modelId}" is not in the advertised list; using as-is.\n`
       );
     }
-    session.model = params.modelId;
-    // The valid thought levels differ per model (e.g. 5.3 offers the full
-    // effort ladder while others only offer none/on), so clamp the current
-    // level to what the new model supports.
-    session.thoughtLevel = resolveThoughtLevel(params.modelId, session.thoughtLevel);
+    session.model = modelId;
+    // The valid thought levels differ per model, so clamp the current level to
+    // what the new model supports.
+    session.thoughtLevel = resolveThoughtLevel(modelId, session.thoughtLevel);
     session.updatedAt = new Date().toISOString();
     // Persist immediately so a fork/reload before the next prompt doesn't
-    // resurrect the previous model or thought level (matches setSessionConfigOption).
-    this.persistSession(params.sessionId, session);
+    // resurrect the previous model or thought level.
+    this.persistSession(sessionId, session);
     // Notify clients so any UI that displays the active model refreshes
     // immediately, instead of waiting for the next prompt to complete.
     await safeSessionUpdate(this.connection, {
-      sessionId: params.sessionId,
+      sessionId,
       update: {
         sessionUpdate: "session_info_update",
         updatedAt: session.updatedAt,
       },
     });
-    // Push updated thought_level options — the set of valid levels may
-    // differ between models (e.g. switching from 5.3 to 4.7 drops the
-    // effort ladder).
     await safeSessionUpdate(this.connection, {
-      sessionId: params.sessionId,
+      sessionId,
       update: {
         sessionUpdate: "config_option_update",
         configOptions: this.configOptionsState(
@@ -413,7 +424,6 @@ export class GlmAcpAgent implements Agent {
         ),
       },
     });
-    return {};
   }
 
   /**
@@ -439,12 +449,7 @@ export class GlmAcpAgent implements Agent {
     currentMode: SessionModeId
   ): SessionConfigOption[] {
     const levels = getThoughtLevels(model);
-    const models = getAvailableModels();
-    // A restored session can be pinned to a de-listed id (see modelsState);
-    // keep it selectable so the dropdown represents the model actually in use.
-    const modelOptions = models.some((m) => m.modelId === model)
-      ? models
-      : [...models, { modelId: model, name: model }];
+    const modelOptions = availableModelsWith(model);
     return [
       {
         id: "thought_level",
@@ -524,41 +529,7 @@ export class GlmAcpAgent implements Agent {
       if (typeof params.value !== "string" || params.value.length === 0) {
         throw new Error(`Invalid model value: ${String(params.value)}`);
       }
-      const known = getAvailableModels().find((m) => m.modelId === params.value);
-      if (!known) {
-        process.stderr.write(
-          `[glm-acp-agent] warning: model "${params.value}" is not in the advertised list; using as-is.\n`
-        );
-      }
-      session.model = params.value;
-      // The valid thought levels differ per model (the 5.3 family offers the
-      // full effort ladder, others only none/on), so clamp like set_model.
-      session.thoughtLevel = resolveThoughtLevel(params.value, session.thoughtLevel);
-      session.updatedAt = new Date().toISOString();
-      this.persistSession(params.sessionId, session);
-      // Mirror unstable_setSessionModel so clients tracking the ACP model
-      // state (rather than the config option) stay in sync with the dropdown.
-      await safeSessionUpdate(this.connection, {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "session_info_update",
-          updatedAt: session.updatedAt,
-        },
-      });
-      // The thought-level set may have changed with the model — push the
-      // updated config options so the effort dropdown doesn't keep showing
-      // a level the new model doesn't offer.
-      await safeSessionUpdate(this.connection, {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "config_option_update",
-          configOptions: this.configOptionsState(
-            session.model,
-            session.thoughtLevel,
-            session.mode
-          ),
-        },
-      });
+      await this.applySessionModel(params.sessionId, session, params.value);
       return {
         configOptions: this.configOptionsState(
           session.model,
@@ -605,14 +576,7 @@ export class GlmAcpAgent implements Agent {
     availableModels: ModelInfo[];
     currentModelId: string;
   } {
-    const available = getAvailableModels();
-    if (available.some((m) => m.modelId === currentModelId)) {
-      return { availableModels: available, currentModelId };
-    }
-    return {
-      availableModels: [...available, { modelId: currentModelId, name: currentModelId }],
-      currentModelId,
-    };
+    return { availableModels: availableModelsWith(currentModelId), currentModelId };
   }
 
   /** Build the SessionModeState we advertise on session create/load/resume/fork. */
@@ -1435,6 +1399,20 @@ function stringifyUserMessage(content: unknown): string {
     })
     .filter((text) => text.length > 0)
     .join("\n");
+}
+
+/**
+ * The advertised model list, always including `currentModelId` — a session
+ * restored from disk can be pinned to a de-listed id (`glm-5.2` was the
+ * previous default), and `ACP_GLM_MODEL` / `session/set_model` / the `model`
+ * config option all accept uncatalogued ids on purpose. Dropping the active id
+ * from the list would leave pickers unable to represent the selection in use.
+ */
+function availableModelsWith(currentModelId: string): ModelInfo[] {
+  const available = getAvailableModels();
+  return available.some((m) => m.modelId === currentModelId)
+    ? available
+    : [...available, { modelId: currentModelId, name: currentModelId }];
 }
 
 /**
