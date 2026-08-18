@@ -1,6 +1,6 @@
 import { Readable, Writable } from "node:stream";
 import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
-import { GlmAcpAgent } from "./agent.js";
+import { GlmAcpAgent, type GlmAcpAgentOptions } from "./agent.js";
 
 /**
  * Sets up the ACP stdio connection and starts the agent.
@@ -8,7 +8,9 @@ import { GlmAcpAgent } from "./agent.js";
  * Uses `ndJsonStream` for newline-delimited JSON transport over stdin/stdout,
  * as specified in the ACP SDK documentation.
  */
-export function startConnection(): AgentSideConnection {
+export function startConnection(
+  agentOptions: GlmAcpAgentOptions = {}
+): AgentSideConnection {
   // Convert Node.js streams to Web Streams API
   const output = Writable.toWeb(process.stdout) as WritableStream<Uint8Array>;
   const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
@@ -16,7 +18,7 @@ export function startConnection(): AgentSideConnection {
   const stream = ndJsonStream(output, input);
 
   const connection = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn),
+    (conn) => new GlmAcpAgent(conn, agentOptions),
     stream
   );
 
