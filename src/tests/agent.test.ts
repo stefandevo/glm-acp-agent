@@ -1554,6 +1554,15 @@ test("prompt loop returns max_turn_requests after exhausting tool turns", async 
     prompt: [{ type: "text", text: "do things" }],
   });
   assert.equal(result.stopReason, "max_turn_requests");
+
+  // The loop emits a notice so the user can tell "hit the cap" from "done".
+  const notice = (conn as unknown as ConnectionStub).updates.some(
+    (u) =>
+      (u as { update?: { content?: { text?: string } } }).update?.content?.text?.includes(
+        "reached the 2-turn limit"
+      )
+  );
+  assert.equal(notice, true);
 });
 
 test("prompt cancellation returns cancelled stop reason", async () => {
@@ -2060,6 +2069,30 @@ test("invalid maxTurns falls back to the default", async () => {
   for (const bad of [0, -1, NaN, Number.POSITIVE_INFINITY]) {
     const agent = new GlmAcpAgent(conn as never, { glm: { ...glm }, maxTurns: bad, sessionStore: null });
     assert.equal((agent as unknown as { maxTurns: number }).maxTurns, 20);
+  }
+});
+
+test("maxTurns falls back to $ACP_GLM_MAX_TURNS and the default", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+
+  const prev = process.env["ACP_GLM_MAX_TURNS"];
+  try {
+    process.env["ACP_GLM_MAX_TURNS"] = "7";
+    const fromEnv = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
+    assert.equal((fromEnv as unknown as { maxTurns: number }).maxTurns, 7);
+
+    // An explicit option wins over the env var.
+    const explicit = new GlmAcpAgent(conn as never, { glm: { ...glm }, maxTurns: 3, sessionStore: null });
+    assert.equal((explicit as unknown as { maxTurns: number }).maxTurns, 3);
+
+    // Invalid env values are ignored (default applies).
+    process.env["ACP_GLM_MAX_TURNS"] = "not-a-number";
+    const invalid = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
+    assert.equal((invalid as unknown as { maxTurns: number }).maxTurns, 20);
+  } finally {
+    if (prev === undefined) delete process.env["ACP_GLM_MAX_TURNS"];
+    else process.env["ACP_GLM_MAX_TURNS"] = prev;
   }
 });
 

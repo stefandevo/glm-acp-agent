@@ -168,7 +168,10 @@ export interface GlmAcpAgentOptions {
       options?: StreamChatOptions
     ) => AsyncIterable<GlmStreamChunk>;
   };
-  /** Maximum number of model/tool turns per single prompt. Default 20. */
+  /**
+   * Maximum number of model/tool turns per single prompt. Default 20,
+   * overridable via `$ACP_GLM_MAX_TURNS`.
+   */
   maxTurns?: number;
   /**
    * Override the session store (used in tests). When undefined the agent
@@ -193,6 +196,26 @@ export interface GlmAcpAgentOptions {
  * GLM series models (via `GlmClient`), providing a full prompt loop with
  * tool-calling and streaming support.
  */
+const DEFAULT_MAX_TURNS = 20;
+
+/**
+ * Resolve the fallback maxTurns from `$ACP_GLM_MAX_TURNS` when the caller did
+ * not pass an explicit value. Returns `undefined` when unset or invalid (the
+ * constructor then applies the default, and logs a warning on invalid input).
+ */
+function envMaxTurns(): number | undefined {
+  const raw = process.env["ACP_GLM_MAX_TURNS"];
+  if (raw === undefined || raw === "") return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring invalid ACP_GLM_MAX_TURNS="${raw}"\n`
+    );
+    return undefined;
+  }
+  return Math.floor(parsed);
+}
+
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
   private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
@@ -207,11 +230,11 @@ export class GlmAcpAgent implements Agent {
     options: GlmAcpAgentOptions = {}
   ) {
     this._glm = options.glm ?? null;
-    const candidateMaxTurns = options.maxTurns ?? 20;
+    const candidateMaxTurns = options.maxTurns ?? envMaxTurns() ?? DEFAULT_MAX_TURNS;
     this.maxTurns =
       Number.isFinite(candidateMaxTurns) && candidateMaxTurns > 0
         ? Math.floor(candidateMaxTurns)
-        : 20;
+        : DEFAULT_MAX_TURNS;
     this.sessionStore =
       options.sessionStore === null
         ? null
@@ -1200,7 +1223,18 @@ export class GlmAcpAgent implements Agent {
       // tool results.
     }
 
-    // Reached MAX_TURNS without resolution.
+    // Reached MAX_TURNS without resolution. Tell the user why we stopped —
+    // without this, hitting the cap is indistinguishable from a normal end.
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+        },
+      },
+    });
     return { stopReason: "max_turn_requests", usage: lastUsage };
   }
 
