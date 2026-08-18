@@ -976,6 +976,287 @@ test("switching model updates thought_level options via config_option_update", a
   assert.deepEqual(values, ["none", "on"]);
 });
 
+// ---------------------------------------------------------------------------
+// Model as a config option (category: "model")
+// ---------------------------------------------------------------------------
+
+test("newSession advertises the model as a config option next to thought_level and mode", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  assert.ok(result.configOptions, "configOptions should be present");
+  const model = result.configOptions!.find((o) => o.id === "model");
+  assert.ok(model, "model option should exist");
+  assert.equal(model!.category, "model");
+  assert.equal(model!.type, "select");
+  assert.equal(model!.name, "Model");
+  // Default model is glm-5.3.
+  assert.equal(model!.currentValue, "glm-5.3");
+  const options = (model as { options: Array<{ value: string; name: string }> }).options;
+  assert.deepEqual(
+    options.map((o) => o.value),
+    ["glm-5.3", "glm-5-turbo", "glm-4.7"]
+  );
+  // Names must match the models state so both surfaces read the same.
+  assert.deepEqual(
+    options.map((o) => o.name),
+    result.models!.availableModels.map((m) => m.name)
+  );
+});
+
+test("setSessionConfigOption('model') switches the model, re-clamps thought level, and pushes updates", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const before = conn.updates.length;
+    const result = await agent.setSessionConfigOption({
+      sessionId,
+      configId: "model",
+      value: "glm-4.7",
+    });
+
+    const model = result.configOptions.find((o) => o.id === "model");
+    assert.equal(model!.currentValue, "glm-4.7");
+    // 5.3-family "max" is invalid on 4.7 — must have been clamped to "on".
+    const tl = result.configOptions.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "on");
+    // The other options are returned unchanged.
+    const mode = result.configOptions.find((o) => o.id === "mode");
+    assert.equal(mode!.currentValue, "default");
+
+    assert.equal(store.load(sessionId)?.model, "glm-4.7");
+
+    // Exactly one config_option_update push with the new thought-level set.
+    const configUpdates = conn.updates.slice(before).filter(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+    );
+    assert.equal(configUpdates.length, 1);
+    const pushed = (configUpdates[0] as { update: { configOptions: Array<{ id: string; currentValue: string }> } }).update.configOptions;
+    assert.equal(pushed.find((o) => o.id === "model")!.currentValue, "glm-4.7");
+    assert.equal(pushed.find((o) => o.id === "thought_level")!.currentValue, "on");
+  } finally {
+    cleanup();
+  }
+});
+
+test("setSessionConfigOption rejects values that aren't a model id at all", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "model", value: 42 as unknown as string }),
+    /Invalid model value/
+  );
+  // The rejected value must not have leaked into the session state.
+  const after = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+  assert.equal(after.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.3");
+});
+
+test("a model set via session/set_model shows up in the next configOptions payload", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // The classic ACP path and the config option share `session.model`, so a
+  // set_model call must not leave the dropdown showing a stale value.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+
+  const viaConfig = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "low",
+  });
+  assert.equal(
+    viaConfig.configOptions.find((o) => o.id === "model")!.currentValue,
+    "glm-5-turbo"
+  );
+});
+
+test("a session pinned to a de-listed model keeps it selectable in the model dropdown", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // glm-5.2 is de-listed (the endpoint routes it to glm-5.3), but a restored
+  // session can still be pinned to it.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.2" });
+
+  const viaConfig = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "medium",
+  });
+  const model = viaConfig.configOptions.find((o) => o.id === "model")!;
+  assert.equal(model.currentValue, "glm-5.2");
+  const options = (model as unknown as { options: Array<{ value: string }> }).options;
+  assert.ok(
+    options.some((o) => o.value === "glm-5.2"),
+    "de-listed id stays selectable so the dropdown represents the model in use"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Session mode as a config option (category: "mode")
+// ---------------------------------------------------------------------------
+
+test("newSession advertises the session mode as a config option next to thought_level", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const result = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  assert.ok(result.configOptions, "configOptions should be present");
+  // Both selectors must ship together — clients that render config options
+  // suppress the legacy mode selector entirely.
+  assert.ok(
+    result.configOptions!.some((o) => o.id === "thought_level"),
+    "thought_level option should still exist"
+  );
+
+  const mode = result.configOptions!.find((o) => o.id === "mode");
+  assert.ok(mode, "mode option should exist");
+  assert.equal(mode!.category, "mode");
+  assert.equal(mode!.type, "select");
+  assert.equal(mode!.name, "Mode");
+  assert.equal(mode!.currentValue, "default");
+  const options = (mode as { options: Array<{ value: string; name: string }> }).options;
+  assert.deepEqual(
+    options.map((o) => o.value),
+    ["default", "accept_edits", "bypass_permissions"]
+  );
+  // Names must match the ACP `modes` state so both surfaces read the same.
+  assert.deepEqual(
+    options.map((o) => o.name),
+    result.modes!.availableModes.map((m) => m.name)
+  );
+});
+
+test("setSessionConfigOption('mode') switches the mode, persists it, and emits current_mode_update", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const before = conn.updates.length;
+    const result = await agent.setSessionConfigOption({
+      sessionId,
+      configId: "mode",
+      value: "accept_edits",
+    });
+
+    const mode = result.configOptions.find((o) => o.id === "mode");
+    assert.equal(mode!.currentValue, "accept_edits");
+    // The other option is returned unchanged.
+    const tl = result.configOptions.find((o) => o.id === "thought_level");
+    assert.equal(tl!.currentValue, "max");
+
+    assert.equal(store.load(sessionId)?.mode, "accept_edits");
+
+    const modeUpdates = conn.updates.slice(before).filter(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "current_mode_update"
+    );
+    assert.equal(modeUpdates.length, 1);
+    assert.equal(
+      (modeUpdates[0] as { update: { currentModeId?: string } }).update.currentModeId,
+      "accept_edits"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("setSessionConfigOption rejects values that aren't a session mode", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await assert.rejects(
+    agent.setSessionConfigOption({ sessionId, configId: "mode", value: "bogus" }),
+    /Invalid mode value: bogus/
+  );
+  // The rejected value must not have leaked into the session state.
+  const after = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+  assert.equal(after.configOptions.find((o) => o.id === "mode")!.currentValue, "default");
+});
+
+test("setSessionMode immediately pushes a config_option_update with the new mode", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const updatesBefore = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  ).length;
+
+  await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+
+  const configUpdates = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  );
+  assert.equal(
+    configUpdates.length,
+    updatesBefore + 1,
+    "setSessionMode should emit exactly one config_option_update"
+  );
+  const pushed = (configUpdates.at(-1)!.update as {
+    configOptions: Array<{ id: string; currentValue: string }>;
+  }).configOptions;
+  assert.equal(pushed.find((o) => o.id === "mode")!.currentValue, "bypass_permissions");
+});
+
+test("a mode set via session/set_mode shows up in the next configOptions payload", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  // The classic ACP path and the config option share `session.mode`, so a
+  // set_mode call must not leave the dropdown showing a stale value.
+  await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+
+  const viaConfig = await agent.setSessionConfigOption({
+    sessionId,
+    configId: "thought_level",
+    value: "low",
+  });
+  assert.equal(
+    viaConfig.configOptions.find((o) => o.id === "mode")!.currentValue,
+    "bypass_permissions"
+  );
+
+  // …and on the push we emit when the model changes.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
+  const configUpdates = conn.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "config_option_update"
+  );
+  const pushed = (configUpdates.at(-1)!.update as {
+    configOptions: Array<{ id: string; currentValue: string }>;
+  }).configOptions;
+  assert.equal(pushed.find((o) => o.id === "mode")!.currentValue, "bypass_permissions");
+});
+
 test("thoughtLevel is forwarded to streamChat as reasoningEffort", async () => {
   const conn = createConnectionStub();
   let seenEffort: string | undefined;

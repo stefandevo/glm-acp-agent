@@ -77,6 +77,42 @@ const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
 export type SessionModeId = "default" | "accept_edits" | "bypass_permissions";
 
 /**
+ * The session modes we advertise, in the order clients should display them.
+ *
+ * Single source of truth for both the ACP `modes` state (`session/set_mode`)
+ * and the `mode`-category SessionConfigOption. Clients like Zed suppress the
+ * legacy mode selector as soon as an agent advertises any config option, so
+ * the same list has to reach the UI through both channels.
+ */
+const SESSION_MODES: ReadonlyArray<{
+  id: SessionModeId;
+  name: string;
+  description: string;
+}> = [
+  {
+    id: "default",
+    name: "Ask for permission",
+    description: "Prompt before edits and commands.",
+  },
+  {
+    id: "accept_edits",
+    name: "Auto-approve edits",
+    description: "Edits run without prompting. Commands still prompt.",
+  },
+  {
+    id: "bypass_permissions",
+    name: "Bypass all permissions",
+    description: "Edits and commands run without prompting.",
+  },
+];
+
+const SESSION_MODE_IDS: SessionModeId[] = SESSION_MODES.map((mode) => mode.id);
+
+function isSessionModeId(value: unknown): value is SessionModeId {
+  return typeof value === "string" && SESSION_MODE_IDS.includes(value as SessionModeId);
+}
+
+/**
  * Display names for thought levels shown in client UIs. Kept as an exhaustive
  * map (not capitalize-first-letter) so `xhigh` renders as "X-High" and adding
  * a level forces a conscious naming decision here.
@@ -349,7 +385,7 @@ export class GlmAcpAgent implements Agent {
       sessionId,
       models: this.modelsState(model),
       modes: this.modesState("default"),
-      configOptions: this.configOptionsState(model, thoughtLevel),
+      configOptions: this.configOptionsState(model, thoughtLevel, "default"),
     };
   }
 
@@ -360,55 +396,84 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    await this.applySessionModel(params.sessionId, session, params.modelId);
+    return {};
+  }
+
+  /**
+   * Switch a session to a new model id — shared by `session/set_model` and the
+   * `model` config option. Uncatalogued ids are allowed on purpose (Z.AI may
+   * offer models we haven't catalogued), but log a stderr hint. Persists,
+   * notifies clients via `session_info_update`, and pushes a
+   * `config_option_update` because the valid thought levels may differ between
+   * models (e.g. switching from 5.3 to 4.7 drops the effort ladder).
+   */
+  private async applySessionModel(
+    sessionId: string,
+    session: SessionState,
+    modelId: string
+  ): Promise<void> {
     const available = getAvailableModels();
-    const known = available.find((m) => m.modelId === params.modelId);
+    const known = available.find((m) => m.modelId === modelId);
     if (!known) {
-      // Allow the caller to pick any model id even if not in the curated list
-      // (Z.AI may offer models we haven't catalogued), but log a stderr hint.
       process.stderr.write(
-        `[glm-acp-agent] warning: model "${params.modelId}" is not in the advertised list; using as-is.\n`
+        `[glm-acp-agent] warning: model "${modelId}" is not in the advertised list; using as-is.\n`
       );
     }
-    session.model = params.modelId;
-    // The valid thought levels differ per model (e.g. 5.3 offers the full
-    // effort ladder while others only offer none/on), so clamp the current
-    // level to what the new model supports.
-    session.thoughtLevel = resolveThoughtLevel(params.modelId, session.thoughtLevel);
+    session.model = modelId;
+    // The valid thought levels differ per model, so clamp the current level to
+    // what the new model supports.
+    session.thoughtLevel = resolveThoughtLevel(modelId, session.thoughtLevel);
     session.updatedAt = new Date().toISOString();
     // Persist immediately so a fork/reload before the next prompt doesn't
-    // resurrect the previous model or thought level (matches setSessionConfigOption).
-    this.persistSession(params.sessionId, session);
+    // resurrect the previous model or thought level.
+    this.persistSession(sessionId, session);
     // Notify clients so any UI that displays the active model refreshes
     // immediately, instead of waiting for the next prompt to complete.
     await safeSessionUpdate(this.connection, {
-      sessionId: params.sessionId,
+      sessionId,
       update: {
         sessionUpdate: "session_info_update",
         updatedAt: session.updatedAt,
       },
     });
-    // Push updated thought_level options — the set of valid levels may
-    // differ between models (e.g. switching from 5.3 to 4.7 drops the
-    // effort ladder).
     await safeSessionUpdate(this.connection, {
-      sessionId: params.sessionId,
+      sessionId,
       update: {
         sessionUpdate: "config_option_update",
-        configOptions: this.configOptionsState(session.model, session.thoughtLevel),
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
       },
     });
-    return {};
   }
 
   /**
-   * Build the `thought_level` SessionConfigOption for the given model. The
-   * available levels depend on the model (see {@link getThoughtLevels}).
+   * Build the SessionConfigOptions we advertise: `thought_level` (levels depend
+   * on the model, see {@link getThoughtLevels}), `mode`, and `model`.
+   *
+   * The `mode` option mirrors {@link modesState} as a `category: "mode"`
+   * selector. Clients that render config options (Zed) suppress the legacy mode
+   * selector once any config option is advertised, so the permission mode would
+   * otherwise be unreachable from their UI. `currentMode` is always read from
+   * the live session state, so a mode set through `session/set_mode` shows up
+   * here too.
+   *
+   * The `model` option mirrors {@link modelsState} as a `category: "model"`
+   * selector for the same reason: clients that render config options suppress
+   * the legacy model selector too, so the active model would otherwise be
+   * unreachable. `currentModel` is read from the live session state, so a model
+   * set through `session/set_model` shows up here as well.
    */
   private configOptionsState(
     model: string,
-    thoughtLevel: ThoughtLevel
+    thoughtLevel: ThoughtLevel,
+    currentMode: SessionModeId
   ): SessionConfigOption[] {
     const levels = getThoughtLevels(model);
+    const modelOptions = availableModelsWith(model);
     return [
       {
         id: "thought_level",
@@ -422,6 +487,30 @@ export class GlmAcpAgent implements Agent {
           name: THOUGHT_LEVEL_NAMES[level],
         })),
       },
+      {
+        id: "mode",
+        name: "Mode",
+        description: "Tool permission mode",
+        category: "mode",
+        type: "select" as const,
+        currentValue: currentMode,
+        options: SESSION_MODES.map((mode) => ({
+          value: mode.id,
+          name: mode.name,
+        })),
+      },
+      {
+        id: "model",
+        name: "Model",
+        description: "GLM model for this session",
+        category: "model",
+        type: "select" as const,
+        currentValue: model,
+        options: modelOptions.map((m) => ({
+          value: m.modelId,
+          name: m.name,
+        })),
+      },
     ];
   }
 
@@ -431,6 +520,47 @@ export class GlmAcpAgent implements Agent {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
+    }
+    if (params.configId === "mode") {
+      // Same reject-don't-coerce policy as thought_level below.
+      if (!isSessionModeId(params.value)) {
+        throw new Error(`Invalid mode value: ${String(params.value)}`);
+      }
+      session.mode = params.value;
+      session.updatedAt = new Date().toISOString();
+      this.persistSession(params.sessionId, session);
+      // Mirror setSessionMode so clients tracking the ACP mode state (rather
+      // than the config option) stay in sync with the dropdown.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: session.mode,
+        },
+      });
+      return {
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
+      };
+    }
+    if (params.configId === "model") {
+      // Same reject-don't-coerce policy as thought_level below, but only for
+      // values that aren't model ids at all. Uncatalogued ids are allowed on
+      // purpose, mirroring unstable_setSessionModel / ACP_GLM_MODEL.
+      if (typeof params.value !== "string" || params.value.length === 0) {
+        throw new Error(`Invalid model value: ${String(params.value)}`);
+      }
+      await this.applySessionModel(params.sessionId, session, params.value);
+      return {
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
+      };
     }
     if (params.configId !== "thought_level") {
       throw new Error(`Unknown config option: ${params.configId}`);
@@ -448,7 +578,11 @@ export class GlmAcpAgent implements Agent {
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);
     return {
-      configOptions: this.configOptionsState(session.model, session.thoughtLevel),
+      configOptions: this.configOptionsState(
+        session.model,
+        session.thoughtLevel,
+        session.mode
+      ),
     };
   }
 
@@ -466,14 +600,7 @@ export class GlmAcpAgent implements Agent {
     availableModels: ModelInfo[];
     currentModelId: string;
   } {
-    const available = getAvailableModels();
-    if (available.some((m) => m.modelId === currentModelId)) {
-      return { availableModels: available, currentModelId };
-    }
-    return {
-      availableModels: [...available, { modelId: currentModelId, name: currentModelId }],
-      currentModelId,
-    };
+    return { availableModels: availableModelsWith(currentModelId), currentModelId };
   }
 
   /** Build the SessionModeState we advertise on session create/load/resume/fork. */
@@ -482,23 +609,7 @@ export class GlmAcpAgent implements Agent {
     currentModeId: SessionModeId;
   } {
     return {
-      availableModes: [
-        {
-          id: "default",
-          name: "Ask for permission",
-          description: "Prompt before edits and commands.",
-        },
-        {
-          id: "accept_edits",
-          name: "Auto-approve edits",
-          description: "Edits run without prompting. Commands still prompt.",
-        },
-        {
-          id: "bypass_permissions",
-          name: "Bypass all permissions",
-          description: "Edits and commands run without prompting.",
-        },
-      ],
+      availableModes: SESSION_MODES.map((mode) => ({ ...mode })),
       currentModeId,
     };
   }
@@ -510,13 +621,12 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
-    const validModeIds: SessionModeId[] = ["default", "accept_edits", "bypass_permissions"];
-    if (!validModeIds.includes(params.modeId as SessionModeId)) {
+    if (!isSessionModeId(params.modeId)) {
       throw new Error(
-        `Invalid modeId: ${params.modeId}. Valid modes are: ${validModeIds.join(", ")}`
+        `Invalid modeId: ${params.modeId}. Valid modes are: ${SESSION_MODE_IDS.join(", ")}`
       );
     }
-    const newMode = params.modeId as SessionModeId;
+    const newMode = params.modeId;
     session.mode = newMode;
     session.updatedAt = new Date().toISOString();
     this.persistSession(params.sessionId, session);
@@ -525,6 +635,20 @@ export class GlmAcpAgent implements Agent {
       update: {
         sessionUpdate: "current_mode_update",
         currentModeId: newMode,
+      },
+    });
+    // Config options are a separate state channel: re-publish them so a mode
+    // dropdown (category "mode") doesn't keep a stale currentValue when the
+    // mode changes through the classic ACP path.
+    await safeSessionUpdate(this.connection, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: this.configOptionsState(
+          session.model,
+          session.thoughtLevel,
+          session.mode
+        ),
       },
     });
     return {};
@@ -769,7 +893,11 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
+      configOptions: this.configOptionsState(
+        restored.model,
+        restored.thoughtLevel,
+        restored.mode
+      ),
     };
   }
 
@@ -807,7 +935,11 @@ export class GlmAcpAgent implements Agent {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
       modes: this.modesState(forked.mode),
-      configOptions: this.configOptionsState(forked.model, forked.thoughtLevel),
+      configOptions: this.configOptionsState(
+        forked.model,
+        forked.thoughtLevel,
+        forked.mode
+      ),
     };
   }
 
@@ -839,7 +971,11 @@ export class GlmAcpAgent implements Agent {
     return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(restored.model, restored.thoughtLevel),
+      configOptions: this.configOptionsState(
+        restored.model,
+        restored.thoughtLevel,
+        restored.mode
+      ),
     };
   }
 
@@ -1298,6 +1434,20 @@ function stringifyUserMessage(content: unknown): string {
     })
     .filter((text) => text.length > 0)
     .join("\n");
+}
+
+/**
+ * The advertised model list, always including `currentModelId` — a session
+ * restored from disk can be pinned to a de-listed id (`glm-5.2` was the
+ * previous default), and `ACP_GLM_MODEL` / `session/set_model` / the `model`
+ * config option all accept uncatalogued ids on purpose. Dropping the active id
+ * from the list would leave pickers unable to represent the selection in use.
+ */
+function availableModelsWith(currentModelId: string): ModelInfo[] {
+  const available = getAvailableModels();
+  return available.some((m) => m.modelId === currentModelId)
+    ? available
+    : [...available, { modelId: currentModelId, name: currentModelId }];
 }
 
 /**
