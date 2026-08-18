@@ -20,7 +20,11 @@ const args = process.argv.slice(2);
 /** Parse `--max-turns <n>` (or `--max-turns=<n>`) from the CLI args. */
 function parseMaxTurnsFlag(argv: string[]): number | undefined {
   const idx = argv.indexOf("--max-turns");
-  if (idx !== -1 && idx + 1 < argv.length) {
+  if (idx !== -1) {
+    if (idx + 1 >= argv.length) {
+      process.stderr.write("glm-acp-agent: --max-turns requires a value\n");
+      return undefined;
+    }
     const parsed = Number(argv[idx + 1]);
     if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
     process.stderr.write(
