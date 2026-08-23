@@ -9,11 +9,19 @@ interface FakeChild extends EventEmitter {
   stdout: Readable;
   stderr: Readable;
   pid: number;
+  exitCode: number | null;
   kill: (signal?: string) => boolean;
 }
 
-function makeFakeChild(): { child: FakeChild; written: string[]; pushStdout: (line: string) => void } {
+function makeFakeChild(): {
+  child: FakeChild;
+  written: string[];
+  pushStdout: (line: string) => void;
+  pushStderr: (line: string) => void;
+  getKillCount: () => number;
+} {
   const written: string[] = [];
+  let killCount = 0;
   const stdin = new Writable({
     write(chunk, _enc, cb) {
       written.push(chunk.toString("utf8"));
@@ -27,10 +35,15 @@ function makeFakeChild(): { child: FakeChild; written: string[]; pushStdout: (li
     stdout,
     stderr,
     pid: 4242,
-    kill: () => true,
+    exitCode: null,
+    kill: () => {
+      killCount += 1;
+      return true;
+    },
   }) as FakeChild;
   const pushStdout = (line: string) => stdout.push(line);
-  return { child, written, pushStdout };
+  const pushStderr = (line: string) => stderr.push(line);
+  return { child, written, pushStdout, pushStderr, getKillCount: () => killCount };
 }
 
 test("StdioVisionMcpClient initializes once and forwards tools/call", async () => {
@@ -107,6 +120,191 @@ test("StdioVisionMcpClient explains a missing npx as an actionable error", async
     () => client.callTool("image_analysis", { image_source: "x" }),
     /npx.*not found/i
   );
+});
+
+test("StdioVisionMcpClient rejects an asynchronous spawn error instead of hanging", async () => {
+  const { child } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "x" });
+
+  await new Promise((r) => setImmediate(r));
+  child.emit("error", Object.assign(new Error("spawn npx ENOENT"), { code: "ENOENT" }));
+
+  await assert.rejects(callPromise, /could not launch npx/i);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient times out initialization and terminates the child", async () => {
+  const { child, getKillCount } = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => child as never,
+    initializationTimeoutMs: 50,
+  });
+
+  await assert.rejects(
+    () => client.callTool("image_analysis", { image_source: "x" }),
+    /timed out after \d+ms/i,
+  );
+  assert.equal(getKillCount(), 1);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient aborts initialization and terminates the child", async () => {
+  const { child, getKillCount } = makeFakeChild();
+  const controller = new AbortController();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "x" }, controller.signal);
+
+  await new Promise((r) => setImmediate(r));
+  controller.abort();
+
+  await assert.rejects(callPromise, /Vision MCP call cancelled/i);
+  assert.equal(getKillCount(), 1);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient keeps shared initialization alive for another caller", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const controller = new AbortController();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const cancelledCall = client.callTool("image_analysis", { image_source: "cancelled" }, controller.signal);
+  const survivingCall = client.callTool("image_analysis", { image_source: "surviving" });
+
+  await new Promise((r) => setImmediate(r));
+  controller.abort();
+  await assert.rejects(cancelledCall, /Vision MCP call cancelled/i);
+  assert.equal(getKillCount(), 0);
+
+  const initBody = JSON.parse(written[0]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: initBody.id, result: { protocolVersion: "2025-06-18" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const toolsListBody = JSON.parse(written[2]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: toolsListBody.id, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const callBody = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; params: { arguments: { image_source: string } } };
+  assert.equal(callBody.params.arguments.image_source, "surviving");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+
+  await assert.doesNotReject(survivingCall);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient does not kill an initialized server when a caller aborts", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const firstCall = client.callTool("image_analysis", { image_source: "first" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 3, result: { content: [{ type: "text", text: "first ok" }] } }) + "\n");
+  await assert.doesNotReject(firstCall);
+
+  const controller = new AbortController();
+  const cancelledCall = client.callTool("image_analysis", { image_source: "cancelled" }, controller.signal);
+  controller.abort();
+  await assert.rejects(cancelledCall, /Vision MCP call cancelled|aborted/i);
+  assert.equal(getKillCount(), 0);
+
+  const survivingCall = client.callTool("image_analysis", { image_source: "surviving" });
+  await new Promise((r) => setImmediate(r));
+  const callBody = JSON.parse(written.at(-1)?.trim() ?? "{}") as { id: number; params: { arguments: { image_source: string } } };
+  assert.equal(callBody.params.arguments.image_source, "surviving");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "still ok" }] } }) + "\n");
+  await assert.doesNotReject(survivingCall);
+
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient launches npx through cmd.exe on Windows", async () => {
+  const { child } = makeFakeChild();
+  let command = "";
+  let args: string[] = [];
+  let windowsHide = false;
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    platform: "win32",
+    comSpec: "C:\\Windows\\System32\\cmd.exe",
+    spawn: (capturedCommand, capturedArgs, options) => {
+      command = capturedCommand;
+      args = capturedArgs;
+      windowsHide = options.windowsHide === true;
+      return child as never;
+    },
+  });
+  const callPromise = client.callTool("image_analysis", { image_source: "x" });
+
+  await new Promise((r) => setImmediate(r));
+  child.emit("error", new Error("test stop"));
+  await assert.rejects(callPromise, /test stop/i);
+
+  assert.equal(command, "C:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(args.slice(0, 5), ["/d", "/s", "/c", "npx", "-y"]);
+  assert.equal(windowsHide, true);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient rejects unsafe Windows package specs before spawning", async () => {
+  let spawned = false;
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    platform: "win32",
+    packageSpec: "@z_ai/mcp-server@latest & echo injected",
+    spawn: () => {
+      spawned = true;
+      return makeFakeChild().child as never;
+    },
+  });
+
+  await assert.rejects(
+    () => client.callTool("image_analysis", { image_source: "x" }),
+    /unsafe npm package spec/i,
+  );
+  assert.equal(spawned, false);
+});
+
+test("StdioVisionMcpClient terminates the Windows process tree on dispose", async () => {
+  const { child, getKillCount } = makeFakeChild();
+  let terminatedPid: number | undefined;
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    platform: "win32",
+    spawn: () => child as never,
+    killProcessTree: (pid) => {
+      terminatedPid = pid;
+      return true;
+    },
+  });
+  const callPromise = client.callTool("image_analysis", { image_source: "x" });
+
+  await new Promise((r) => setImmediate(r));
+  await client.dispose();
+
+  await assert.rejects(callPromise, /client disposed/i);
+  assert.equal(terminatedPid, 4242);
+  assert.equal(getKillCount(), 0);
+});
+
+test("StdioVisionMcpClient drains and redacts stderr on failure", async () => {
+  const apiKey = "secret-vision-key";
+  const { child, pushStderr } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey, spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "x" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStderr(`provider failed for ${apiKey}\n`);
+  child.emit("exit", 1, null);
+
+  await assert.rejects(callPromise, (error: Error) => {
+    assert.match(error.message, /stderr: provider failed/);
+    assert.match(error.message, /\[REDACTED\]/);
+    assert.doesNotMatch(error.message, new RegExp(apiKey));
+    return true;
+  });
+  await client.dispose();
 });
 
 test("StdioVisionMcpClient resolves tool name via keyword fallback when server uses a different name", async () => {
