@@ -32,7 +32,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; the advertised coding models route pasted ACP image blocks through Z.AI Vision MCP (`@z_ai/mcp-server`), while `glm-5v-turbo` sessions — opt-in via `ACP_GLM_AVAILABLE_MODELS`, since it is no longer on the Coding Plan allowlist — send supported image parts directly to the model. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
-- **Six built-in tools** (see below)
+- **Seven built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
 - **Configurable permissions** – `write_file` and `run_command` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
