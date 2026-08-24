@@ -1,8 +1,18 @@
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { McpServer, McpServerHttp, McpServerStdio } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "./definitions.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+/** Generous: a cold `npx -y` fetch on Windows Defender can take well over a minute. */
+const DEFAULT_INITIALIZATION_TIMEOUT_MS = 120_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const STDERR_TAIL_LIMIT = 16_384;
+const STDERR_MESSAGE_LIMIT = 2_000;
+/** Extensionless launchers that resolve to a `.cmd` shim on Windows, which Node cannot spawn directly. */
+const WINDOWS_SHIM_COMMANDS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
+/** Characters cmd.exe treats specially; any of them in a client-supplied token is a launch injection risk. */
+const CMD_METACHARACTERS = /[&|<>^"%!\r\n\0]/;
+const SECRET_ENV_NAME = /key|token|secret|password|passwd|pwd|credential|auth|cookie/i;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -258,23 +268,51 @@ class HttpMcpClient implements ConnectedMcpClient {
   }
 }
 
-class StdioMcpClient implements ConnectedMcpClient {
+export interface StdioMcpClientOptions {
+  /** Maximum time for the MCP handshake (spawn + initialize). Generous by default for cold `npx -y` fetches. */
+  initializationTimeoutMs?: number;
+  /** Maximum time for an individual JSON-RPC request. */
+  requestTimeoutMs?: number;
+  /** Platform override for tests. */
+  platform?: NodeJS.Platform;
+  /** Windows command interpreter override for tests. */
+  comSpec?: string;
+  /** Windows process-tree terminator override for tests. */
+  killProcessTree?: (pid: number) => boolean;
+  /** Override the spawn function for tests. */
+  spawn?: (
+    command: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; windowsHide?: boolean }
+  ) => ChildProcessWithoutNullStreams;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  label: string;
+}
+
+export class StdioMcpClient implements ConnectedMcpClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private initialized: Promise<void> | null = null;
+  private initializingChild: ChildProcessWithoutNullStreams | null = null;
+  private initializationWaiters = 0;
   private nextId = 1;
-  private pending = new Map<
-    number,
-    {
-      resolve: (value: unknown) => void;
-      reject: (reason: Error) => void;
-      label: string;
-    }
-  >();
+  private pending = new Map<number, PendingRequest>();
   private buffer = "";
+  private stderrTail = "";
   private exited = false;
   private exitReason: string | null = null;
+  private disposed = false;
+  private readonly secrets: string[];
 
-  constructor(private server: McpServerStdio) {}
+  constructor(
+    private server: McpServerStdio,
+    private opts: StdioMcpClientOptions = {}
+  ) {
+    this.secrets = collectSecretEnvValues(server);
+  }
 
   async listTools(): Promise<McpTool[]> {
     await this.ensureInitialized();
@@ -282,106 +320,268 @@ class StdioMcpClient implements ConnectedMcpClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    await this.ensureInitialized();
+    if (signal?.aborted) throw new Error(`MCP ${this.server.name} call cancelled`);
+    await this.awaitInitialization(signal);
     return this.request("tools/call", { name, arguments: args }, `tools/call ${name}`, signal);
   }
 
   async dispose(): Promise<void> {
-    if (this.child && !this.exited) {
-      try {
-        this.child.kill();
-      } catch {
-        // ignore
-      }
-    }
+    const child = this.child;
+    this.disposed = true;
     this.child = null;
     this.initialized = null;
-    for (const [, pending] of this.pending) {
-      pending.reject(new Error("MCP client disposed"));
-    }
-    this.pending.clear();
+    this.initializingChild = null;
+    this.exited = true;
+    this.exitReason = "client disposed";
+    if (child) this.terminateChild(child);
+    this.rejectAllPending(new Error("cancelled (client disposed)"));
   }
 
-  private async ensureInitialized(): Promise<void> {
-    if (this.initialized) return this.initialized;
-    this.initialized = this.startAndInitialize();
+  /**
+   * Wait for the shared handshake without letting one caller's abort tear it down for the others:
+   * the child is only killed when the aborting caller is the last one still waiting on it.
+   */
+  private async awaitInitialization(signal?: AbortSignal): Promise<void> {
+    const initialization = this.ensureInitialized();
+    const waiting = this.initializingChild !== null;
+    if (waiting) this.initializationWaiters += 1;
     try {
-      await this.initialized;
+      await waitForAbort(initialization, signal, `MCP ${this.server.name} call cancelled`);
     } catch (err) {
-      this.initialized = null;
+      const child = this.initializingChild;
+      if (signal?.aborted && waiting && this.initializationWaiters === 1 && child) {
+        this.failConnection(new Error("initialization aborted"), child, true);
+      }
+      throw err;
+    } finally {
+      if (waiting) this.initializationWaiters -= 1;
+    }
+  }
+
+  private ensureInitialized(): Promise<void> {
+    if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
+    if (this.initialized && this.child && !this.exited) return this.initialized;
+    const initialization = this.startAndInitialize();
+    this.initialized = initialization;
+    void initialization.catch(() => {
+      if (this.initialized === initialization) this.initialized = null;
+    });
+    return initialization;
+  }
+
+  private async startAndInitialize(): Promise<void> {
+    const { command, args } = this.resolveLaunch();
+    const spawnFn = this.opts.spawn ?? nodeSpawn;
+    this.exited = false;
+    this.exitReason = null;
+    this.buffer = "";
+    this.stderrTail = "";
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawnFn(command, args, { env: buildStdioEnv(this.server), windowsHide: true });
+    } catch (err) {
+      throw this.launchError(err as NodeJS.ErrnoException);
+    }
+    this.child = child;
+    this.initializingChild = child;
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (this.child === child) this.handleStdout(chunk);
+    });
+    // Drain stderr even when we never read it: an undrained pipe eventually blocks the child.
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      if (this.child === child) this.handleStderr(chunk);
+    });
+    child.on("exit", (code, sig) => {
+      this.failConnection(new Error(`server exited (exit code=${code} signal=${sig ?? "(none)"}).`), child, false);
+    });
+    child.on("error", (err) => {
+      this.failConnection(this.launchError(err as NodeJS.ErrnoException), child, true);
+    });
+
+    const deadline = Date.now() + (this.opts.initializationTimeoutMs ?? DEFAULT_INITIALIZATION_TIMEOUT_MS);
+    try {
+      await this.request(
+        "initialize",
+        {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
+        },
+        "initialize",
+        undefined,
+        Math.max(1, deadline - Date.now())
+      );
+      this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      if (this.initializingChild === child) this.initializingChild = null;
+    } catch (err) {
+      this.failConnection(err instanceof Error ? err : new Error(String(err)), child, true);
       throw err;
     }
   }
 
-  private async startAndInitialize(): Promise<void> {
-    try {
-      this.child = nodeSpawn(this.server.command, this.server.args, {
-        env: buildStdioEnv(this.server),
-      });
-    } catch (err) {
-      throw new Error(`MCP ${this.server.name} startup failed: ${(err as Error).message}`, {
-        cause: err,
-      });
+  /**
+   * Windows cannot `spawn` a `.cmd`/`.bat` shim directly (bare `npx` yields async ENOENT,
+   * `npx.cmd` yields EINVAL), so those go through `cmd.exe /d /s /c`. Because the command and
+   * args are client-supplied, every token routed through cmd.exe is validated first — we reject
+   * rather than try to escape.
+   */
+  private resolveLaunch(): { command: string; args: string[] } {
+    const platform = this.opts.platform ?? process.platform;
+    const command = this.server.command;
+    const args = [...this.server.args];
+    if (platform !== "win32" || !needsWindowsShim(command)) {
+      return { command, args };
     }
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
-    this.child.on("exit", (code, sig) => {
-      this.exited = true;
-      this.exitReason = `exit code=${code} signal=${sig ?? "(none)"}`;
-      for (const [, pending] of this.pending) {
-        pending.reject(new Error(`server exited (${this.exitReason}).`));
+    for (const token of [command, ...args]) {
+      if (CMD_METACHARACTERS.test(token)) {
+        throw new Error(
+          `MCP ${this.server.name} startup failed: unsafe token for the cmd.exe launch of \`${command}\` ` +
+            `(contains a shell metacharacter): ${token}`
+        );
       }
-      this.pending.clear();
-    });
-    this.child.on("error", (err) => {
-      this.exited = true;
-      this.exitReason = err.message;
-    });
+    }
+    const comSpec = this.opts.comSpec ?? process.env["ComSpec"] ?? "cmd.exe";
+    return { command: comSpec, args: ["/d", "/s", "/c", command, ...args] };
+  }
 
-    await this.request(
-      "initialize",
-      {
-        protocolVersion: MCP_PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
-      },
-      "initialize"
-    );
-    this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  private launchError(err: NodeJS.ErrnoException): Error {
+    if (err.code === "ENOENT") {
+      return new Error(
+        `MCP ${this.server.name} failed: could not launch \`${this.server.command}\`. ` +
+          `Ensure it is installed and available on PATH.`,
+        { cause: err }
+      );
+    }
+    if (err.code === "EINVAL") {
+      return new Error(
+        `MCP ${this.server.name} failed: could not launch \`${this.server.command}\` (EINVAL). ` +
+          `On Windows a .cmd/.bat launcher must be started through cmd.exe.`,
+        { cause: err }
+      );
+    }
+    return new Error(`MCP ${this.server.name} process error: ${err.message}`, { cause: err });
   }
 
   private request(
     method: string,
     params: Record<string, unknown>,
     label: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    timeoutMs = this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
-      this.pending.set(id, {
-        label,
-        resolve,
-        reject: (err) => reject(new Error(`MCP ${this.server.name} ${label} failed: ${err.message}`)),
-      });
+      let settled = false;
       const onAbort = () => {
         const pending = this.pending.get(id);
         if (!pending) return;
         this.pending.delete(id);
         pending.reject(new Error("aborted"));
       };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const settle = (fn: (value: unknown) => void, value: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      this.pending.set(id, {
+        label,
+        resolve: (value) => settle(resolve, value),
+        reject: (err) =>
+          settle(reject, new Error(`MCP ${this.server.name} ${label} failed: ${this.withStderr(err.message)}`)),
+      });
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        const timeout = new Error(`request timed out after ${timeoutMs}ms`);
+        const child = this.child;
+        if (child) {
+          this.failConnection(timeout, child, true);
+          return;
+        }
+        this.pending.delete(id);
+        pending.reject(timeout);
+      }, timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       try {
         this.send({ jsonrpc: "2.0", id, method, params });
       } catch (err) {
+        const pending = this.pending.get(id);
         this.pending.delete(id);
-        reject(new Error(`MCP ${this.server.name} ${label} failed: ${(err as Error).message}`));
+        pending?.reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }
 
+  private rejectAllPending(error: Error): void {
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    for (const request of pending) request.reject(error);
+  }
+
+  /** Tear the connection down once and propagate the reason into every in-flight request. */
+  private failConnection(error: Error, child: ChildProcessWithoutNullStreams, kill: boolean): void {
+    if (this.child !== child || this.exited) return;
+    this.child = null;
+    if (this.initializingChild === child) this.initializingChild = null;
+    this.exited = true;
+    this.exitReason = error.message;
+    this.initialized = null;
+    this.rejectAllPending(error);
+    if (kill) this.terminateChild(child);
+  }
+
+  private terminateChild(child: ChildProcessWithoutNullStreams): void {
+    const platform = this.opts.platform ?? process.platform;
+    // `child.kill()` only reaches cmd.exe, orphaning the npx -> node tree underneath it.
+    if (platform === "win32" && child.pid && child.exitCode === null && (!this.opts.spawn || this.opts.killProcessTree)) {
+      try {
+        const killed = this.opts.killProcessTree
+          ? this.opts.killProcessTree(child.pid)
+          : nodeSpawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+              stdio: "ignore",
+              windowsHide: true,
+            }).status === 0;
+        if (killed) return;
+      } catch {
+        // fall back to the direct child below
+      }
+    }
+    try {
+      child.kill();
+    } catch {
+      // ignore
+    }
+  }
+
+  private handleStderr(chunk: string): void {
+    const tail = chunk.length >= STDERR_TAIL_LIMIT ? chunk.slice(-STDERR_TAIL_LIMIT) : this.stderrTail + chunk;
+    this.stderrTail = tail.slice(-STDERR_TAIL_LIMIT);
+  }
+
+  private withStderr(message: string): string {
+    let stderr = this.stderrTail.trim();
+    if (!stderr) return message;
+    for (const secret of this.secrets) stderr = stderr.split(secret).join("[REDACTED]");
+    stderr = stderr.replace(/\s+/g, " ").slice(-STDERR_MESSAGE_LIMIT);
+    return `${message}; stderr: ${stderr}`;
+  }
+
   private send(message: Record<string, unknown>): void {
     if (!this.child || this.exited) {
-      throw new Error(`MCP server is not running${this.exitReason ? ` (${this.exitReason})` : ""}.`);
+      throw new Error(`MCP ${this.server.name} server is not running${this.exitReason ? ` (${this.exitReason})` : ""}.`);
     }
     this.child.stdin.write(JSON.stringify(message) + "\n");
   }
@@ -410,6 +610,38 @@ class StdioMcpClient implements ConnectedMcpClient {
       }
     }
   }
+}
+
+function needsWindowsShim(command: string): boolean {
+  const base = command.replace(/^.*[\\/]/, "").toLowerCase();
+  return WINDOWS_SHIM_COMMANDS.has(base) || base.endsWith(".cmd") || base.endsWith(".bat");
+}
+
+function collectSecretEnvValues(server: McpServerStdio): string[] {
+  return server.env
+    .filter((entry) => SECRET_ENV_NAME.test(entry.name) && entry.value.length >= 4)
+    .map((entry) => entry.value)
+    .sort((a, b) => b.length - a.length);
+}
+
+function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error(message));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const settle = (fn: (value: never) => void, value: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      (fn as (value: unknown) => void)(value);
+    };
+    const onAbort = () => settle(reject as (value: never) => void, new Error(message));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => settle(resolve as (value: never) => void, value),
+      (error) => settle(reject as (value: never) => void, error)
+    );
+  });
 }
 
 function buildStdioEnv(server: McpServerStdio): NodeJS.ProcessEnv {
