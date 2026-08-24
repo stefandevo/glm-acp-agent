@@ -12,7 +12,9 @@ const STDERR_MESSAGE_LIMIT = 2_000;
 const WINDOWS_SHIM_COMMANDS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
 /** Characters cmd.exe treats specially; any of them in a client-supplied token is a launch injection risk. */
 const CMD_METACHARACTERS = /[&|<>^"%!\r\n\0]/;
-const SECRET_ENV_NAME = /key|token|secret|password|passwd|credential|auth|cookie/i;
+const SECRET_ENV_NAME = /key|token|secret|password|passwd|pwd|credential|auth|cookie/i;
+/** Exact names that match SECRET_ENV_NAME but are never credentials — exempt these, not the substring. */
+const NON_SECRET_ENV_NAMES = new Set(["PWD", "OLDPWD"]);
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -627,6 +629,7 @@ function taskkillTree(pid: number): boolean {
 function collectSecretEnvValues(env: NodeJS.ProcessEnv): string[] {
   const values = new Set<string>();
   for (const [name, value] of Object.entries(env)) {
+    if (NON_SECRET_ENV_NAMES.has(name.toUpperCase())) continue;
     if (value && value.length >= 4 && SECRET_ENV_NAME.test(name)) values.add(value);
   }
   // Longest first, so a secret that contains another is replaced before its substring.
