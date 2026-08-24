@@ -288,6 +288,32 @@ test("StdioMcpClient drains stderr and redacts secret env values on failure", as
   await client.dispose();
 });
 
+test("StdioMcpClient redacts inherited environment secrets from stderr", async () => {
+  const inherited = "inherited-parent-credential";
+  process.env["GLM_TEST_UPSTREAM_TOKEN"] = inherited;
+  try {
+    const { child, pushStderr } = makeFakeChild();
+    const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+    const listPromise = client.listTools();
+
+    await tick();
+    // The child inherits process.env, so a parent-held credential can reach its stderr.
+    pushStderr(`upstream rejected ${inherited} in ${process.cwd()}\n`);
+    child.emit("exit", 1, null);
+
+    await assert.rejects(listPromise, (error: Error) => {
+      assert.match(error.message, /\[REDACTED\]/);
+      assert.doesNotMatch(error.message, new RegExp(inherited));
+      // PWD-style vars must not be treated as secrets, or every diagnostic loses its cwd.
+      assert.match(error.message, new RegExp(process.cwd().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      return true;
+    });
+    await client.dispose();
+  } finally {
+    delete process.env["GLM_TEST_UPSTREAM_TOKEN"];
+  }
+});
+
 test("StdioMcpClient terminates the Windows process tree on dispose", async () => {
   const { child, getKillCount } = makeFakeChild();
   let terminatedPid: number | undefined;
