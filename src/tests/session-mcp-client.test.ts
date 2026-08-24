@@ -140,6 +140,7 @@ test("StdioMcpClient launches npx through cmd.exe on Windows", async () => {
   const client = new StdioMcpClient(stdioServer(), {
     platform: "win32",
     comSpec: "C:\\Windows\\System32\\cmd.exe",
+    killProcessTree: () => true,
     spawn: (capturedCommand, capturedArgs, options) => {
       command = capturedCommand;
       args = capturedArgs;
@@ -165,6 +166,7 @@ test("StdioMcpClient launches a .cmd shim through cmd.exe on Windows", async () 
   const client = new StdioMcpClient(stdioServer({ command: "C:\\tools\\mcp-docs.cmd", args: ["--stdio"] }), {
     platform: "win32",
     comSpec: "cmd.exe",
+    killProcessTree: () => true,
     spawn: (_command, capturedArgs) => {
       args = capturedArgs;
       return child as never;
@@ -187,6 +189,7 @@ test("StdioMcpClient spawns a real executable directly on Windows", async () => 
   const client = new StdioMcpClient(stdioServer({ command: "node", args: ["server.js"] }), {
     platform: "win32",
     comSpec: "cmd.exe",
+    killProcessTree: () => true,
     spawn: (capturedCommand, capturedArgs) => {
       command = capturedCommand;
       args = capturedArgs;
@@ -332,6 +335,51 @@ test("StdioMcpClient keeps a shared initialization alive when one caller aborts"
   pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [] } }) + "\n");
 
   await assert.doesNotReject(survivingCall);
+  await client.dispose();
+});
+
+test("StdioMcpClient does not kill an initialized server when a caller aborts", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const listPromise = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await listPromise;
+
+  const controller = new AbortController();
+  const cancelledCall = client.callTool("search", { q: "cancelled" }, controller.signal);
+  controller.abort();
+  await assert.rejects(cancelledCall, /cancelled|aborted/i);
+  assert.equal(getKillCount(), 0);
+
+  // The server is still usable for the next caller.
+  const survivingCall = client.callTool("search", { q: "surviving" });
+  await tick();
+  const callBody = JSON.parse(written.at(-1)?.trim() ?? "{}") as {
+    id: number;
+    params: { arguments: { q: string } };
+  };
+  assert.equal(callBody.params.arguments.q, "surviving");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [] } }) + "\n");
+  await assert.doesNotReject(survivingCall);
+
+  await client.dispose();
+});
+
+test("StdioMcpClient keeps a shared initialization alive for a concurrent listTools", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const controller = new AbortController();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+
+  const cancelledCall = client.callTool("search", { q: "cancelled" }, controller.signal);
+  const listPromise = client.listTools();
+
+  await tick();
+  controller.abort();
+  await assert.rejects(cancelledCall, /cancelled/i);
+  assert.equal(getKillCount(), 0);
+
+  await completeHandshake(written, pushStdout);
+  assert.deepEqual(await listPromise, [{ name: "search", description: undefined, inputSchema: undefined }]);
   await client.dispose();
 });
 

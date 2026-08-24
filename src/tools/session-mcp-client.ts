@@ -290,7 +290,6 @@ export interface StdioMcpClientOptions {
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
-  label: string;
 }
 
 export class StdioMcpClient implements ConnectedMcpClient {
@@ -306,16 +305,20 @@ export class StdioMcpClient implements ConnectedMcpClient {
   private exitReason: string | null = null;
   private disposed = false;
   private readonly secrets: string[];
+  private readonly killProcessTree: (pid: number) => boolean;
 
   constructor(
     private server: McpServerStdio,
     private opts: StdioMcpClientOptions = {}
   ) {
     this.secrets = collectSecretEnvValues(server);
+    this.killProcessTree = opts.killProcessTree ?? taskkillTree;
   }
 
   async listTools(): Promise<McpTool[]> {
-    await this.ensureInitialized();
+    // Counted as an initialization waiter too, so a concurrent callTool abort cannot
+    // tear down the handshake this call is still waiting on.
+    await this.awaitInitialization();
     return extractTools(await this.request("tools/list", {}, "tools/list"));
   }
 
@@ -493,7 +496,6 @@ export class StdioMcpClient implements ConnectedMcpClient {
         fn(value);
       };
       this.pending.set(id, {
-        label,
         resolve: (value) => settle(resolve, value),
         reject: (err) =>
           settle(reject, new Error(`MCP ${this.server.name} ${label} failed: ${this.withStderr(err.message)}`)),
@@ -546,15 +548,9 @@ export class StdioMcpClient implements ConnectedMcpClient {
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
     const platform = this.opts.platform ?? process.platform;
     // `child.kill()` only reaches cmd.exe, orphaning the npx -> node tree underneath it.
-    if (platform === "win32" && child.pid && child.exitCode === null && (!this.opts.spawn || this.opts.killProcessTree)) {
+    if (platform === "win32" && child.pid && child.exitCode === null) {
       try {
-        const killed = this.opts.killProcessTree
-          ? this.opts.killProcessTree(child.pid)
-          : nodeSpawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-              stdio: "ignore",
-              windowsHide: true,
-            }).status === 0;
-        if (killed) return;
+        if (this.killProcessTree(child.pid)) return;
       } catch {
         // fall back to the direct child below
       }
@@ -617,6 +613,14 @@ function needsWindowsShim(command: string): boolean {
   return WINDOWS_SHIM_COMMANDS.has(base) || base.endsWith(".cmd") || base.endsWith(".bat");
 }
 
+/** Windows: kill the whole cmd.exe -> npx -> node tree, not just the interpreter we spawned. */
+function taskkillTree(pid: number): boolean {
+  return nodeSpawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
+    stdio: "ignore",
+    windowsHide: true,
+  }).status === 0;
+}
+
 function collectSecretEnvValues(server: McpServerStdio): string[] {
   return server.env
     .filter((entry) => SECRET_ENV_NAME.test(entry.name) && entry.value.length >= 4)
@@ -629,17 +633,23 @@ function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, m
   if (signal.aborted) return Promise.reject(new Error(message));
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const settle = (fn: (value: never) => void, value: unknown) => {
-      if (settled) return;
+    const claim = (): boolean => {
+      if (settled) return false;
       settled = true;
       signal.removeEventListener("abort", onAbort);
-      (fn as (value: unknown) => void)(value);
+      return true;
     };
-    const onAbort = () => settle(reject as (value: never) => void, new Error(message));
+    const onAbort = () => {
+      if (claim()) reject(new Error(message));
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
-      (value) => settle(resolve as (value: never) => void, value),
-      (error) => settle(reject as (value: never) => void, error)
+      (value) => {
+        if (claim()) resolve(value);
+      },
+      (error) => {
+        if (claim()) reject(error);
+      }
     );
   });
 }
