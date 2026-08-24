@@ -290,7 +290,9 @@ test("StdioMcpClient drains stderr and redacts secret env values on failure", as
 
 test("StdioMcpClient redacts inherited environment secrets from stderr", async () => {
   const inherited = "inherited-parent-credential";
+  const suffixed = "suffixed-db-password";
   process.env["GLM_TEST_UPSTREAM_TOKEN"] = inherited;
+  process.env["GLM_TEST_DB_PWD"] = suffixed;
   try {
     const { child, pushStderr } = makeFakeChild();
     const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
@@ -298,19 +300,22 @@ test("StdioMcpClient redacts inherited environment secrets from stderr", async (
 
     await tick();
     // The child inherits process.env, so a parent-held credential can reach its stderr.
-    pushStderr(`upstream rejected ${inherited} in ${process.cwd()}\n`);
+    pushStderr(`upstream rejected ${inherited} / ${suffixed} in ${process.cwd()}\n`);
     child.emit("exit", 1, null);
 
     await assert.rejects(listPromise, (error: Error) => {
       assert.match(error.message, /\[REDACTED\]/);
       assert.doesNotMatch(error.message, new RegExp(inherited));
-      // PWD-style vars must not be treated as secrets, or every diagnostic loses its cwd.
+      // A `_PWD`-suffixed name is a credential (MYSQL_PWD and friends), not a path.
+      assert.doesNotMatch(error.message, new RegExp(suffixed));
+      // Bare PWD/OLDPWD are exempt, or every diagnostic loses its cwd.
       assert.match(error.message, new RegExp(process.cwd().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       return true;
     });
     await client.dispose();
   } finally {
     delete process.env["GLM_TEST_UPSTREAM_TOKEN"];
+    delete process.env["GLM_TEST_DB_PWD"];
   }
 });
 
