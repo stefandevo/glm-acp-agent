@@ -12,7 +12,7 @@ const STDERR_MESSAGE_LIMIT = 2_000;
 const WINDOWS_SHIM_COMMANDS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
 /** Characters cmd.exe treats specially; any of them in a client-supplied token is a launch injection risk. */
 const CMD_METACHARACTERS = /[&|<>^"%!\r\n\0]/;
-const SECRET_ENV_NAME = /key|token|secret|password|passwd|pwd|credential|auth|cookie/i;
+const SECRET_ENV_NAME = /key|token|secret|password|passwd|credential|auth|cookie/i;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -304,14 +304,13 @@ export class StdioMcpClient implements ConnectedMcpClient {
   private exited = false;
   private exitReason: string | null = null;
   private disposed = false;
-  private readonly secrets: string[];
+  private secrets: string[] = [];
   private readonly killProcessTree: (pid: number) => boolean;
 
   constructor(
     private server: McpServerStdio,
     private opts: StdioMcpClientOptions = {}
   ) {
-    this.secrets = collectSecretEnvValues(server);
     this.killProcessTree = opts.killProcessTree ?? taskkillTree;
   }
 
@@ -375,6 +374,10 @@ export class StdioMcpClient implements ConnectedMcpClient {
   private async startAndInitialize(): Promise<void> {
     const { command, args } = this.resolveLaunch();
     const spawnFn = this.opts.spawn ?? nodeSpawn;
+    // Redact against the env the child actually gets — it inherits process.env, so a
+    // credential the parent holds can surface in the child's stderr.
+    const env = buildStdioEnv(this.server);
+    this.secrets = collectSecretEnvValues(env);
     this.exited = false;
     this.exitReason = null;
     this.buffer = "";
@@ -382,7 +385,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawnFn(command, args, { env: buildStdioEnv(this.server), windowsHide: true });
+      child = spawnFn(command, args, { env, windowsHide: true });
     } catch (err) {
       throw this.launchError(err as NodeJS.ErrnoException);
     }
@@ -621,11 +624,13 @@ function taskkillTree(pid: number): boolean {
   }).status === 0;
 }
 
-function collectSecretEnvValues(server: McpServerStdio): string[] {
-  return server.env
-    .filter((entry) => SECRET_ENV_NAME.test(entry.name) && entry.value.length >= 4)
-    .map((entry) => entry.value)
-    .sort((a, b) => b.length - a.length);
+function collectSecretEnvValues(env: NodeJS.ProcessEnv): string[] {
+  const values = new Set<string>();
+  for (const [name, value] of Object.entries(env)) {
+    if (value && value.length >= 4 && SECRET_ENV_NAME.test(name)) values.add(value);
+  }
+  // Longest first, so a secret that contains another is replaced before its substring.
+  return [...values].sort((a, b) => b.length - a.length);
 }
 
 function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
