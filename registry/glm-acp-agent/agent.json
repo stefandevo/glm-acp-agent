@@ -1,7 +1,7 @@
 {
   "id": "glm-acp-agent",
   "name": "GLM Agent",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": "ACP agent powered by Z.AI / Zhipu AI GLM Coding Plan models (glm-5.3, glm-5.3-flash, glm-5-turbo, glm-4.7). Supports streaming, tool calls, mid-session model switching, thought_level config for reasoning effort, image input via native vision (glm-5.3-flash) or Z.AI Coding Plan Vision MCP, and session load/fork/resume with on-disk persistence.",
   "repository": "https://github.com/stefandevo/glm-acp-agent",
   "authors": [
@@ -11,7 +11,7 @@
   "icon": "icon.svg",
   "distribution": {
     "npx": {
-      "package": "glm-acp-agent@1.6.1"
+      "package": "glm-acp-agent@1.7.0"
     }
   }
 }
