@@ -190,14 +190,15 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 
 | Model | Levels | Mapping to the Z.AI request |
 |-------|--------|-----------------------------|
-| `glm-5.3` / `glm-5.3-flash` (and `glm-5.2` / `glm-5.1`, which route to 5.3) | `Minimal` / `Low` / `Medium` / `High` / `X-High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort` set to the matching value |
+| `glm-5.3` (and `glm-5.2` / `glm-5.1`, which route to 5.3) | `Minimal` / `Low` / `Medium` / `High` / `X-High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort` set to the matching value |
+| `glm-5.3-flash` | `Low` / `High` / `Max` | Same mapping; Z.AI only documents these three levels for Flash |
 | other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
 
 **GLM-5.3 and GLM-5.3-Flash have no `Off` level, because thinking cannot be turned off on them.** Sending `thinking: { type: "disabled" }` now errors (it is no longer a silent no-op), so `ACP_GLM_THINKING=false` leaves thinking enabled rather than sending `disabled`. Use `glm-4.7` if you need non-reasoning completions — with the caveat that if Coding Plan really routes turbo/4.7 to Flash, a session that picks `glm-4.7` + thought level `Off` may 4xx.
 
-`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (an effort-ladder selection reverts to `On` when you move to GLM-4.7, and an `Off` selection becomes `Max` when you move to GLM-5.3 / Flash) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (an effort-ladder selection reverts to `On` when you move to GLM-4.7; an `Off` selection becomes `Max` on GLM-5.3 / Flash; switching from GLM-5.3 onto Flash maps `minimal`→`low`, `medium`→`high`, `xhigh`→`max`) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
 
-The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max`; the agent exposes every one of those values as a thought level except `none`, which the GLM-5.3 family rejects (see above).
+The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max` on GLM-5.3. GLM-5.3-Flash's documented values are only `low | high | max`, so the agent advertises that shorter ladder for Flash. `none` is never offered on either model.
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 

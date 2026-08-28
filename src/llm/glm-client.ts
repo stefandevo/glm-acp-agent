@@ -10,10 +10,11 @@ import { debug, error } from "./logger.js";
  * SessionConfigOption. These map onto Z.AI's `thinking` / `reasoning_effort`
  * request parameters (see {@link buildThinkingParams}).
  *
- * GLM-5.3 (and GLM-5.2, which the Coding Plan endpoint serves with 5.3)
- * supports the full effort ladder: `minimal | low | medium | high | xhigh |
- * max`. Other thinking-capable models (5-turbo, 4.7, …) only distinguish
- * thinking on vs. off, so they use `none` and `on`.
+ * GLM-5.3 (and GLM-5.2 / GLM-5.1, which the Coding Plan endpoint serves with
+ * 5.3) supports the full effort ladder: `minimal | low | medium | high |
+ * xhigh | max`. GLM-5.3-Flash only honours `low | high | max`. Other
+ * thinking-capable models (5-turbo, 4.7, …) only distinguish thinking on vs.
+ * off, so they use `none` and `on`.
  */
 export type ThoughtLevel =
   | "none"
@@ -42,6 +43,13 @@ const LEVELS_REASONING_EFFORT: ThoughtLevel[] = [
   "max",
 ];
 
+/**
+ * GLM-5.3-Flash's advertised ladder. Z.AI's Chat Completions schema for
+ * vision models only accepts `low | high | max`; other values do not provide
+ * the requested effort.
+ */
+const LEVELS_FLASH: ThoughtLevel[] = ["low", "high", "max"];
+
 /** Levels shown for every other thinking-capable model. */
 const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
 
@@ -58,6 +66,10 @@ const LEVELS_DEFAULT: ThoughtLevel[] = ["none", "on"];
 function isReasoningEffortModel(model: string): boolean {
   const id = model.toLowerCase();
   return id.startsWith("glm-5.3") || id.startsWith("glm-5.2") || id.startsWith("glm-5.1");
+}
+
+function isFlashModel(model: string): boolean {
+  return model.toLowerCase() === "glm-5.3-flash";
 }
 
 /** The complete set of thought levels the agent understands. */
@@ -78,8 +90,10 @@ export function isThoughtLevel(value: string): value is ThoughtLevel {
  * Only the GLM-5.3 family honours `reasoning_effort`; on `glm-5-turbo` and
  * `glm-4.7` the endpoint accepts the field without validating it and the
  * response depth does not change, so those models only get on/off.
+ * GLM-5.3-Flash is a 5.3-family model but only the three documented levels.
  */
 export function getThoughtLevels(model: string): ThoughtLevel[] {
+  if (isFlashModel(model)) return LEVELS_FLASH;
   return isReasoningEffortModel(model) ? LEVELS_REASONING_EFFORT : LEVELS_DEFAULT;
 }
 
@@ -87,11 +101,20 @@ export function getThoughtLevels(model: string): ThoughtLevel[] {
  * Resolve a stored ThoughtLevel to one that's valid for the given model.
  * Used when switching models or restoring a persisted session: if the old
  * level isn't in the new model's option list, fall back to the model's
- * default (max on 5.3, on for everything else — the last entry in the list).
+ * default (max on 5.3 / Flash, on for everything else — the last entry in
+ * the list). Switching from GLM-5.3 onto Flash maps the six-rung ladder
+ * onto Flash's three documented values rather than collapsing everything
+ * to max.
  */
 export function resolveThoughtLevel(model: string, level: ThoughtLevel): ThoughtLevel {
   const valid = getThoughtLevels(model);
-  return valid.includes(level) ? level : valid[valid.length - 1]!;
+  if (valid.includes(level)) return level;
+  if (isFlashModel(model)) {
+    if (level === "minimal") return "low";
+    if (level === "medium") return "high";
+    return "max";
+  }
+  return valid[valid.length - 1]!;
 }
 
 /**
@@ -504,9 +527,15 @@ export function buildThinkingParams(
 
   // reasoning_effort is only meaningful for the GLM-5.3 family — glm-5-turbo
   // and glm-4.7 accept it without validating it and answer identically either
-  // way. The remaining levels ("on", and "none" when thinking is force-enabled
-  // via the env override) carry no valid effort, so we omit the field.
-  if (effort !== undefined && LEVELS_REASONING_EFFORT.includes(effort) && isReasoningEffortModel(model)) {
+  // way. Flash only honours low/high/max, so we send the advertised ladder
+  // rather than the full 5.3 set. The remaining levels ("on", and "none"
+  // when thinking is force-enabled via the env override) carry no valid
+  // effort, so we omit the field.
+  if (
+    effort !== undefined &&
+    isReasoningEffortModel(model) &&
+    getThoughtLevels(model).includes(effort)
+  ) {
     params["reasoning_effort"] = effort;
   }
 
