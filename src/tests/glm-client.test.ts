@@ -11,6 +11,7 @@ import {
   getThoughtLevels,
   resolveThoughtLevel,
   buildThinkingParams,
+  isVisionNativeModel,
 } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
@@ -191,7 +192,7 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, ["glm-5.3", "glm-5-turbo", "glm-4.7"]);
+    assert.deepEqual(ids, ["glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
@@ -220,6 +221,10 @@ test("getDefaultModel returns glm-5.3 without an env override", () => {
 
 test("getContextWindow reports the 1M window for glm-5.3", () => {
   assert.equal(getContextWindow("glm-5.3"), 1_000_000);
+});
+
+test("getContextWindow reports the 1M window for glm-5.3-flash", () => {
+  assert.equal(getContextWindow("glm-5.3-flash"), 1_000_000);
 });
 
 test("getContextWindow reports the 1M window for glm-5.2", () => {
@@ -348,12 +353,12 @@ test("streamChat disables thinking when effort is none", async () => {
 });
 
 test("getThoughtLevels omits none for reasoning-effort models", () => {
-  // Thinking cannot be turned off on glm-5.3: the endpoint accepts
-  // `thinking: { type: "disabled" }` and `reasoning_effort: "none"` but keeps
-  // emitting reasoning either way, so offering an "Off" option would lie.
-  // Everything else on the validated ladder is exposed, in ladder order.
+  // Thinking cannot be turned off on glm-5.3 / glm-5.3-flash: the endpoint
+  // errors on `thinking: { type: "disabled" }`, so offering an "Off" option
+  // would lie. Everything else on the validated ladder is exposed, in order.
   const ladder = ["minimal", "low", "medium", "high", "xhigh", "max"];
   assert.deepEqual(getThoughtLevels("glm-5.3"), ladder);
+  assert.deepEqual(getThoughtLevels("glm-5.3-flash"), ladder);
   // glm-5.2 and glm-5.1 are both served by glm-5.3, so they behave identically
   // — including the fact that "Off" would not actually turn thinking off.
   assert.deepEqual(getThoughtLevels("glm-5.2"), ladder);
@@ -455,12 +460,57 @@ test("buildThinkingParams honours ACP_GLM_THINKING=false override", () => {
   const old = process.env["ACP_GLM_THINKING"];
   process.env["ACP_GLM_THINKING"] = "false";
   try {
-    // Forced off even when a level requests thinking.
-    assert.deepEqual(buildThinkingParams("glm-5.2", "max"), { thinking: { type: "disabled" } });
+    // Forced off even when a level requests thinking — models that still
+    // accept thinking.type: "disabled" (not the GLM-5.3 family).
+    assert.deepEqual(buildThinkingParams("glm-4.7", "on"), { thinking: { type: "disabled" } });
+    assert.deepEqual(buildThinkingParams("glm-5-turbo", "on"), { thinking: { type: "disabled" } });
   } finally {
     if (old === undefined) delete process.env["ACP_GLM_THINKING"];
     else process.env["ACP_GLM_THINKING"] = old;
   }
+});
+
+test("buildThinkingParams attaches reasoning_effort on glm-5.3-flash", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    assert.deepEqual(buildThinkingParams("glm-5.3-flash", "max"), {
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
+    });
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("buildThinkingParams does not send thinking.type=disabled on GLM-5.3 family", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  process.env["ACP_GLM_THINKING"] = "false";
+  try {
+    // Latest Z.AI docs: thinking.type: "disabled" errors on GLM-5.3 / Flash.
+    for (const model of ["glm-5.3", "glm-5.3-flash"]) {
+      const params = buildThinkingParams(model, "max");
+      assert.notDeepEqual(
+        params["thinking"],
+        { type: "disabled" },
+        `${model} must not send thinking.type: disabled`
+      );
+      assert.deepEqual(params["thinking"], { type: "enabled" });
+      assert.equal(params["reasoning_effort"], "max");
+    }
+  } finally {
+    if (old === undefined) delete process.env["ACP_GLM_THINKING"];
+    else process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
+test("isVisionNativeModel is true for Flash and glm-5v-turbo only", () => {
+  assert.equal(isVisionNativeModel("glm-5.3-flash"), true);
+  assert.equal(isVisionNativeModel("GLM-5.3-Flash"), true);
+  assert.equal(isVisionNativeModel("glm-5v-turbo"), true);
+  assert.equal(isVisionNativeModel("glm-5.3"), false);
+  assert.equal(isVisionNativeModel("glm-5-turbo"), false);
+  assert.equal(isVisionNativeModel("glm-4.7"), false);
 });
 
 test("streamChat does not flush partial tool calls (missing id or name)", async () => {
