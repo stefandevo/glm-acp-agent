@@ -997,7 +997,7 @@ test("newSession advertises the model as a config option next to thought_level a
   const options = (model as { options: Array<{ value: string; name: string }> }).options;
   assert.deepEqual(
     options.map((o) => o.value),
-    ["glm-5.3", "glm-5-turbo", "glm-4.7"]
+    ["glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]
   );
   // Names must match the models state so both surfaces read the same.
   assert.deepEqual(
@@ -1867,49 +1867,51 @@ test("prompt with image block runs Vision MCP preprocessing and feeds text into 
   assert.match(capturedUser as string, /<image_analysis index="1">[\s\S]*It is a kitten\.[\s\S]*<\/image_analysis>/);
 });
 
-test("prompt with image block on vision-native model sends native image_url content", async () => {
-  const conn = createConnectionStub();
-  let capturedUser: unknown;
-  const glm = {
-    async *streamChat(
-      messages: ReadonlyArray<{ role: string; content?: unknown }>,
-      _signal?: AbortSignal,
-      options?: { model?: string }
-    ): AsyncGenerator<GlmStreamChunk> {
-      assert.equal(options?.model, "glm-5v-turbo");
-      const userMsg = [...messages].reverse().find((m) => m.role === "user");
-      capturedUser = userMsg?.content;
-      yield { text: "ok" };
-      yield { done: true, stopReason: "stop" };
-    },
-  };
-  const visionCalls: Array<Record<string, unknown>> = [];
-  const visionClient = {
-    async callTool(_name: string, args: Record<string, unknown>) {
-      visionCalls.push(args);
-      return { content: [{ type: "text", text: "should not be used" }] };
-    },
-    async dispose() {},
-  };
-  const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
-  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
-  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+for (const visionModel of ["glm-5v-turbo", "glm-5.3-flash"] as const) {
+  test(`prompt with image block on ${visionModel} sends native image_url content`, async () => {
+    const conn = createConnectionStub();
+    let capturedUser: unknown;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>,
+        _signal?: AbortSignal,
+        options?: { model?: string }
+      ): AsyncGenerator<GlmStreamChunk> {
+        assert.equal(options?.model, visionModel);
+        const userMsg = [...messages].reverse().find((m) => m.role === "user");
+        capturedUser = userMsg?.content;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const visionCalls: Array<Record<string, unknown>> = [];
+    const visionClient = {
+      async callTool(_name: string, args: Record<string, unknown>) {
+        visionCalls.push(args);
+        return { content: [{ type: "text", text: "should not be used" }] };
+      },
+      async dispose() {},
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.unstable_setSessionModel({ sessionId, modelId: visionModel });
 
-  await agent.prompt({
-    sessionId,
-    prompt: [
+    await agent.prompt({
+      sessionId,
+      prompt: [
+        { type: "text", text: "What is in this image?" },
+        { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
+      ],
+    });
+
+    assert.equal(visionCalls.length, 0);
+    assert.deepEqual(capturedUser, [
       { type: "text", text: "What is in this image?" },
-      { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
-    ],
+      { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+    ]);
   });
-
-  assert.equal(visionCalls.length, 0);
-  assert.deepEqual(capturedUser, [
-    { type: "text", text: "What is in this image?" },
-    { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
-  ]);
-});
+}
 
 test("prompt with inline image data on vision-native model sends a data URI", async () => {
   const conn = createConnectionStub();

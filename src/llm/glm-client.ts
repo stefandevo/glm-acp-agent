@@ -29,10 +29,9 @@ export type ThoughtLevel =
  * Levels shown for the models that honour `reasoning_effort` — the endpoint's
  * full validated ladder minus `none`.
  *
- * Deliberately has no `none`: probing the Coding Plan endpoint on 2026-08-15
- * showed GLM-5.3 keeps emitting `reasoning_content` whether you send
- * `thinking: { type: "disabled" }` or `reasoning_effort: "none"`, so an "Off"
- * option would advertise something the model does not do.
+ * Deliberately has no `none`: Z.AI docs say GLM-5.3 / GLM-5.3-Flash only
+ * accept `thinking.type: "enabled"` — sending `"disabled"` errors — so an
+ * "Off" option would advertise something the model cannot do.
  */
 const LEVELS_REASONING_EFFORT: ThoughtLevel[] = [
   "minimal",
@@ -160,6 +159,11 @@ const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
     description: "Newest 1M-context coding model with thinking mode",
   },
   {
+    modelId: "glm-5.3-flash",
+    name: "GLM-5.3 Flash",
+    description: "Native-vision 1M-context model; cheaper Coding Plan quota",
+  },
+  {
     modelId: "glm-5-turbo",
     name: "GLM-5 Turbo",
     description: "Faster Coding Plan reasoning model",
@@ -186,6 +190,7 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
  */
 const MODEL_METADATA: Record<string, { contextWindow: number }> = {
   "glm-5.3": { contextWindow: 1_000_000 },
+  "glm-5.3-flash": { contextWindow: 1_000_000 },
   "glm-5-turbo": { contextWindow: 128_000 },
   "glm-4.7": { contextWindow: 200_000 },
   // Routed to glm-5.3 by the Coding Plan endpoint.
@@ -198,7 +203,7 @@ const MODEL_METADATA: Record<string, { contextWindow: number }> = {
 };
 
 /** Models that accept image content parts directly through chat completions. */
-const VISION_NATIVE_MODELS = new Set(["glm-5v-turbo"]);
+const VISION_NATIVE_MODELS = new Set(["glm-5.3-flash", "glm-5v-turbo"]);
 
 export function isVisionNativeModel(modelId: string): boolean {
   return VISION_NATIVE_MODELS.has(modelId.toLowerCase());
@@ -456,15 +461,16 @@ function thinkingOverride(): boolean | undefined {
  * - `minimal` … `max` → thinking enabled + reasoning_effort=<level>
  *   (5.3 family only)
  *
- * Caveat: GLM-5.3 ignores every attempt to turn thinking off — it keeps
- * emitting `reasoning_content` for `thinking: { type: "disabled" }` and for
- * `reasoning_effort: "none"` alike. `none` is therefore not offered as a level
- * for those models (see {@link getThoughtLevels}), and the `ACP_GLM_THINKING=false`
- * override below is a no-op there even though the request is still sent.
+ * Caveat: GLM-5.3 and GLM-5.3-Flash reject `thinking: { type: "disabled" }`
+ * (it is no longer a silent no-op). `none` is therefore not offered as a
+ * level for those models (see {@link getThoughtLevels}), and
+ * `ACP_GLM_THINKING=false` leaves thinking enabled rather than sending
+ * `disabled`.
  *
- * The `ACP_GLM_THINKING` env override still wins: `false` forces thinking off,
- * `true` forces it on (ignoring a `none` level). When `effort` is unset the
- * model defaults are used, preserving the pre-thought-level behaviour.
+ * The `ACP_GLM_THINKING` env override still wins for models that accept it:
+ * `false` forces thinking off, `true` forces it on (ignoring a `none` level).
+ * When `effort` is unset the model defaults are used, preserving the
+ * pre-thought-level behaviour.
  */
 export function buildThinkingParams(
   model: string,
@@ -474,17 +480,20 @@ export function buildThinkingParams(
 
   const override = thinkingOverride();
   const modelCanThink = modelSupportsThinking(model);
+  // GLM-5.3 / Flash (and aliases routed to them) error on thinking.type=disabled.
+  const thinkingLockedOn = isReasoningEffortModel(model);
 
-  // Explicit env override to disable wins over everything.
-  if (override === false) {
+  // Explicit env override to disable wins, except on models that reject it.
+  if (override === false && !thinkingLockedOn) {
     if (modelCanThink) params["thinking"] = { type: "disabled" };
     return params;
   }
 
   const canThink = override === true || modelCanThink;
 
-  // A `none` level disables thinking, unless the env override forces it on.
-  if (effort === "none" && override !== true) {
+  // A `none` level disables thinking, unless the env override forces it on
+  // or the model rejects disabled.
+  if (effort === "none" && override !== true && !thinkingLockedOn) {
     if (canThink) params["thinking"] = { type: "disabled" };
     return params;
   }

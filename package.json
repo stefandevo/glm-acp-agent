@@ -1,7 +1,7 @@
 {
   "name": "glm-acp-agent",
   "version": "1.6.1",
-  "description": "ACP agent in TypeScript that uses the Z.AI / Zhipu AI GLM Coding Plan models (GLM-5.3, GLM-5 Turbo, GLM-4.7) as the reasoning core",
+  "description": "ACP agent in TypeScript that uses the Z.AI / Zhipu AI GLM Coding Plan models (GLM-5.3, GLM-5.3 Flash, GLM-5 Turbo, GLM-4.7) as the reasoning core",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
