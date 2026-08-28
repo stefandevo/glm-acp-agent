@@ -358,11 +358,16 @@ test("getThoughtLevels omits none for reasoning-effort models", () => {
   // would lie. Everything else on the validated ladder is exposed, in order.
   const ladder = ["minimal", "low", "medium", "high", "xhigh", "max"];
   assert.deepEqual(getThoughtLevels("glm-5.3"), ladder);
-  assert.deepEqual(getThoughtLevels("glm-5.3-flash"), ladder);
   // glm-5.2 and glm-5.1 are both served by glm-5.3, so they behave identically
   // — including the fact that "Off" would not actually turn thinking off.
   assert.deepEqual(getThoughtLevels("glm-5.2"), ladder);
   assert.deepEqual(getThoughtLevels("glm-5.1"), ladder);
+});
+
+test("getThoughtLevels advertises only low/high/max for glm-5.3-flash", () => {
+  // Z.AI Chat Completions: GLM-5.3-Flash reasoning_effort is only low/high/max.
+  assert.deepEqual(getThoughtLevels("glm-5.3-flash"), ["low", "high", "max"]);
+  assert.deepEqual(getThoughtLevels("GLM-5.3-Flash"), ["low", "high", "max"]);
 });
 
 test("getThoughtLevels returns none/on for models without reasoning_effort", () => {
@@ -388,6 +393,17 @@ test("resolveThoughtLevel clamps a persisted none up to max on glm-5.3", () => {
   // when switched to glm-5.3, which has no "none" level.
   assert.equal(resolveThoughtLevel("glm-5.3", "none"), "max");
   assert.equal(resolveThoughtLevel("glm-5.3", "on"), "max");
+});
+
+test("resolveThoughtLevel maps the 5.3 ladder onto Flash's three levels", () => {
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "low"), "low");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "high"), "high");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "max"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "minimal"), "low");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "medium"), "high");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "xhigh"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "none"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.3-flash", "on"), "max");
 });
 
 test("buildThinkingParams omits fields for non-thinking models", () => {
@@ -474,9 +490,21 @@ test("buildThinkingParams attaches reasoning_effort on glm-5.3-flash", () => {
   const old = process.env["ACP_GLM_THINKING"];
   delete process.env["ACP_GLM_THINKING"];
   try {
-    assert.deepEqual(buildThinkingParams("glm-5.3-flash", "max"), {
+    for (const level of ["low", "high", "max"] as const) {
+      assert.deepEqual(buildThinkingParams("glm-5.3-flash", level), {
+        thinking: { type: "enabled" },
+        reasoning_effort: level,
+      });
+    }
+    // Unadvertised 5.3-ladder values must not be forwarded as-is.
+    assert.deepEqual(buildThinkingParams("glm-5.3-flash", "minimal"), {
       thinking: { type: "enabled" },
-      reasoning_effort: "max",
+    });
+    assert.deepEqual(buildThinkingParams("glm-5.3-flash", "medium"), {
+      thinking: { type: "enabled" },
+    });
+    assert.deepEqual(buildThinkingParams("glm-5.3-flash", "xhigh"), {
+      thinking: { type: "enabled" },
     });
   } finally {
     if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
