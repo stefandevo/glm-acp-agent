@@ -1268,7 +1268,12 @@ export class GlmAcpAgent implements Agent {
         if (isOverflow && overflowRetryCount < 1) {
           debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
           const window = getContextWindow(session.model);
-          session.messages = compactMessages(session.messages, Math.floor(window * 0.7));
+          session.messages = compactMessages(
+            session.messages,
+            Math.floor(window * 0.7),
+            undefined,
+            true
+          );
           overflowRetryCount++;
           retryTurn = true;
         } else if (isOverflow) {
@@ -1664,12 +1669,27 @@ async function safeSessionUpdate(
 }
 
 /**
+ * Token cost charged to a single `image_url` content part.
+ *
+ * Vision-native GLM models tile an image into 14px patches and merge them 2x2,
+ * so a full-size input (capped at 1120x1120) costs (1120/14)^2 / 4 = 1600
+ * tokens. Smaller images cost less, and the wire form (an HTTPS URL or a
+ * base64 data URL) tells us nothing about the decoded dimensions — so charge
+ * every image the ceiling. Over-counting only makes compaction fire early;
+ * under-counting is what lets an image-heavy session sail past the window and
+ * get rejected by the provider.
+ */
+const IMAGE_PART_TOKENS = 1600;
+
+/**
  * Heuristically estimate the number of tokens in a list of messages.
  * Uses a simple 4-character-per-token rule, which is a safe baseline for
- * English and code.
+ * English and code, plus a flat per-image charge for native `image_url` parts
+ * (see {@link IMAGE_PART_TOKENS}).
  */
 function estimateTokens(messages: GlmMessage[]): number {
   let chars = 0;
+  let tokens = 0;
   for (const m of messages) {
     if (typeof m.content === "string") {
       chars += m.content.length;
@@ -1677,6 +1697,12 @@ function estimateTokens(messages: GlmMessage[]): number {
       for (const part of m.content) {
         if ("text" in part && typeof part.text === "string") {
           chars += part.text.length;
+        } else if (
+          typeof part === "object" &&
+          part !== null &&
+          (part as { type?: unknown }).type === "image_url"
+        ) {
+          tokens += IMAGE_PART_TOKENS;
         }
       }
     }
@@ -1689,7 +1715,7 @@ function estimateTokens(messages: GlmMessage[]): number {
       }
     }
   }
-  return Math.ceil(chars / 4);
+  return tokens + Math.ceil(chars / 4);
 }
 
 /**
@@ -1702,11 +1728,21 @@ function estimateTokens(messages: GlmMessage[]): number {
  *    with a user message followed by assistant and tool responses.
  * 3. Evict the largest remaining interaction groups until the total estimate
  *    is below `targetTokens`.
+ *
+ * `force` is for the emergency path after the provider itself rejected the
+ * history as too long. There, {@link estimateTokens} has already been proven
+ * wrong — it is a heuristic, and images in particular can only be charged an
+ * approximation — so its verdict cannot be allowed to veto eviction. Under
+ * `force` the size checks stop being gates: the tail shrinks as far as it must
+ * (never below the final turn, which carries the live user message) and at
+ * least one turn is always evicted, so the retry sends strictly less than the
+ * request that just failed.
  */
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,
-  preserveTurns = 10
+  preserveTurns = 10,
+  force = false
 ): GlmMessage[] {
   if (messages.length <= 1) return messages;
 
@@ -1728,18 +1764,30 @@ function compactMessages(
     turns.push(currentTurn);
   }
 
+  // Nothing to evict without dropping the live user message — a single turn
+  // over the window is beyond what turn eviction can fix, forced or not.
+  if (turns.length < 2) return messages;
+
+  // Normally the tail is untouchable; under `force` it yields as far as the
+  // final turn so there is always at least one eviction candidate.
+  const effectivePreserve = force
+    ? Math.max(1, Math.min(preserveTurns, turns.length - 1))
+    : preserveTurns;
+
   // If we have fewer turns than we want to preserve, just return the messages.
-  if (turns.length <= preserveTurns) return messages;
+  if (turns.length <= effectivePreserve) return messages;
 
   let currentEstimate = estimateTokens(messages);
-  if (currentEstimate <= targetTokens) return messages;
+  if (!force && currentEstimate <= targetTokens) return messages;
 
-  debug(`compactMessages: currentEstimate=${currentEstimate} target=${targetTokens} turns=${turns.length}`);
+  debug(
+    `compactMessages: currentEstimate=${currentEstimate} target=${targetTokens} turns=${turns.length} preserve=${effectivePreserve} force=${force}`
+  );
 
-  // Identify candidates for eviction: all turns except the last `preserveTurns`.
-  const tail = turns.slice(-preserveTurns);
+  // Identify candidates for eviction: all turns except the preserved tail.
+  const tail = turns.slice(-effectivePreserve);
   const candidateTurns = turns
-    .slice(0, -preserveTurns)
+    .slice(0, -effectivePreserve)
     .map((turn, index) => ({
       turn,
       index,
@@ -1751,13 +1799,15 @@ function compactMessages(
 
   const evictedIndices = new Set<number>();
   for (const c of candidateTurns) {
-    if (currentEstimate <= targetTokens) break;
+    // Under `force`, always take the first (largest) candidate: the estimate
+    // that says we are already under target is the one the provider rejected.
+    if (currentEstimate <= targetTokens && !(force && evictedIndices.size === 0)) break;
     evictedIndices.add(c.index);
     currentEstimate -= c.tokens;
   }
 
   const compacted: GlmMessage[] = [systemPrompt];
-  for (let i = 0; i < turns.length - preserveTurns; i++) {
+  for (let i = 0; i < turns.length - effectivePreserve; i++) {
     if (!evictedIndices.has(i)) {
       compacted.push(...turns[i]);
     }
