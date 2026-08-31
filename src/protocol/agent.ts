@@ -1722,10 +1722,11 @@ function estimateTokens(messages: GlmMessage[]): number {
  *    is below `targetTokens`.
  *
  * `force` is for the emergency path after the provider itself rejected the
- * history, where {@link estimateTokens} has already been proven wrong and so
- * cannot be allowed to veto eviction. It shrinks the preserved tail as far as
- * the final turn (which carries the live user message) and always evicts at
- * least one turn, so the retry sends strictly less than what just failed.
+ * history. There {@link estimateTokens} has been proven wrong, so it can set
+ * neither the stopping point nor what is off limits: the target is halved, and
+ * the preserved tail becomes evictable from its oldest end. Only the final turn
+ * is sacred — it carries the live user message, and a request without it is not
+ * a retry of anything.
  */
 function compactMessages(
   messages: GlmMessage[],
@@ -1752,55 +1753,59 @@ function compactMessages(
     turns.push(currentTurn);
   }
 
-  // Normally the tail is untouchable; under `force` it yields as far as the
-  // final turn — never past it, since that turn holds the live user message —
-  // so there is always at least one eviction candidate.
-  const effectivePreserve = force
-    ? Math.max(1, Math.min(preserveTurns, turns.length - 1))
-    : preserveTurns;
-
-  // Fewer turns than we want to preserve: nothing to evict. Under `force` this
-  // means a lone turn, which is past what turn eviction can fix.
-  if (turns.length <= effectivePreserve) return messages;
+  // The final turn holds the live user message, so it is never evictable —
+  // with nothing else to drop there is no compaction to do.
+  if (turns.length < 2) return messages;
+  if (!force && turns.length <= preserveTurns) return messages;
 
   let currentEstimate = estimateTokens(messages);
   if (!force && currentEstimate <= targetTokens) return messages;
 
+  // An estimate already above target names a real reduction to aim for, forced
+  // or not. One that sits *below* target while the provider is rejecting the
+  // payload has been disproven, and stopping on it would spend the single retry
+  // on another oversized request — so halve it instead. Wrong by an unknown
+  // factor still shrinks geometrically, and only that case pays the extra loss.
+  const estimateDisproven = force && currentEstimate <= targetTokens;
+  const effectiveTarget = estimateDisproven
+    ? Math.floor(currentEstimate / 2)
+    : targetTokens;
+
   debug(
-    `compactMessages: currentEstimate=${currentEstimate} target=${targetTokens} turns=${turns.length} preserve=${effectivePreserve} force=${force}`
+    `compactMessages: currentEstimate=${currentEstimate} target=${effectiveTarget} turns=${turns.length} force=${force}`
   );
 
-  // Identify candidates for eviction: all turns except the preserved tail.
-  const tail = turns.slice(-effectivePreserve);
-  const candidateTurns = turns
-    .slice(0, -effectivePreserve)
-    .map((turn, index) => ({
-      turn,
-      index,
-      tokens: estimateTokens(turn),
-    }));
-
-  // Sort candidates by size (largest first).
-  candidateTurns.sort((a, b) => b.tokens - a.tokens);
-
+  const sized = turns.map((turn, index) => ({ index, tokens: estimateTokens(turn) }));
+  const protectedFrom = turns.length - preserveTurns;
   const evictedIndices = new Set<number>();
+
+  // Largest first, among the turns outside the preserved tail.
+  const candidateTurns = sized
+    .filter((c) => c.index < protectedFrom)
+    .sort((a, b) => b.tokens - a.tokens);
   for (const c of candidateTurns) {
-    // Under `force`, the largest candidate goes regardless of the estimate —
-    // the estimate saying we already fit is the one the provider rejected.
-    const mustEvict = force && evictedIndices.size === 0;
-    if (!mustEvict && currentEstimate <= targetTokens) break;
+    if (currentEstimate <= effectiveTarget) break;
     evictedIndices.add(c.index);
     currentEstimate -= c.tokens;
   }
 
+  // Still over, and forced? Then the preserved tail is itself the problem — a
+  // run of image-heavy prompts can exceed the window on its own, leaving the
+  // candidates above unable to reach the target however many are dropped. Eat
+  // into the tail from its oldest end so the freshest context survives.
+  if (force) {
+    for (let i = Math.max(protectedFrom, 0); i < turns.length - 1; i++) {
+      if (currentEstimate <= effectiveTarget) break;
+      evictedIndices.add(i);
+      currentEstimate -= sized[i].tokens;
+    }
+  }
+
   const compacted: GlmMessage[] = [systemPrompt];
-  for (let i = 0; i < turns.length - effectivePreserve; i++) {
+  for (let i = 0; i < turns.length; i++) {
     if (!evictedIndices.has(i)) {
       compacted.push(...turns[i]);
     }
-  }
-  for (const turn of tail) {
-    compacted.push(...turn);
   }
 
   debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} messageCount=${compacted.length}`);

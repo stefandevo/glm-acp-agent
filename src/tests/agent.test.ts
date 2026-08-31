@@ -2487,6 +2487,20 @@ test("prompt fails fast when context overflow persists after emergency compactio
 // Native images and context compaction
 // ---------------------------------------------------------------------------
 
+type MessageLike = { role?: string; content?: unknown };
+
+/** Count `image_url` parts across a message list, for token-budget assertions. */
+function countImageParts(messages: ReadonlyArray<MessageLike>): number {
+  let count = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) {
+      if ((part as { type?: unknown })?.type === "image_url") count++;
+    }
+  }
+  return count;
+}
+
 /** A minimal, well-formed data URL image part for a vision-native message. */
 function imagePart(): { type: "image_url"; image_url: { url: string } } {
   return {
@@ -2587,9 +2601,84 @@ test("emergency compaction evicts history even when the estimate is under target
 
   assert.equal(result.stopReason, "end_turn");
   assert.equal(callCount, 2, "expected two streamChat calls (one failed, one retried)");
+  // Strictly less is not enough: evicting a single turn and then stopping on
+  // the same estimate the provider just disproved can leave the retry
+  // oversized, which spends the one retry for nothing.
   assert.ok(
-    messagesInSecondCall < messagesInFirstCall,
-    `expected the retry to send strictly less history (sent ${messagesInSecondCall}, first call had ${messagesInFirstCall})`
+    messagesInFirstCall - messagesInSecondCall > 2,
+    `expected the retry to drop more than one turn (sent ${messagesInSecondCall}, first call had ${messagesInFirstCall})`
+  );
+});
+
+test("emergency compaction evicts the preserved tail when the tail alone busts the target", async () => {
+  const conn = createConnectionStub();
+  let callCount = 0;
+  let messagesInFirstCall = 0;
+  let secondCall: MessageLike[] = [];
+
+  const glm = {
+    async *streamChat(messages: ReadonlyArray<MessageLike>): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      if (callCount === 1) {
+        messagesInFirstCall = messages.length;
+        const err = new Error("Prompt exceeds max length") as OverflowErrorLike;
+        err.error = { code: 1261 };
+        throw err;
+      }
+      secondCall = [...messages];
+      yield { text: "Recovered." };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+  const session = (agent as unknown as {
+    sessions: Map<string, { messages: unknown[] }>;
+  }).sessions.get(sessionId);
+  assert.ok(session, "expected in-memory session to exist");
+
+  // Twelve multi-image turns. Proactive compaction burns through every turn
+  // outside the ten-turn preserved tail and still cannot reach its target, so
+  // by the time the provider rejects the payload the tail *is* the history —
+  // recovery is impossible unless forced eviction may reach into it.
+  for (let i = 0; i < 12; i++) {
+    session.messages.push({
+      role: "user",
+      content: [{ type: "text", text: "batch" }, ...Array.from({ length: 12 }, imagePart)],
+    });
+    session.messages.push({ role: "assistant", content: "seen" });
+  }
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "and this one?" }],
+  });
+
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(callCount, 2, "expected two streamChat calls (one failed, one retried)");
+  assert.ok(
+    secondCall.length < messagesInFirstCall,
+    `expected the retry to shed tail turns (sent ${secondCall.length}, first call had ${messagesInFirstCall})`
+  );
+  // The emergency target is 70% of the 200K window. Charged at 1600 tokens
+  // each, the retry's images must fit under it — otherwise the one retry we
+  // get is spent on another payload the provider will reject.
+  const imagesSent = countImageParts(secondCall);
+  assert.ok(
+    imagesSent * 1600 <= Math.floor(200_000 * 0.7),
+    `expected the retry to fit the emergency target, but it carried ${imagesSent} images`
+  );
+  // Whatever else goes, the live user message has to survive — a request
+  // without it is not a retry of anything.
+  const last = secondCall[secondCall.length - 1];
+  assert.equal(last?.role, "user");
+  assert.ok(
+    JSON.stringify(last?.content ?? "").includes("and this one?"),
+    "expected the live user prompt to survive forced compaction"
   );
 });
 
