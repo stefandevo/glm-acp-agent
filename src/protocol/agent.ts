@@ -160,6 +160,18 @@ interface SessionState {
   thoughtLevel: ThoughtLevel;
   /** Slash commands discovered under this session's cwd, advertised to the client. */
   commands: SlashCommand[];
+  /**
+   * Replay text for user messages whose stored content is not what the user
+   * typed — a slash command expanded into its body, an image swapped for its
+   * vision annotation. The model reads `messages`; the client's transcript
+   * reads this.
+   *
+   * Keyed by message identity rather than by position: `compactMessages`
+   * evicts whole turns from `messages`, and an index-keyed map would then
+   * point at the wrong message. A WeakMap also drops evicted entries on its
+   * own. Serialized to indices at save time and rebuilt on load.
+   */
+  displayText: WeakMap<GlmMessage & object, string>;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -389,6 +401,7 @@ export class GlmAcpAgent implements Agent {
       mode: "default",
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
+      displayText: new WeakMap(),
     });
 
     this.scheduleAvailableCommands(sessionId);
@@ -744,10 +757,7 @@ export class GlmAcpAgent implements Agent {
     // Clients invoke an advertised command by sending `/name …` as ordinary
     // prompt text, so expand it here into the instructions its definition
     // holds. Unknown `/foo` is left alone and reaches the model as prose.
-    const { blocks: promptBlocks, invocation } = expandPromptCommand(
-      params.prompt,
-      session.commands
-    );
+    const promptBlocks = expandPromptCommand(params.prompt, session.commands);
     const visionNative = isVisionNativeModel(session.model);
     const preprocessed = visionNative
       ? { blocks: promptBlocks, cleanups: [] }
@@ -756,10 +766,21 @@ export class GlmAcpAgent implements Agent {
           this.visionClient,
           abortController.signal
         );
-    const { content: userContent, plainText: userText } = visionNative
+    const { content: userContent } = visionNative
       ? renderVisionNativePromptBlocks(preprocessed.blocks)
       : renderPromptBlocks(preprocessed.blocks);
-    session.messages.push({ role: "user", content: userContent });
+    const userMessage: GlmMessage = { role: "user", content: userContent };
+    session.messages.push(userMessage);
+
+    // What the user typed, rendered from the blocks as they arrived — before
+    // command expansion and image analysis rewrote them for the model. Kept
+    // separately so `session/load` replays the conversation the user had (and
+    // the title names it), not the one the model saw. Persisted only when the
+    // two actually diverge.
+    const displayText = renderPromptBlocks(params.prompt).plainText;
+    if (displayText !== stringifyUserMessage(userContent)) {
+      session.displayText.set(userMessage, displayText);
+    }
 
     // Echo back the client-supplied messageId on every response (success,
     // cancelled, or error) so the client can correlate the turn.
@@ -785,7 +806,7 @@ export class GlmAcpAgent implements Agent {
       const titleUpdate: { title?: string | null } =
         session.title === null
           ? (() => {
-              const derived = (invocation ?? userText)
+              const derived = displayText
                 .slice(0, 80)
                 .replace(/\s+/g, " ")
                 .trim();
@@ -934,13 +955,18 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
+      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
     };
     this.sessions.set(params.sessionId, restored);
 
     // Replay user/assistant text turns so the client can rehydrate its UI.
     // Tool / system messages are skipped — they're internal and the client
     // doesn't render them on its own.
-    await this.replayMessages(params.sessionId, persisted.messages);
+    await this.replayMessages(
+      params.sessionId,
+      persisted.messages,
+      restored.displayText
+    );
 
     this.scheduleAvailableCommands(params.sessionId);
 
@@ -968,10 +994,11 @@ export class GlmAcpAgent implements Agent {
     const newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
+    const forkedMessages = structuredClone(persisted.messages);
     const forked: SessionState = {
       cwd: params.cwd,
       // Deep-clone messages so the fork doesn't share state with the parent.
-      messages: structuredClone(persisted.messages),
+      messages: forkedMessages,
       abortController: null,
       promptPromise: null,
       title: forkedTitle,
@@ -982,6 +1009,9 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
+      // Re-key onto the cloned messages: the parent's map is keyed by the
+      // originals, which the fork no longer holds.
+      displayText: deserializeDisplayText(forkedMessages, persisted.displayText),
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -1023,6 +1053,7 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
+      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -1046,6 +1077,7 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   private snapshot(sessionId: string, session: SessionState): PersistedSession {
+    const displayText = serializeDisplayText(session.messages, session.displayText);
     return {
       sessionId,
       cwd: session.cwd,
@@ -1055,6 +1087,9 @@ export class GlmAcpAgent implements Agent {
       model: session.model,
       mode: session.mode,
       thoughtLevel: session.thoughtLevel,
+      // Omitted entirely for conversations where nothing diverges, which is
+      // the common case — an ordinary session gains no on-disk weight.
+      ...(displayText ? { displayText } : {}),
     };
   }
 
@@ -1083,11 +1118,13 @@ export class GlmAcpAgent implements Agent {
 
   private async replayMessages(
     sessionId: string,
-    messages: GlmMessage[]
+    messages: GlmMessage[],
+    displayText: SessionState["displayText"]
   ): Promise<void> {
     for (const msg of messages) {
       if (msg.role === "user") {
-        const text = stringifyUserMessage(msg.content);
+        // Prefer what the user typed over what we handed the model.
+        const text = displayText.get(msg) ?? stringifyUserMessage(msg.content);
         if (text.length === 0) continue;
         await this.connection.sessionUpdate({
           sessionId,
@@ -1362,7 +1399,9 @@ function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number
         break;
       }
       case "image": {
-        // Defensive: image blocks should have been preprocessed away upstream.
+        // Reached on the display-text pass, which renders the untouched
+        // prompt; on the model-facing pass images have been preprocessed away
+        // into `<image_analysis>` annotations upstream.
         textParts.push(`[image: ${block.mimeType}]`);
         break;
       }
@@ -1471,6 +1510,41 @@ function escapeAttribute(value: string): string {
     .replaceAll(">", "&gt;");
 }
 
+/**
+ * Project the identity-keyed display map onto indices into `messages`, ready
+ * to persist. Returns `undefined` when nothing diverges so the field can be
+ * left off the record entirely.
+ */
+function serializeDisplayText(
+  messages: ReadonlyArray<GlmMessage>,
+  displayText: SessionState["displayText"]
+): Record<string, string> | undefined {
+  let out: Record<string, string> | undefined;
+  messages.forEach((message, index) => {
+    const text = displayText.get(message);
+    if (text === undefined) return;
+    out ??= {};
+    out[String(index)] = text;
+  });
+  return out;
+}
+
+/** Rebuild the identity-keyed display map from a persisted index map. */
+function deserializeDisplayText(
+  messages: ReadonlyArray<GlmMessage>,
+  persisted: Record<string, string> | undefined
+): SessionState["displayText"] {
+  const out = new WeakMap<GlmMessage & object, string>();
+  if (!persisted) return out;
+  for (const [key, text] of Object.entries(persisted)) {
+    const message = messages[Number(key)];
+    // A hand-edited or truncated record can point past the end of the array;
+    // dropping the entry just falls back to replaying the stored content.
+    if (message) out.set(message, text);
+  }
+  return out;
+}
+
 /** Flatten the `content` of a user message into a plain string for replay. */
 function stringifyUserMessage(content: unknown): string {
   if (typeof content === "string") return content;
@@ -1538,30 +1612,24 @@ function availableCommandsState(
  * a client may place an image or resource block ahead of what the user typed,
  * and the command would otherwise reach the model as a literal `/name`.
  *
- * Returns the blocks unchanged (and a null `invocation`) when that text does
- * not start with an advertised command. `invocation` carries the text the user
- * actually typed so the session title doesn't end up being the expanded body.
+ * Returns the blocks unchanged when that text does not start with an
+ * advertised command. The caller keeps the original blocks around to derive
+ * the replay/title text, so nothing here needs to report the typed form back.
  */
 function expandPromptCommand(
   blocks: PromptRequest["prompt"],
   commands: ReadonlyArray<SlashCommand>
-): { blocks: PromptRequest["prompt"]; invocation: string | null } {
+): PromptRequest["prompt"] {
   const index = blocks.findIndex(
     (block) => block.type === "text" && block.text.trim().length > 0
   );
   const typed = blocks[index];
-  if (typed?.type !== "text") return { blocks, invocation: null };
+  if (typed?.type !== "text") return blocks;
   const parsed = parseSlashCommand(typed.text, commands);
-  if (!parsed) return { blocks, invocation: null };
+  if (!parsed) return blocks;
   const expanded = [...blocks];
   expanded[index] = { ...typed, text: renderSlashCommand(parsed) };
-  return {
-    blocks: expanded,
-    invocation:
-      parsed.args.length > 0
-        ? `/${parsed.command.name} ${parsed.args}`
-        : `/${parsed.command.name}`,
-  };
+  return expanded;
 }
 
 /**
