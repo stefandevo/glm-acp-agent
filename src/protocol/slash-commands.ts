@@ -162,7 +162,8 @@ function splitFrontmatter(contents: string): {
   for (const line of match[1]!.split(/\r?\n/)) {
     const separator = line.indexOf(":");
     if (separator <= 0) continue;
-    const key = line.slice(0, separator).trim();
+    // Lower-cased so a hand-written `Description:` still resolves.
+    const key = line.slice(0, separator).trim().toLowerCase();
     const value = line
       .slice(separator + 1)
       .trim()
