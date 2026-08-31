@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -10,6 +10,10 @@ import { join as pathJoin } from "node:path";
 process.env["ACP_GLM_SESSION_DIR"] = mkdtempSync(
   pathJoin(osTmpdir(), "glm-acp-integration-test-")
 );
+
+// Slash-command discovery scans `~/.claude`; isolate HOME so the developer's
+// own commands can't appear in the advertised snapshot asserted on below.
+process.env["HOME"] = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-home-"));
 import {
   AgentSideConnection,
   ClientSideConnection,
@@ -303,5 +307,61 @@ test("end-to-end: session mode change mid-conversation affects permission prompt
     assert.equal(pathJoin(dir, "x.txt"), pathJoin(dir, "x.txt")); // sanity
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function commandSnapshots(stub: StubClient): Array<Record<string, unknown>> {
+  return stub.updates.filter(
+    (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "available_commands_update"
+  );
+}
+
+test("end-to-end: the client receives an available_commands_update after session/new", async () => {
+  const { a, b } = pairedStreams();
+  const stub = new StubClient();
+  const cwd = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-cmds-"));
+  mkdirSync(pathJoin(cwd, ".claude", "commands"), { recursive: true });
+  writeFileSync(
+    pathJoin(cwd, ".claude", "commands", "deploy.md"),
+    "---\ndescription: Ship the current branch\nargument-hint: <environment>\n---\nRun the deploy playbook.\n",
+    "utf8"
+  );
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const _agentConn = new AgentSideConnection(
+      (conn) => new GlmAcpAgent(conn, { sessionStore: null }),
+      a
+    );
+    const clientConn = new ClientSideConnection(() => stub, b);
+
+    await clientConn.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    const session = await clientConn.newSession({ cwd, mcpServers: [] });
+
+    // The snapshot is deferred until after the session/new response: a client
+    // only learns the session id from that response, so an update sent ahead of
+    // it would name a session the client has never heard of.
+    assert.equal(commandSnapshots(stub).length, 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const advertised = commandSnapshots(stub);
+    assert.equal(advertised.length, 1);
+    assert.equal(advertised[0]?.["sessionId"], session.sessionId);
+    const commands = (
+      advertised[0]?.update as {
+        availableCommands: Array<{ name: string; description: string; input?: { hint: string } }>;
+      }
+    ).availableCommands;
+    assert.deepEqual(
+      commands.map((c) => c.name),
+      ["deploy"]
+    );
+    assert.equal(commands[0]?.description, "Ship the current branch");
+    assert.equal(commands[0]?.input?.hint, "<environment>");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

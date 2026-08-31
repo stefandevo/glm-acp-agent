@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -14,6 +14,11 @@ import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 process.env["ACP_GLM_SESSION_DIR"] = mkdtempSync(
   pathJoin(osTmpdir(), "glm-acp-test-default-")
 );
+
+// Slash-command discovery scans `~/.claude` as well as the session cwd. Point
+// HOME at an isolated tempdir so a developer's own commands can't leak into the
+// advertised snapshots asserted on below.
+process.env["HOME"] = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-home-"));
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -119,6 +124,14 @@ function captureSystemPrompt() {
   return { glm, ref };
 }
 
+/**
+ * Yield to the macrotask queue so deferred notifications — today only
+ * `available_commands_update` — have reached the connection stub.
+ */
+function flushNotifications(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 /** Create an isolated temp directory to use as a session cwd, optionally seeded with files. */
 function makeTempCwd(files: Record<string, string> = {}): {
   cwd: string;
@@ -126,7 +139,9 @@ function makeTempCwd(files: Record<string, string> = {}): {
 } {
   const cwd = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-cwd-"));
   for (const [name, content] of Object.entries(files)) {
-    writeFileSync(pathJoin(cwd, name), content);
+    const path = pathJoin(cwd, name);
+    mkdirSync(pathJoin(path, ".."), { recursive: true });
+    writeFileSync(path, content);
   }
   return {
     cwd,
@@ -2236,8 +2251,12 @@ test("resumeSession restores in-memory state without replaying messages", async 
     });
 
     assert.equal(result.models?.currentModelId, "glm-5.1");
-    // No replay updates expected.
-    assert.equal(conn.updates.length, 0);
+    await flushNotifications();
+    // No replay updates expected — only the slash-command advertisement.
+    assert.deepEqual(
+      conn.updates.map((u) => (u.update as { sessionUpdate: string }).sessionUpdate),
+      ["available_commands_update"]
+    );
   } finally {
     cleanup();
   }
@@ -2462,4 +2481,267 @@ test("prompt fails fast when context overflow persists after emergency compactio
   assert.equal(caught.message, "Context overflow persisted after emergency compaction");
   assert.equal(caught.cause, secondOverflow);
   assert.equal(errorMessages.length, 1, "expected an error message reporting persistent overflow");
+});
+
+// ---------------------------------------------------------------------------
+// Slash commands (available_commands_update)
+// ---------------------------------------------------------------------------
+
+/** Files that give a session cwd one discoverable `/deploy` command. */
+const COMMAND_FIXTURE = {
+  ".claude/commands/deploy.md":
+    "---\ndescription: Ship the current branch\nargument-hint: <environment>\n---\nRun the deploy playbook.\n",
+};
+
+interface AvailableCommandsEnvelope {
+  sessionId: string;
+  update: {
+    sessionUpdate: string;
+    availableCommands?: Array<{ name: string; description: string; input?: { hint: string } }>;
+  };
+}
+
+function commandUpdates(conn: ConnectionStub): AvailableCommandsEnvelope[] {
+  return (conn.updates as unknown as AvailableCommandsEnvelope[]).filter(
+    (u) => u.update.sessionUpdate === "available_commands_update"
+  );
+}
+
+/** Capture the last user message handed to the model on a prompt turn. */
+function captureUserMessage() {
+  const ref = { value: "" };
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; content?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      const users = messages.filter((m) => m.role === "user");
+      const last = users[users.length - 1];
+      ref.value = typeof last?.content === "string" ? last.content : "";
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  return { glm, ref };
+}
+
+test("newSession advertises commands discovered under the session cwd", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await flushNotifications();
+
+    const updates = commandUpdates(conn);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]?.sessionId, sessionId);
+    const commands = updates[0]?.update.availableCommands ?? [];
+    assert.deepEqual(
+      commands.map((c) => c.name),
+      ["deploy"]
+    );
+    assert.equal(commands[0]?.description, "Ship the current branch");
+    assert.equal(commands[0]?.input?.hint, "<environment>");
+  } finally {
+    cleanup();
+  }
+});
+
+test("advertised command names carry no leading slash", async () => {
+  const { cwd, cleanup } = makeTempCwd({
+    ...COMMAND_FIXTURE,
+    ".claude/skills/audit/SKILL.md": "---\ndescription: Audit dependencies\n---\nCheck the lockfile.\n",
+  });
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    await agent.newSession({ cwd, mcpServers: [] });
+    await flushNotifications();
+
+    const commands = commandUpdates(conn)[0]?.update.availableCommands ?? [];
+    assert.deepEqual(
+      commands.map((c) => c.name),
+      ["audit", "deploy"]
+    );
+    for (const command of commands) {
+      assert.ok(!command.name.startsWith("/"), `${command.name} should not start with /`);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("newSession advertises an empty list when the cwd has no commands", async () => {
+  const { cwd, cleanup } = makeTempCwd({ "README.md": "hello" });
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+    await agent.newSession({ cwd, mcpServers: [] });
+    await flushNotifications();
+
+    assert.deepEqual(commandUpdates(conn)[0]?.update.availableCommands, []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("loadSession advertises commands after replaying history", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    store.save({
+      sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
+      cwd,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "ping" },
+        { role: "assistant", content: "pong" },
+      ],
+      title: "ping pong",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.1",
+      mode: "default",
+    });
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.loadSession({
+      sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
+      cwd,
+      mcpServers: [],
+    });
+    await flushNotifications();
+
+    const kinds = conn.updates.map(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate
+    );
+    // The snapshot lands last so the client has a hydrated transcript before it
+    // paints the slash menu.
+    assert.equal(kinds[kinds.length - 1], "available_commands_update");
+    assert.deepEqual(
+      commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
+      ["deploy"]
+    );
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("unstable_forkSession advertises commands on the new session id", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await flushNotifications();
+    conn.updates.length = 0;
+
+    const fork = await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
+    await flushNotifications();
+
+    const updates = commandUpdates(conn);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]?.sessionId, fork.sessionId);
+    assert.notEqual(updates[0]?.sessionId, sessionId);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("resumeSession advertises commands for the resumed cwd", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    store.save({
+      sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
+      cwd,
+      messages: [{ role: "system", content: "system" }],
+      title: null,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.1",
+      mode: "default",
+    });
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.resumeSession({
+      sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
+      cwd,
+      mcpServers: [],
+    });
+    await flushNotifications();
+
+    assert.deepEqual(
+      commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
+      ["deploy"]
+    );
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("prompt expands an advertised /command into its body", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const { glm, ref } = captureUserMessage();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/deploy staging" }],
+    });
+
+    assert.match(ref.value, /The user invoked the \/deploy command/);
+    assert.match(ref.value, /Run the deploy playbook\./);
+    assert.match(ref.value, /Arguments: staging/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("prompt leaves an unknown /command as plain prose", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const { glm, ref } = captureUserMessage();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/nope do something" }],
+    });
+
+    assert.equal(ref.value, "/nope do something");
+  } finally {
+    cleanup();
+  }
+});
+
+test("prompt titles the session with the typed command, not the expanded body", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const { glm } = captureUserMessage();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/deploy staging" }],
+    });
+
+    const info = conn.updates.find(
+      (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "session_info_update"
+    );
+    assert.equal((info?.update as { title?: string }).title, "/deploy staging");
+  } finally {
+    cleanup();
+  }
 });
