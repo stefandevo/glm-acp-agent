@@ -766,9 +766,9 @@ export class GlmAcpAgent implements Agent {
           this.visionClient,
           abortController.signal
         );
-    const { content: userContent } = visionNative
+    const userContent = visionNative
       ? renderVisionNativePromptBlocks(preprocessed.blocks)
-      : renderPromptBlocks(preprocessed.blocks);
+      : renderPromptBlocks(preprocessed.blocks).content;
     const userMessage: GlmMessage = { role: "user", content: userContent };
     session.messages.push(userMessage);
 
@@ -1414,18 +1414,15 @@ function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number
   return { content: plainText, plainText };
 }
 
-function renderVisionNativePromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number]>): {
-  content: ChatCompletionContentPart[];
-  plainText: string;
-} {
+function renderVisionNativePromptBlocks(
+  blocks: ReadonlyArray<PromptRequest["prompt"][number]>
+): ChatCompletionContentPart[] {
   const content: ChatCompletionContentPart[] = [];
-  const plainTextParts: string[] = [];
   let imageIndex = 0;
 
   const pushText = (text: string) => {
     if (text.length === 0) return;
     content.push({ type: "text", text });
-    plainTextParts.push(text);
   };
 
   for (const block of blocks) {
@@ -1450,7 +1447,6 @@ function renderVisionNativePromptBlocks(blocks: ReadonlyArray<PromptRequest["pro
         const imageUrl = toVisionNativeImageUrl(block);
         if (imageUrl) {
           content.push({ type: "image_url", image_url: { url: imageUrl } });
-          plainTextParts.push(`[image: ${block.mimeType}]`);
         } else {
           pushText(
             `<image_unsupported_format index="${imageIndex}" mime="${escapeAttribute(block.mimeType)}">Only image/jpeg, image/jpg, image/png inputs can be sent to the native vision model. Attach a supported HTTPS image URL or supported base64 image data.</image_unsupported_format>`
@@ -1466,7 +1462,7 @@ function renderVisionNativePromptBlocks(blocks: ReadonlyArray<PromptRequest["pro
     }
   }
 
-  return { content, plainText: plainTextParts.join("\n") };
+  return content;
 }
 
 function toVisionNativeImageUrl(block: Extract<PromptRequest["prompt"][number], { type: "image" }>): string | null {
