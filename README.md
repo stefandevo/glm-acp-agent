@@ -24,12 +24,13 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 
 ## Features
 
-- **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`
+- **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`, and pushes `session_info_update`, `config_option_update`, `current_mode_update`, and `available_commands_update` notifications
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
 - **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 20; see `ACP_GLM_MAX_TURNS` / `--max-turns`)
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
+- **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.3-flash` sends supported pasted ACP image blocks directly as native `image_url` content parts, while the other advertised coding models (including default `glm-5.3`) route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Seven built-in tools** (see below)
@@ -87,6 +88,36 @@ Clients can use `session/set_mode` to drive the permission policy:
 | `bypass_permissions` | Bypass all permissions | Silent | Silent |
 
 Reads, listings, and MCP tool calls are always silent across all modes.
+
+---
+
+## Slash commands
+
+After `session/new`, `session/load`, `session/fork`, and `session/resume`, the agent
+sends an ACP [`available_commands_update`](https://agentclientprotocol.com/protocol/v2/slash-commands)
+notification. Clients such as Zed and Paseo use it to populate their `/` autocomplete.
+Each notification is a full snapshot that replaces the previous list.
+
+The snapshot is built from the same on-disk layout Claude Code uses, read from the
+session's working directory and from `~/.claude` for user-level definitions:
+
+| Path | Command name |
+|---|---|
+| `<cwd>/.claude/commands/commit.md` | `/commit` |
+| `<cwd>/.claude/commands/review/pr.md` | `/review:pr` |
+| `<cwd>/.claude/skills/audit/SKILL.md` | `/audit` |
+
+Project definitions shadow user-level ones with the same name. The `description`
+and `argument-hint` keys of a file's YAML frontmatter become the menu entry's
+description and input hint; without a `description`, the first heading (then the
+first line) of the body is used instead.
+
+Advertised names are sent **without** a leading slash — the client prepends it for
+display and invokes the command by sending `/name …` as ordinary prompt text. When
+that text names an advertised command, the agent injects the definition's body into
+the user message, substituting `$ARGUMENTS` where the file asks for it and otherwise
+appending the typed arguments. Unknown `/foo` is left untouched and reaches the model
+as prose, so typing a slash by accident never fails the turn.
 
 ---
 
@@ -386,6 +417,7 @@ src/
 ├── protocol/
 │   ├── connection.ts         # Sets up the ACP stdio connection
 │   ├── agent.ts              # GlmAcpAgent – ACP protocol implementation
+│   ├── slash-commands.ts     # Discovers .claude commands/skills; expands `/name`
 │   └── session-store.ts      # On-disk persistence for load/fork/resume
 ├── tools/
 │   ├── definitions.ts        # Tool JSON schemas (function-calling format)
@@ -395,6 +427,7 @@ src/
     ├── credentials.test.ts   # Credential resolution and --setup persistence
     ├── executor.test.ts      # Tests for ToolExecutor
     ├── glm-client.test.ts    # Tests for streaming / tool-call assembly
+    ├── slash-commands.test.ts # Command discovery and `/name` expansion
     └── integration.test.ts   # End-to-end tests over the real ACP ndjson transport
 ```
 

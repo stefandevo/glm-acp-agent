@@ -31,6 +31,7 @@ import type {
   SetSessionConfigOptionRequest,
   SetSessionConfigOptionResponse,
   SessionConfigOption,
+  AvailableCommand,
   ModelInfo,
   StopReason,
   Usage,
@@ -56,6 +57,12 @@ import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
+import {
+  discoverSlashCommands,
+  parseSlashCommand,
+  renderSlashCommand,
+  type SlashCommand,
+} from "./slash-commands.js";
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
@@ -151,6 +158,8 @@ interface SessionState {
   mode: SessionModeId;
   /** Reasoning effort for this session, controlled via the `thought_level` config option. */
   thoughtLevel: ThoughtLevel;
+  /** Slash commands discovered under this session's cwd, advertised to the client. */
+  commands: SlashCommand[];
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -379,7 +388,10 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: "default",
       thoughtLevel,
+      commands: discoverSlashCommands(params.cwd),
     });
+
+    this.scheduleAvailableCommands(sessionId);
 
     return {
       sessionId,
@@ -387,6 +399,35 @@ export class GlmAcpAgent implements Agent {
       modes: this.modesState("default"),
       configOptions: this.configOptionsState(model, thoughtLevel, "default"),
     };
+  }
+
+  /**
+   * Queue an `available_commands_update` snapshot for a session.
+   *
+   * The notification is the only channel ACP gives us for slash-command
+   * autocomplete — it is not part of any method's response — so every session
+   * entry point (create / load / fork / resume) has to send one.
+   *
+   * It is deliberately *deferred* rather than awaited inline: a client learns a
+   * session's id from the `session/new` / `session/fork` response, so a
+   * notification written ahead of that response arrives for a session the client
+   * has never heard of, and clients drop those. Sending on the next macrotask
+   * puts it behind the response the caller is about to return (and, on load,
+   * behind the replayed transcript), which is also when a client is ready to
+   * paint the menu. Each send replaces the previous list wholesale.
+   */
+  private scheduleAvailableCommands(sessionId: string): void {
+    setTimeout(() => {
+      const session = this.sessions.get(sessionId);
+      if (!session) return;
+      void safeSessionUpdate(this.connection, {
+        sessionId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: availableCommandsState(session.commands),
+        },
+      });
+    }, 0);
   }
 
   async unstable_setSessionModel(
@@ -700,11 +741,18 @@ export class GlmAcpAgent implements Agent {
         debug(line);
       }
     }
+    // Clients invoke an advertised command by sending `/name …` as ordinary
+    // prompt text, so expand it here into the instructions its definition
+    // holds. Unknown `/foo` is left alone and reaches the model as prose.
+    const { blocks: promptBlocks, invocation } = expandPromptCommand(
+      params.prompt,
+      session.commands
+    );
     const visionNative = isVisionNativeModel(session.model);
     const preprocessed = visionNative
-      ? { blocks: params.prompt, cleanups: [] }
+      ? { blocks: promptBlocks, cleanups: [] }
       : await preprocessImageBlocks(
-          params.prompt,
+          promptBlocks,
           this.visionClient,
           abortController.signal
         );
@@ -737,7 +785,10 @@ export class GlmAcpAgent implements Agent {
       const titleUpdate: { title?: string | null } =
         session.title === null
           ? (() => {
-              const derived = userText.slice(0, 80).replace(/\s+/g, " ").trim();
+              const derived = (invocation ?? userText)
+                .slice(0, 80)
+                .replace(/\s+/g, " ")
+                .trim();
               session.title = derived.length > 0 ? derived : "New conversation";
               return { title: session.title };
             })()
@@ -882,6 +933,7 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
+      commands: discoverSlashCommands(params.cwd),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -889,6 +941,8 @@ export class GlmAcpAgent implements Agent {
     // Tool / system messages are skipped — they're internal and the client
     // doesn't render them on its own.
     await this.replayMessages(params.sessionId, persisted.messages);
+
+    this.scheduleAvailableCommands(params.sessionId);
 
     return {
       models: this.modelsState(persisted.model),
@@ -927,9 +981,14 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
+      commands: discoverSlashCommands(params.cwd),
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
+
+    // Notify on the *created* session id — the parent thread's command list is
+    // unchanged and a notify there would repaint the wrong menu.
+    this.scheduleAvailableCommands(newSessionId);
 
     return {
       sessionId: newSessionId,
@@ -963,8 +1022,11 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
+      commands: discoverSlashCommands(params.cwd),
     };
     this.sessions.set(params.sessionId, restored);
+
+    this.scheduleAvailableCommands(params.sessionId);
 
     // Resume does NOT replay history — the client keeps its own UI state and
     // just wants the agent to pick up where it left off.
@@ -1448,6 +1510,48 @@ function availableModelsWith(currentModelId: string): ModelInfo[] {
   return available.some((m) => m.modelId === currentModelId)
     ? available
     : [...available, { modelId: currentModelId, name: currentModelId }];
+}
+
+/**
+ * Map discovered commands onto the ACP wire shape. Names are sent *without* a
+ * leading slash — the client prepends it for display and sends `/name …` back
+ * as prompt text. `input` is omitted for commands that declare no
+ * `argument-hint`, which is how a client learns the command takes no extra text.
+ */
+function availableCommandsState(
+  commands: ReadonlyArray<SlashCommand>
+): AvailableCommand[] {
+  return commands.map((command) => ({
+    name: command.name,
+    description: command.description,
+    ...(command.argumentHint !== undefined
+      ? { input: { hint: command.argumentHint } }
+      : {}),
+  }));
+}
+
+/**
+ * Expand a leading `/name` in the first prompt block into the command's body.
+ *
+ * Returns the blocks unchanged (and a null `invocation`) when the prompt does
+ * not start with an advertised command. `invocation` carries the text the user
+ * actually typed so the session title doesn't end up being the expanded body.
+ */
+function expandPromptCommand(
+  blocks: PromptRequest["prompt"],
+  commands: ReadonlyArray<SlashCommand>
+): { blocks: PromptRequest["prompt"]; invocation: string | null } {
+  const first = blocks[0];
+  if (first?.type !== "text") return { blocks, invocation: null };
+  const parsed = parseSlashCommand(first.text, commands);
+  if (!parsed) return { blocks, invocation: null };
+  return {
+    blocks: [{ ...first, text: renderSlashCommand(parsed) }, ...blocks.slice(1)],
+    invocation:
+      parsed.args.length > 0
+        ? `/${parsed.command.name} ${parsed.args}`
+        : `/${parsed.command.name}`,
+  };
 }
 
 /**
