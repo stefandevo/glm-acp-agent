@@ -5,7 +5,7 @@ import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import type { GlmStreamChunk } from "../llm/glm-client.js";
-import { SessionStore } from "../protocol/session-store.js";
+import { SessionStore, SESSION_SCHEMA_VERSION } from "../protocol/session-store.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
 // Defence in depth: even though every test below opts out via `sessionStore: null`,
@@ -1363,7 +1363,7 @@ test("v2 sessions (no thoughtLevel) migrate and resolve to the model default on 
     // The store migrates the raw record, defaulting thoughtLevel to "max".
     const store = new SessionStore(dir);
     const migrated = store.load(sessionId);
-    assert.equal(migrated?.schemaVersion, 3);
+    assert.equal(migrated?.schemaVersion, SESSION_SCHEMA_VERSION);
     assert.equal(migrated?.thoughtLevel, "max");
 
     // On load the agent clamps that to the session's model (glm-4.7 → "on").
@@ -2772,5 +2772,218 @@ test("prompt titles the session with the typed command, not the expanded body", 
     assert.equal((info?.update as { title?: string }).title, "/deploy staging");
   } finally {
     cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Display text (what the UI replays) vs. model text (what the model sees)
+// ---------------------------------------------------------------------------
+
+/** Pull the replayed `user_message_chunk` texts out of a connection stub. */
+function replayedUserTexts(conn: ReturnType<typeof createConnectionStub>): string[] {
+  return conn.updates
+    .filter((u) => (u.update as { sessionUpdate: string }).sessionUpdate === "user_message_chunk")
+    .map((u) => (u.update as { content: { text: string } }).content.text);
+}
+
+test("loadSession replays the typed slash invocation, not the expanded body", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const { glm } = captureUserMessage();
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/deploy staging" }],
+    });
+
+    // A fresh agent reads the record back from disk, exactly as a client
+    // reopening the conversation would.
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
+
+    assert.deepEqual(replayedUserTexts(conn), ["/deploy staging"]);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("the model still sees the expanded command body after a reload", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const { glm, ref } = captureUserMessage();
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/deploy staging" }],
+    });
+    assert.match(ref.value, /^<slash_command name="deploy"/);
+
+    const reopened = new GlmAcpAgent(createConnectionStub() as never, {
+      glm,
+      sessionStore: store,
+    });
+    await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
+    const persisted = store.load(sessionId);
+    const user = persisted?.messages.find((m) => m.role === "user");
+    assert.match(String(user?.content), /^<slash_command name="deploy"/);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("loadSession replays an image placeholder, not the vision annotation", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+    const visionClient = {
+      async callTool() {
+        return { content: [{ type: "text", text: "It is a kitten." }] };
+      },
+      async dispose() {},
+    };
+    const agent = new GlmAcpAgent(createConnectionStub() as never, {
+      glm,
+      visionClient,
+      sessionStore: store,
+    });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({
+      sessionId,
+      prompt: [
+        { type: "text", text: "What is in this image?" },
+        { type: "image", data: "", mimeType: "image/png", uri: "https://example.com/cat.png" },
+      ],
+    });
+
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+
+    assert.deepEqual(replayedUserTexts(conn), [
+      "What is in this image?\n[image: image/png]",
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("plain prompts are replayed verbatim and store no display-text sidecar", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "just prose" }] });
+
+    assert.equal(store.load(sessionId)?.displayText, undefined);
+
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    assert.deepEqual(replayedUserTexts(conn), ["just prose"]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a forked session replays the typed invocation too", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const { glm } = captureUserMessage();
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/deploy staging" }] });
+
+    const fork = await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
+
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId: fork.sessionId, cwd, mcpServers: [] });
+
+    assert.deepEqual(replayedUserTexts(conn), ["/deploy staging"]);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("display text survives a compaction that drops earlier turns", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const { glm } = captureUserMessage();
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    // glm-5-turbo has the smallest catalogued window (128k), so a handful of
+    // fat turns is enough to trip proactive compaction.
+    await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+
+    // Compaction preserves the last 10 interaction groups and evicts the
+    // largest of the rest, so every surviving message shifts index. A sidecar
+    // keyed by position would follow the wrong message afterwards.
+    const filler = "x".repeat(40_000);
+    for (let i = 0; i < 12; i++) {
+      await agent.prompt({ sessionId, prompt: [{ type: "text", text: `turn ${i} ${filler}` }] });
+    }
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/deploy staging" }] });
+
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
+
+    const texts = replayedUserTexts(conn);
+    assert.ok(
+      texts.length < 13,
+      `expected compaction to drop turns, got ${texts.length} replayed user messages`
+    );
+    assert.equal(texts[texts.length - 1], "/deploy staging");
+    // The sidecar must not have leaked onto any other surviving turn.
+    assert.equal(texts.filter((t) => t === "/deploy staging").length, 1);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("v3 sessions (no displayText) migrate and replay their stored content", async () => {
+  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-migrate-"));
+  const sessionId = "abcd1234-abcd-abcd-abcd-abcdabcd1234";
+  try {
+    const v3 = {
+      schemaVersion: 3,
+      sessionId,
+      cwd: "/tmp",
+      messages: [
+        { role: "system", content: "you are a coding assistant" },
+        { role: "user", content: "ping" },
+        { role: "assistant", content: "pong" },
+      ],
+      title: "old session",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-4.7",
+      mode: "default",
+      thoughtLevel: "on",
+    };
+    writeFileSync(pathJoin(dir, `${sessionId}.json`), JSON.stringify(v3), "utf8");
+
+    const store = new SessionStore(dir);
+    const migrated = store.load(sessionId);
+    assert.equal(migrated?.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.equal(migrated?.displayText, undefined);
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    assert.deepEqual(replayedUserTexts(conn), ["ping"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

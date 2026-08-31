@@ -8,7 +8,7 @@ import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
  * shape of `PersistedSession` changes incompatibly so future loaders can
  * migrate (or reject) old records instead of silently producing garbage.
  */
-export const SESSION_SCHEMA_VERSION = 3 as const;
+export const SESSION_SCHEMA_VERSION = 4 as const;
 
 /**
  * On-disk representation of a session. Only fields that need to survive a
@@ -35,6 +35,17 @@ export interface PersistedSession {
    * the migration (and load-time resolution) default it to "max".
    */
   thoughtLevel?: ThoughtLevel;
+  /**
+   * Replay text for user messages whose stored `content` differs from what the
+   * user actually typed — a slash command expanded into its body, an image
+   * replaced by its vision annotation. Keys are indices into `messages`;
+   * entries are written only where the two texts diverge, so an ordinary
+   * conversation persists no sidecar at all.
+   *
+   * Indices are re-derived from message identity on every save, so they stay
+   * correct across the compaction that drops turns from `messages`.
+   */
+  displayText?: Record<string, string>;
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
@@ -106,9 +117,11 @@ export class SessionStore {
       return undefined;
     }
     // Handle schema migrations. We support v1 (pre-modes), v2 (with mode
-    // field), and v3 (with thoughtLevel). Defaulting thoughtLevel to "max"
-    // is safe: it's GLM-5.3's own default effort, and load-time resolution
-    // clamps it to a valid level for the session's actual model.
+    // field), v3 (with thoughtLevel), and v4 (with displayText). Defaulting
+    // thoughtLevel to "max" is safe: it's GLM-5.3's own default effort, and
+    // load-time resolution clamps it to a valid level for the session's
+    // actual model. `displayText` needs no backfill — its absence already
+    // means "replay the stored content", which is what older records did.
     const version = parsed.schemaVersion ?? 1;
     if (version === 1) {
       // Migration: add mode + thoughtLevel fields with default values.
@@ -126,6 +139,10 @@ export class SessionStore {
         thoughtLevel: "max",
         schemaVersion: SESSION_SCHEMA_VERSION,
       };
+    }
+    if (version === 3) {
+      // Migration: no new data to backfill, just retag at the current version.
+      return { ...parsed, schemaVersion: SESSION_SCHEMA_VERSION };
     }
     if (version !== SESSION_SCHEMA_VERSION) {
       // Forward-incompatible record written by a newer agent build.
