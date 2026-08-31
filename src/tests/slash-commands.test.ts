@@ -96,6 +96,20 @@ test("discoverSlashCommands falls back to the first heading, then the first line
   }
 });
 
+test("discoverSlashCommands matches frontmatter keys case-insensitively", () => {
+  const { cwd, cleanup } = makeTree({
+    ".claude/commands/ship.md":
+      "---\nDescription: Ship it\nArgument-Hint: <target>\n---\nDo the thing.\n",
+  });
+  try {
+    const commands = discoverSlashCommands(cwd);
+    assert.equal(commands[0]?.description, "Ship it");
+    assert.equal(commands[0]?.argumentHint, "<target>");
+  } finally {
+    cleanup();
+  }
+});
+
 test("discoverSlashCommands omits argumentHint when the definition declares none", () => {
   const { cwd, cleanup } = makeTree({
     ".claude/commands/status.md": "---\ndescription: Show status\n---\nRun git status.\n",
