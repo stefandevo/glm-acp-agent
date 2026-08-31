@@ -20,7 +20,7 @@
  * All I/O errors are swallowed: having no commands at all is the common case,
  * and a broken command file should never fail `session/new`.
  */
-import { readdirSync, readFileSync, type Dirent } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -55,8 +55,21 @@ const MAX_COMMANDS = 200;
 /** How deep to walk `.claude/commands`; deeper files are ignored. */
 const MAX_COMMAND_DEPTH = 3;
 
-/** Descriptions are shown in a one-line menu entry, so keep them short. */
-const DESCRIPTION_CAP_CHARS = 200;
+/**
+ * Cap on the strings that reach the client's one-line menu entry — the
+ * description and the argument hint. Both are advertised verbatim, so neither
+ * may carry an unbounded frontmatter value through to the notification.
+ */
+const MENU_TEXT_CAP_CHARS = 200;
+
+/**
+ * Cap on how much of a command file is read. Discovery runs automatically at
+ * every session entry point over as many as {@link MAX_COMMANDS} files, so an
+ * oversized file in a cloned workspace must never be pulled into memory whole.
+ * A bounded prefix rather than a hard skip keeps frontmatter and the start of
+ * the body usable; {@link COMMAND_BODY_CAP_CHARS} still binds what we store.
+ */
+const MAX_COMMAND_FILE_BYTES = 64 * 1024;
 
 /**
  * Names have to survive being typed after a `/` and split on whitespace, and we
@@ -91,8 +104,9 @@ function collectCommandFiles(
   prefix: string[],
   found: Map<string, SlashCommand>
 ): void {
-  if (prefix.length >= MAX_COMMAND_DEPTH) return;
+  if (prefix.length >= MAX_COMMAND_DEPTH || found.size >= MAX_COMMANDS) return;
   for (const entry of readDirSafe(dir)) {
+    if (found.size >= MAX_COMMANDS) return;
     const path = pathJoin(dir, entry.name);
     if (entry.isDirectory()) {
       collectCommandFiles(path, [...prefix, entry.name], found);
@@ -105,7 +119,9 @@ function collectCommandFiles(
 
 /** Read `<skills>/<name>/SKILL.md` definitions; the directory name is the command name. */
 function collectSkillFiles(dir: string, found: Map<string, SlashCommand>): void {
+  if (found.size >= MAX_COMMANDS) return;
   for (const entry of readDirSafe(dir)) {
+    if (found.size >= MAX_COMMANDS) return;
     if (!entry.isDirectory()) continue;
     addCommand(found, entry.name, pathJoin(dir, entry.name, "SKILL.md"));
   }
@@ -119,26 +135,40 @@ function readDirSafe(dir: string): Dirent<string>[] {
   }
 }
 
+/**
+ * Read at most {@link MAX_COMMAND_FILE_BYTES} from a file, or `undefined` when
+ * it can't be read at all. A trailing multi-byte character can be cut at the
+ * boundary, which is harmless: the tail of a file that large is discarded by
+ * the body cap regardless.
+ */
+function readCappedFile(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(MAX_COMMAND_FILE_BYTES);
+    const bytes = readSync(fd, buffer, 0, MAX_COMMAND_FILE_BYTES, 0);
+    return buffer.toString("utf-8", 0, bytes);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function addCommand(
   found: Map<string, SlashCommand>,
   name: string,
   path: string
 ): void {
-  if (found.size >= MAX_COMMANDS) return;
   if (!COMMAND_NAME_PATTERN.test(name) || found.has(name)) return;
-  let contents: string;
-  try {
-    contents = readFileSync(path, { encoding: "utf-8" });
-  } catch {
-    return;
-  }
+  const contents = readCappedFile(path);
+  if (contents === undefined) return;
   const { frontmatter, body } = splitFrontmatter(contents);
+  const argumentHint = frontmatter["argument-hint"]?.slice(0, MENU_TEXT_CAP_CHARS);
   found.set(name, {
     name,
     description: describe(frontmatter["description"], body, name),
-    ...(frontmatter["argument-hint"] !== undefined
-      ? { argumentHint: frontmatter["argument-hint"] }
-      : {}),
+    ...(argumentHint !== undefined ? { argumentHint } : {}),
     body: body.slice(0, COMMAND_BODY_CAP_CHARS).trim(),
     source: path,
   });
@@ -186,7 +216,7 @@ function describe(
   const candidates = [fromFrontmatter, firstHeading(body), firstProseLine(body)];
   for (const candidate of candidates) {
     const text = candidate?.replace(/\s+/g, " ").trim();
-    if (text) return text.slice(0, DESCRIPTION_CAP_CHARS);
+    if (text) return text.slice(0, MENU_TEXT_CAP_CHARS);
   }
   return `Run the /${name} command.`;
 }

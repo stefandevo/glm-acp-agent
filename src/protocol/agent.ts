@@ -1531,9 +1531,14 @@ function availableCommandsState(
 }
 
 /**
- * Expand a leading `/name` in the first prompt block into the command's body.
+ * Expand a leading `/name` in the prompt's first written text into the
+ * command's body.
  *
- * Returns the blocks unchanged (and a null `invocation`) when the prompt does
+ * The target is the first text block that actually has content, not block 0:
+ * a client may place an image or resource block ahead of what the user typed,
+ * and the command would otherwise reach the model as a literal `/name`.
+ *
+ * Returns the blocks unchanged (and a null `invocation`) when that text does
  * not start with an advertised command. `invocation` carries the text the user
  * actually typed so the session title doesn't end up being the expanded body.
  */
@@ -1541,12 +1546,17 @@ function expandPromptCommand(
   blocks: PromptRequest["prompt"],
   commands: ReadonlyArray<SlashCommand>
 ): { blocks: PromptRequest["prompt"]; invocation: string | null } {
-  const first = blocks[0];
-  if (first?.type !== "text") return { blocks, invocation: null };
-  const parsed = parseSlashCommand(first.text, commands);
+  const index = blocks.findIndex(
+    (block) => block.type === "text" && block.text.trim().length > 0
+  );
+  const typed = blocks[index];
+  if (typed?.type !== "text") return { blocks, invocation: null };
+  const parsed = parseSlashCommand(typed.text, commands);
   if (!parsed) return { blocks, invocation: null };
+  const expanded = [...blocks];
+  expanded[index] = { ...typed, text: renderSlashCommand(parsed) };
   return {
-    blocks: [{ ...first, text: renderSlashCommand(parsed) }, ...blocks.slice(1)],
+    blocks: expanded,
     invocation:
       parsed.args.length > 0
         ? `/${parsed.command.name} ${parsed.args}`
