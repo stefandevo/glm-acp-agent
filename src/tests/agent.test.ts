@@ -2926,27 +2926,47 @@ test("display text survives a compaction that drops earlier turns", async () => 
     // fat turns is enough to trip proactive compaction.
     await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
 
-    // Compaction preserves the last 10 interaction groups and evicts the
-    // largest of the rest, so every surviving message shifts index. A sidecar
-    // keyed by position would follow the wrong message afterwards.
+    // Ordering is the whole point: the command has to land *before* the turns
+    // that trigger eviction, and stay inside the preserved tail, so its entry
+    // already exists when compaction renumbers the messages around it. Run the
+    // command last instead and eviction is over before there is anything to
+    // misplace — the test would then pass against a naive index-keyed map.
     const filler = "x".repeat(40_000);
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 3; i++) {
       await agent.prompt({ sessionId, prompt: [{ type: "text", text: `turn ${i} ${filler}` }] });
     }
     await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/deploy staging" }] });
+    const keysBefore = Object.keys(store.load(sessionId)?.displayText ?? {});
+    assert.equal(keysBefore.length, 1);
+
+    for (let i = 3; i < 12; i++) {
+      await agent.prompt({ sessionId, prompt: [{ type: "text", text: `turn ${i} ${filler}` }] });
+    }
+
+    const persisted = store.load(sessionId);
+    const keysAfter = Object.keys(persisted?.displayText ?? {});
+    assert.equal(keysAfter.length, 1);
+    assert.notDeepEqual(
+      keysAfter,
+      keysBefore,
+      "expected compaction to evict leading turns and renumber the entry"
+    );
+    // Renumbered onto the command itself, not whatever now sits at the old index.
+    assert.match(
+      String(persisted?.messages[Number(keysAfter[0])]?.content),
+      /^<slash_command name="deploy"/
+    );
 
     const conn = createConnectionStub();
     const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
     await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
 
     const texts = replayedUserTexts(conn);
-    assert.ok(
-      texts.length < 13,
-      `expected compaction to drop turns, got ${texts.length} replayed user messages`
-    );
-    assert.equal(texts[texts.length - 1], "/deploy staging");
-    // The sidecar must not have leaked onto any other surviving turn.
+    assert.ok(texts.length < 13, `expected dropped turns, got ${texts.length} replayed`);
     assert.equal(texts.filter((t) => t === "/deploy staging").length, 1);
+    // `turn 3` was the prompt immediately after the command, so this pins the
+    // replayed invocation to the right position in the surviving transcript.
+    assert.ok(texts[texts.indexOf("/deploy staging") + 1]?.startsWith("turn 3 "));
   } finally {
     cleanupCwd();
     cleanupStore();
