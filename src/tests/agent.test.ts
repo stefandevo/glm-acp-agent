@@ -2484,6 +2484,116 @@ test("prompt fails fast when context overflow persists after emergency compactio
 });
 
 // ---------------------------------------------------------------------------
+// Native images and context compaction
+// ---------------------------------------------------------------------------
+
+/** A minimal, well-formed data URL image part for a vision-native message. */
+function imagePart(): { type: "image_url"; image_url: { url: string } } {
+  return {
+    type: "image_url",
+    image_url: { url: "data:image/png;base64,iVBORw0KGgo=" },
+  };
+}
+
+test("proactive compaction counts native image parts toward the context estimate", async () => {
+  const conn = createConnectionStub();
+  let messagesInCall = 0;
+
+  const glm = {
+    async *streamChat(messages: ReadonlyArray<{ role: string }>): AsyncGenerator<GlmStreamChunk> {
+      messagesInCall = messages.length;
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+
+  // Pin to a vision-native model with a 200K window so a realistic number of
+  // images is enough to cross the 90% proactive-compaction threshold.
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
+  const session = (agent as unknown as {
+    sessions: Map<string, { messages: unknown[] }>;
+  }).sessions.get(sessionId);
+  assert.ok(session, "expected in-memory session to exist");
+
+  // 150 image-bearing turns. The *text* in this history is negligible — only
+  // the images can push the estimate past the threshold.
+  for (let i = 0; i < 150; i++) {
+    session.messages.push({
+      role: "user",
+      content: [{ type: "text", text: "look" }, imagePart()],
+    });
+    session.messages.push({ role: "assistant", content: "seen" });
+  }
+  const messagesBefore = session.messages.length;
+
+  await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "and this one?" }],
+  });
+
+  assert.ok(
+    messagesInCall < messagesBefore,
+    `expected image-heavy history to be compacted before the call (sent ${messagesInCall}, had ${messagesBefore})`
+  );
+});
+
+test("emergency compaction evicts history even when the estimate is under target", async () => {
+  const conn = createConnectionStub();
+  let callCount = 0;
+  let messagesInFirstCall = 0;
+  let messagesInSecondCall = 0;
+
+  const glm = {
+    async *streamChat(messages: ReadonlyArray<{ role: string }>): AsyncGenerator<GlmStreamChunk> {
+      callCount++;
+      if (callCount === 1) {
+        messagesInFirstCall = messages.length;
+        const err = new Error("Prompt exceeds max length") as OverflowErrorLike;
+        err.error = { code: 1261 };
+        throw err;
+      }
+      messagesInSecondCall = messages.length;
+      yield { text: "Recovered." };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const session = (agent as unknown as {
+    sessions: Map<string, { messages: unknown[] }>;
+  }).sessions.get(sessionId);
+  assert.ok(session, "expected in-memory session to exist");
+
+  // Twenty tiny turns: the heuristic estimate sits far below any compaction
+  // target, so only a forced eviction can shrink the retry payload. The real
+  // cost the provider rejected (images, or anything the heuristic under-counts)
+  // is invisible to the estimate by construction.
+  for (let i = 0; i < 20; i++) {
+    session.messages.push({ role: "user", content: [{ type: "text", text: "hi" }, imagePart()] });
+    session.messages.push({ role: "assistant", content: "ok" });
+  }
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "one more" }],
+  });
+
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(callCount, 2, "expected two streamChat calls (one failed, one retried)");
+  assert.ok(
+    messagesInSecondCall < messagesInFirstCall,
+    `expected the retry to send strictly less history (sent ${messagesInSecondCall}, first call had ${messagesInFirstCall})`
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Slash commands (available_commands_update)
 // ---------------------------------------------------------------------------
 
