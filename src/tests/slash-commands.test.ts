@@ -140,6 +140,49 @@ test("discoverSlashCommands lets a project command shadow a same-named user comm
   }
 });
 
+test("discoverSlashCommands caps an oversized argument hint", () => {
+  const { cwd, cleanup } = makeTree({
+    ".claude/commands/huge.md":
+      `---\ndescription: Fine\nargument-hint: ${"x".repeat(5000)}\n---\nbody\n`,
+  });
+  try {
+    assert.equal(discoverSlashCommands(cwd)[0]?.argumentHint?.length, 200);
+  } finally {
+    cleanup();
+  }
+});
+
+test("discoverSlashCommands reads only a bounded prefix of an oversized file", () => {
+  // Discovery runs at every session entry point, so an oversized file must be
+  // truncated on read rather than pulled into memory whole. The heading sits
+  // past the read cap: it is only reachable if the whole file was read, so the
+  // description it would produce is the probe for an unbounded read.
+  const { cwd, cleanup } = makeTree({
+    ".claude/commands/big.md": `${"filler\n".repeat(600_000)}# Past the read cap\n`,
+  });
+  try {
+    const command = discoverSlashCommands(cwd)[0];
+    assert.equal(command?.name, "big");
+    assert.equal(command?.description, "filler");
+    assert.equal(command?.body.length, 16 * 1024);
+  } finally {
+    cleanup();
+  }
+});
+
+test("discoverSlashCommands stops traversing once the command cap is reached", () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 250; i++) {
+    files[`.claude/commands/c${String(i).padStart(3, "0")}.md`] = "body\n";
+  }
+  const { cwd, cleanup } = makeTree(files);
+  try {
+    assert.equal(discoverSlashCommands(cwd).length, 200);
+  } finally {
+    cleanup();
+  }
+});
+
 test("discoverSlashCommands returns nothing for a cwd with no .claude directory", () => {
   const { cwd, cleanup } = makeTree({ "README.md": "hello" });
   try {

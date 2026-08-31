@@ -2705,6 +2705,35 @@ test("prompt expands an advertised /command into its body", async () => {
   }
 });
 
+test("prompt expands a /command that follows a non-text block", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    const { glm, ref } = captureUserMessage();
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: null,
+      visionClient: null,
+    });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    // A client may put a pasted image ahead of the typed text; the command is
+    // still what the user wrote.
+    await agent.prompt({
+      sessionId,
+      prompt: [
+        { type: "image", mimeType: "image/png", data: "aGk=" },
+        { type: "text", text: "/deploy staging" },
+      ],
+    });
+
+    assert.match(ref.value, /The user invoked the \/deploy command/);
+    assert.match(ref.value, /Run the deploy playbook\./);
+  } finally {
+    cleanup();
+  }
+});
+
 test("prompt leaves an unknown /command as plain prose", async () => {
   const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
   try {
