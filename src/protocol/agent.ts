@@ -171,7 +171,7 @@ interface SessionState {
    * point at the wrong message. A WeakMap also drops evicted entries on its
    * own. Serialized to indices at save time and rebuilt on load.
    */
-  displayText: WeakMap<GlmMessage & object, string>;
+  displayText: WeakMap<GlmMessage, string>;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -1087,8 +1087,8 @@ export class GlmAcpAgent implements Agent {
       model: session.model,
       mode: session.mode,
       thoughtLevel: session.thoughtLevel,
-      // Omitted entirely for conversations where nothing diverges, which is
-      // the common case — an ordinary session gains no on-disk weight.
+      // Absent for the common case where nothing diverges, so an ordinary
+      // session gains no on-disk weight.
       ...(displayText ? { displayText } : {}),
     };
   }
@@ -1123,7 +1123,6 @@ export class GlmAcpAgent implements Agent {
   ): Promise<void> {
     for (const msg of messages) {
       if (msg.role === "user") {
-        // Prefer what the user typed over what we handed the model.
         const text = displayText.get(msg) ?? stringifyUserMessage(msg.content);
         if (text.length === 0) continue;
         await this.connection.sessionUpdate({
@@ -1399,9 +1398,8 @@ function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number
         break;
       }
       case "image": {
-        // Reached on the display-text pass, which renders the untouched
-        // prompt; on the model-facing pass images have been preprocessed away
-        // into `<image_analysis>` annotations upstream.
+        // Only the display-text pass sees these; the model-facing pass has had
+        // its images preprocessed into `<image_analysis>` annotations upstream.
         textParts.push(`[image: ${block.mimeType}]`);
         break;
       }
@@ -1520,12 +1518,12 @@ function serializeDisplayText(
   displayText: SessionState["displayText"]
 ): Record<string, string> | undefined {
   let out: Record<string, string> | undefined;
-  messages.forEach((message, index) => {
+  for (const [index, message] of messages.entries()) {
     const text = displayText.get(message);
-    if (text === undefined) return;
+    if (text === undefined) continue;
     out ??= {};
     out[String(index)] = text;
-  });
+  }
   return out;
 }
 
@@ -1534,7 +1532,7 @@ function deserializeDisplayText(
   messages: ReadonlyArray<GlmMessage>,
   persisted: Record<string, string> | undefined
 ): SessionState["displayText"] {
-  const out = new WeakMap<GlmMessage & object, string>();
+  const out = new WeakMap<GlmMessage, string>();
   if (!persisted) return out;
   for (const [key, text] of Object.entries(persisted)) {
     const message = messages[Number(key)];

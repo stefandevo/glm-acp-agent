@@ -2987,3 +2987,30 @@ test("v3 sessions (no displayText) migrate and replay their stored content", asy
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("resumeSession carries the sidecar forward so a later save keeps it", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const { glm } = captureUserMessage();
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/deploy staging" }] });
+
+    // Resume replays nothing, but it must still rebuild the sidecar: the next
+    // prompt re-persists the session, and a dropped map would quietly rewrite
+    // the record without it.
+    const resumed = new GlmAcpAgent(createConnectionStub() as never, { glm, sessionStore: store });
+    await resumed.resumeSession({ sessionId, cwd, mcpServers: [] });
+    await resumed.prompt({ sessionId, prompt: [{ type: "text", text: "and now?" }] });
+
+    const conn = createConnectionStub();
+    const reopened = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
+
+    assert.deepEqual(replayedUserTexts(conn), ["/deploy staging", "and now?"]);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
