@@ -22,13 +22,21 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "read_file",
       description:
-        "Read the text content of a file from the agent process. Relative paths resolve against the ACP session working directory.",
+        "Read the text content of a file from the agent process. Relative paths resolve against the ACP session working directory. Large responses are truncated: pass offset (1-based start line) and limit (max lines, default 2000) to page through; the result reports the shown range and the total line count.",
       parameters: {
         type: "object",
         properties: {
           path: {
             type: "string",
             description: "Absolute or relative path to the file to read.",
+          },
+          offset: {
+            type: "number",
+            description: "1-based line number to start reading from. Default 1.",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of lines to return. Default 2000.",
           },
         },
         required: ["path"],
@@ -186,6 +194,43 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           },
         },
         required: ["image_source"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "todowrite",
+      description:
+        "Create or replace the session's structured task list. Use it for multi-step work so progress is tracked in the task list instead of narrated in text; skip it for single-step, trivial, or purely conversational requests. Keep exactly one task list: each call replaces the previous one entirely. Mark a task in_progress before starting it and completed as soon as it is done — never batch status updates after the fact.",
+      parameters: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            description: "The full task list, replacing any previous one.",
+            items: {
+              type: "object",
+              properties: {
+                content: {
+                  type: "string",
+                  description: "Short imperative description of the task.",
+                },
+                status: {
+                  type: "string",
+                  enum: ["pending", "in_progress", "completed"],
+                  description: "pending = not started, in_progress = currently working on it, completed = done.",
+                },
+                active_form: {
+                  type: "string",
+                  description: "Present-progressive form shown while the task runs, e.g. 'Renaming the entry point'.",
+                },
+              },
+              required: ["content", "status"],
+            },
+          },
+        },
+        required: ["todos"],
       },
     },
   },

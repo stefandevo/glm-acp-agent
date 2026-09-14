@@ -36,10 +36,11 @@ agent process with paths resolved from the session working directory.`;
 const TOOLS_TEMPLATE = `<tools>
 Available tools: __TOOLS__
 - Use only tools listed above.
+- Working output is tool calls, not prose: do not narrate what you are about to do — the client renders each tool call as it runs. Reserve text for conclusions, answers, and questions for the user.
+- For multi-step work, maintain the task list with todowrite (mark a task in_progress before starting it, completed when finishing it) instead of describing progress in text.
 - Prefer reading before writing: when modifying a file, read it first so your edit is grounded in the current contents.
 - To change an existing file, prefer edit_file with a minimal exact snippet over write_file with the whole file: it keeps diffs surgical and avoids output-token limits.
 - Issue independent lookups (multiple file reads, separate searches) in parallel rather than sequentially.
-- Briefly state what you are about to do before invoking any tool that touches the file system, terminal, or network.
 </tools>`;
 
 const FILE_SYSTEM_GUIDELINES = `<file_system_guidelines>

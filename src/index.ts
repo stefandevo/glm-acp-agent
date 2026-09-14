@@ -45,6 +45,7 @@ if (args.includes("--setup")) {
       "  ACP_GLM_BASE_URL               Override the Z.AI API base URL",
       "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default 32768)",
       "  ACP_GLM_THINKING               Force thinking mode (true / false)",
+      "  ACP_GLM_STREAM_THINKING        Forward reasoning to the client as thought chunks (default true)",
       "  ACP_GLM_SESSION_DIR            Where to persist sessions (default: ~/.local/state/glm-acp-agent/sessions)",
       "  ACP_GLM_DEBUG                  Enable verbose stderr logging (true or 1)",
       "  XDG_CONFIG_HOME                Where to read/write credentials.json (default: ~/.config)",

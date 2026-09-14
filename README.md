@@ -33,7 +33,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.3-flash` sends supported pasted ACP image blocks directly as native `image_url` content parts, while the other advertised coding models (including default `glm-5.3`) route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
-- **Eight built-in tools** (see below)
+- **Nine built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
 - **Configurable permissions** – `write_file` and `run_command` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
@@ -70,9 +70,10 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 
 | Tool | Runs on | Permission behavior | Description |
 |------|---------|---------------------|-------------|
-| `read_file` | Agent process | Always silent | Read the text content of a file |
+| `read_file` | Agent process | Always silent | Read a text file, paginated by offset/limit (default 2000 lines, capped at 5000); the result reports the shown range |
 | `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
 | `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file — a surgical edit instead of a full rewrite. Re-reads and re-validates after the permission prompt so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
+| `todowrite` | Agent process | Always silent | Create or replace the session's structured task list so multi-step progress is tracked instead of narrated in chat. Each call replaces the list; the tool result renders it back to the model. |
 | `list_files` | Agent process | Always silent | List a directory using Node filesystem APIs |
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
@@ -178,6 +179,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
+| `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
 | `ACP_GLM_DEBUG` | No | — | Set to `true` or `1` to enable verbose debug logging to stderr (shows model selection, API key resolution, tool calls, and usage stats) |
 | `XDG_CONFIG_HOME` | No | `~/.config` | Where the credentials file is read/written |

@@ -52,7 +52,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { ToolExecutor } from "../tools/executor.js";
+import { ToolExecutor, type TodoItem } from "../tools/executor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
@@ -244,8 +244,11 @@ function envMaxTurns(): number | undefined {
 
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
+  private sessionTodos: Map<string, TodoItem[]> = new Map();
   private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
   private maxTurns: number;
+  /** Forward GLM reasoning to the client as agent_thought_chunk. Default on; disable with ACP_GLM_STREAM_THINKING=false. */
+  private streamThinking: boolean;
   private clientCapabilities: ClientCapabilities | null = null;
   private sessionStore: SessionStore | null;
   private _visionClient: VisionMcpClient | null;
@@ -266,6 +269,7 @@ export class GlmAcpAgent implements Agent {
         : (options.sessionStore ?? new SessionStore());
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
+    this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
   private get glm(): NonNullable<GlmAcpAgentOptions["glm"]> {
@@ -1188,7 +1192,8 @@ export class GlmAcpAgent implements Agent {
       session.mcpTools,
       session.cwd,
       // Use a thunk so mode changes mid-turn take effect on the next tool call.
-      () => this.sessions.get(sessionId)?.mode ?? "default"
+      () => this.sessions.get(sessionId)?.mode ?? "default",
+      (todos) => this.sessionTodos.set(sessionId, todos)
     );
 
     let lastUsage: Usage | undefined;
@@ -1226,7 +1231,7 @@ export class GlmAcpAgent implements Agent {
         })) {
           if (signal.aborted) return { stopReason: "cancelled" };
 
-          if (chunk.thinking) {
+          if (chunk.thinking && this.streamThinking) {
             await this.connection.sessionUpdate({
               sessionId,
               update: {
@@ -1361,7 +1366,7 @@ export class GlmAcpAgent implements Agent {
 
   /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
-    const names = ["read_file", "write_file", "edit_file", "list_files", "run_command", "web_search", "web_reader"];
+    const names = ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "web_search", "web_reader"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
       names.push("image_analysis");
     }

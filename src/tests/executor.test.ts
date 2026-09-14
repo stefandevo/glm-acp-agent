@@ -266,6 +266,34 @@ test("list_files and run_command execute in the agent process without terminal c
 // read_file
 // ---------------------------------------------------------------------------
 
+test("read_file truncates large files with a range marker", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-truncate-"));
+  const path = join(dir, "big.txt");
+  writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const first = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, limit: 4 })
+    );
+    assert.match(first.content, /line-1/);
+    assert.match(first.content, /showing lines 1-4 of (10|11)/);
+    assert.match(first.content, /pass offset=5/);
+
+    const second = await exec.execute(
+      "tc2",
+      "read_file",
+      JSON.stringify({ path, offset: 5, limit: 4 })
+    );
+    assert.match(second.content, /line-5/);
+    assert.doesNotMatch(second.content, /line-4\b/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file success path emits in_progress and completed updates", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-success-"));
   const path = join(dir, "x.txt");
@@ -561,6 +589,73 @@ test("write_file surfaces client writeTextFile failures as a failed tool result"
     assert.equal(existsSync(path), false);
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("todowrite stores the task list and renders it back to the model", async () => {
+  const conn = createConnectionStub();
+  const stored: Array<Array<{ content: string; status: string }>> = [];
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    process.cwd(),
+    () => "default",
+    (todos) => stored.push(todos)
+  );
+  const result = await exec.execute(
+    "tc1",
+    "todowrite",
+    JSON.stringify({
+      todos: [
+        { content: "Reproduce the failure", status: "completed" },
+        { content: "Patch the parser", status: "in_progress", active_form: "Patching the parser" },
+        { content: "Add regression tests", status: "pending" },
+      ],
+    })
+  );
+  assert.match(result.content, /Todo list updated/);
+  assert.match(result.content, /\[x\] Reproduce the failure/);
+  assert.match(result.content, /\[>\] Patch the parser/);
+  assert.match(result.content, /\[ \] Add regression tests/);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.length, 3);
+
+  const bad = await exec.execute(
+    "tc2",
+    "todowrite",
+    JSON.stringify({ todos: [{ content: "x", status: "wat" }] })
+  );
+  assert.match(bad.content, /status.*must be one of/i);
+  assert.equal(stored.length, 1);
+});
+
+test("write_file elides long content in client previews but writes the full file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-preview-elide-"));
+  const path = join(dir, "out.txt");
+  const big = "x".repeat(5000);
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: big })
+    );
+    assert.match(result.content, /written successfully/);
+    // The disk write is complete...
+    assert.equal(readFileSync(path, "utf8"), big);
+    // ...but the client-facing rawInput is elided.
+    const announce = conn.updates.find(
+      (u) => (u.update as { rawInput?: { content?: unknown } }).rawInput?.content !== undefined
+    ) as { update: { rawInput: { content: string } } };
+    assert.match(announce.update.rawInput.content, /5000 chars\]$/);
+    assert.ok(announce.update.rawInput.content.length < 300);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -2129,8 +2129,48 @@ test("advertised tool definitions include edit_file alongside the core tools", a
   )
     .availableToolDefinitions()
     .map((tool) => tool.function.name);
-  for (const expected of ["read_file", "write_file", "edit_file", "list_files", "run_command"]) {
+  for (const expected of ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command"]) {
     assert.ok(names.includes(expected), `expected advertised tool ${expected}`);
+  }
+});
+
+test("ACP_GLM_STREAM_THINKING=false silences the agent_thought_chunk stream", async () => {
+  const prev = process.env["ACP_GLM_STREAM_THINKING"];
+  const glm = () => makeStreamingGlm([
+    [
+      { thinking: "reasoning..." },
+      { text: "answer" },
+      { done: true, stopReason: "stop" },
+    ],
+  ]);
+  try {
+    process.env["ACP_GLM_STREAM_THINKING"] = "false";
+    const connOff = createConnectionStub();
+    const off = new GlmAcpAgent(connOff as never, { glm: glm(), sessionStore: null });
+    await off.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const offSession = await off.newSession({ cwd: "/tmp", mcpServers: [] });
+    await off.prompt({ sessionId: offSession.sessionId, prompt: [{ type: "text", text: "hi" }] });
+    assert.equal(
+      connOff.updates.filter(
+        (u) => (u.update as { sessionUpdate?: string }).sessionUpdate === "agent_thought_chunk"
+      ).length,
+      0
+    );
+
+    delete process.env["ACP_GLM_STREAM_THINKING"];
+    const connOn = createConnectionStub();
+    const on = new GlmAcpAgent(connOn as never, { glm: glm(), sessionStore: null });
+    await on.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const onSession = await on.newSession({ cwd: "/tmp", mcpServers: [] });
+    await on.prompt({ sessionId: onSession.sessionId, prompt: [{ type: "text", text: "hi" }] });
+    assert.ok(
+      connOn.updates.some(
+        (u) => (u.update as { sessionUpdate?: string }).sessionUpdate === "agent_thought_chunk"
+      )
+    );
+  } finally {
+    if (prev === undefined) delete process.env["ACP_GLM_STREAM_THINKING"];
+    else process.env["ACP_GLM_STREAM_THINKING"] = prev;
   }
 });
 
