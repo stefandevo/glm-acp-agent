@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
-import { StdioMcpClient } from "../tools/session-mcp-client.js";
+import { connectSessionMcpServers, StdioMcpClient } from "../tools/session-mcp-client.js";
 
 interface FakeChild extends EventEmitter {
   stdin: Writable;
@@ -62,6 +62,30 @@ function stdioServer(overrides: Partial<McpServerStdio> = {}): McpServerStdio {
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
+
+test("connectSessionMcpServers aborts stalled HTTP initialization", async () => {
+  const previousFetch = globalThis.fetch;
+  let setupSignal: AbortSignal | undefined;
+  globalThis.fetch = ((_: RequestInfo | URL, init?: RequestInit) => {
+    setupSignal = init?.signal ?? undefined;
+    return new Promise<Response>((_resolve, reject) => {
+      setupSignal?.addEventListener("abort", () => reject(new Error("synthetic setup abort")), { once: true });
+    });
+  }) as typeof fetch;
+  const controller = new AbortController();
+  try {
+    const pending = connectSessionMcpServers([
+      { type: "http", name: "stalled", url: "https://mcp.example.test/stalled", headers: [] },
+    ], controller.signal);
+    await tick();
+    assert.ok(setupSignal, "HTTP setup must receive an abort signal");
+    controller.abort();
+    await assert.rejects(pending, /synthetic setup abort|cancelled/i);
+    assert.equal(setupSignal.aborted, true);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
 
 /** Drive a fake child through initialize + tools/list so the client is ready for tools/call. */
 async function completeHandshake(
