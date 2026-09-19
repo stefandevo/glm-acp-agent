@@ -67,6 +67,7 @@ import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { validateStreamCompletion } from "../llm/stream-state.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -1310,6 +1311,7 @@ export class GlmAcpAgent implements Agent {
       }> = [];
 
       let assistantText = "";
+      let assistantReasoning = "";
       let lastStopReason: string | undefined;
       let turnUsage: Usage | undefined;
       let usageCommitted = false;
@@ -1334,6 +1336,7 @@ export class GlmAcpAgent implements Agent {
             break;
           }
 
+          if (chunk.thinking) assistantReasoning += chunk.thinking;
           if (chunk.thinking && this.streamThinking) {
             await this.connection.sessionUpdate({
               sessionId,
@@ -1370,6 +1373,12 @@ export class GlmAcpAgent implements Agent {
             lastStopReason = chunk.stopReason;
           }
         }
+        if (!signal.aborted) {
+          lastStopReason = validateStreamCompletion(lastStopReason, toolCalls);
+          if (lastStopReason === "length" || lastStopReason === "content_filter") {
+            toolCalls.length = 0;
+          }
+        }
       } catch (err) {
         commitTurnUsage();
         if (signal.aborted) {
@@ -1392,6 +1401,11 @@ export class GlmAcpAgent implements Agent {
         } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
         } else if (!cancelledDuringStream) {
+          // Keep text the client has already seen, but never retain an
+          // incomplete executable tool batch from an interrupted stream.
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
           throw err;
         }
       }
@@ -1403,20 +1417,28 @@ export class GlmAcpAgent implements Agent {
 
       commitTurnUsage();
 
+      // Provider continuity is independent of the client's thought display.
+      // Never replay reasoning from a cancelled or truncated response as a
+      // completed reasoning chain.
+      const reasoning = assistantReasoning.length > 0 && !cancelledDuringStream && !signal.aborted &&
+        (lastStopReason === "stop" || lastStopReason === "tool_calls")
+        ? { reasoning_content: assistantReasoning } : {};
+
       // Record the assistant turn in history so the model has full context for
       // the next iteration.
       if (toolCalls.length > 0) {
         session.messages.push({
           role: "assistant",
           content: assistantText.length > 0 ? assistantText : null,
+          ...reasoning,
           tool_calls: toolCalls.map((tc) => ({
             id: tc.id,
             type: "function" as const,
             function: { name: tc.name, arguments: tc.arguments },
           })),
         });
-      } else if (assistantText.length > 0) {
-        session.messages.push({ role: "assistant", content: assistantText });
+      } else if (assistantText.length > 0 || reasoning.reasoning_content !== undefined) {
+        session.messages.push({ role: "assistant", content: assistantText || null, ...reasoning });
       }
 
       if (cancelledDuringStream || signal.aborted) {
@@ -1868,6 +1890,7 @@ function estimateTokens(messages: GlmMessage[]): number {
   let chars = 0;
   let tokens = 0;
   for (const m of messages) {
+    if (m.role === "assistant" && m.reasoning_content) chars += m.reasoning_content.length;
     if (typeof m.content === "string") {
       chars += m.content.length;
     } else if (Array.isArray(m.content)) {

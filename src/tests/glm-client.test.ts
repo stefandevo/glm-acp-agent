@@ -541,9 +541,9 @@ test("isVisionNativeModel is true for Flash and glm-5v-turbo only", () => {
   assert.equal(isVisionNativeModel("glm-4.7"), false);
 });
 
-test("streamChat does not flush partial tool calls (missing id or name)", async () => {
+test("streamChat rejects inconsistent partial tool calls instead of reporting success", async () => {
   // Stream a tool_call delta that only contains arguments – no id, no name.
-  // The client should silently drop the partial entry instead of yielding it.
+  // It must not turn a malformed tool response into a successful text stop.
   const stream = fakeStream([
     {
       choices: [
@@ -557,8 +557,10 @@ test("streamChat does not flush partial tool calls (missing id or name)", async 
   ]);
   const c = makeClient(stream);
   const calls: Array<{ id: string; name: string }> = [];
-  for await (const chunk of c.streamChat([])) {
-    if (chunk.toolCall) calls.push({ id: chunk.toolCall.id, name: chunk.toolCall.name });
-  }
+  await assert.rejects(async () => {
+    for await (const chunk of c.streamChat([])) {
+      if (chunk.toolCall) calls.push({ id: chunk.toolCall.id, name: chunk.toolCall.name });
+    }
+  }, /inconsistent|incomplete/i);
   assert.equal(calls.length, 0);
 });

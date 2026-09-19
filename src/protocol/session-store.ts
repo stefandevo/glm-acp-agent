@@ -158,6 +158,7 @@ function isGlmMessage(value: unknown): value is GlmMessage {
 
   if ("tool_call_id" in value && (value.role !== "tool" || typeof value.tool_call_id !== "string")) return false;
   if ("name" in value && typeof value.name !== "string") return false;
+  if ("reasoning_content" in value && (value.role !== "assistant" || typeof value.reasoning_content !== "string")) return false;
   if ("tool_calls" in value) {
     if (value.role !== "assistant") return false;
     if (!Array.isArray(value.tool_calls)) return false;
