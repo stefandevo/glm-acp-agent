@@ -48,17 +48,22 @@ interface ToolBinding {
 }
 
 interface ConnectedMcpClient {
-  listTools(): Promise<McpTool[]>;
+  listTools(signal?: AbortSignal): Promise<McpTool[]>;
   callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
   dispose(): Promise<void>;
 }
 
 export class SessionMcpTools {
   private bindings = new Map<string, ToolBinding>();
+  private clients = new Set<ConnectedMcpClient>();
 
-  constructor(bindings: ToolBinding[]) {
+  constructor(bindings: ToolBinding[], clients: Iterable<ConnectedMcpClient> = []) {
+    for (const client of clients) {
+      this.clients.add(client);
+    }
     for (const binding of bindings) {
       this.bindings.set(binding.exposedName, binding);
+      this.clients.add(binding.client);
     }
   }
 
@@ -85,14 +90,15 @@ export class SessionMcpTools {
   }
 
   async dispose(): Promise<void> {
-    const clients = new Set(Array.from(this.bindings.values()).map((binding) => binding.client));
-    await Promise.all(Array.from(clients).map((client) => client.dispose().catch(() => undefined)));
+    await Promise.all(Array.from(this.clients).map((client) => client.dispose().catch(() => undefined)));
+    this.clients.clear();
     this.bindings.clear();
   }
 }
 
 export async function connectSessionMcpServers(
-  servers: ReadonlyArray<McpServer>
+  servers: ReadonlyArray<McpServer>,
+  signal?: AbortSignal
 ): Promise<SessionMcpTools> {
   const usedNames = new Set(TOOL_DEFINITIONS.map((tool) => tool.function.name));
   const bindings: ToolBinding[] = [];
@@ -100,9 +106,10 @@ export async function connectSessionMcpServers(
 
   try {
     for (const server of servers) {
+      if (signal?.aborted) throw new Error("MCP session setup cancelled");
       const client = createClient(server);
       clients.push(client);
-      const tools = await client.listTools();
+      const tools = await client.listTools(signal);
       for (const tool of tools) {
         const exposedName = chooseToolName(tool.name, server.name, usedNames);
         usedNames.add(exposedName);
@@ -126,7 +133,7 @@ export async function connectSessionMcpServers(
     throw err;
   }
 
-  return new SessionMcpTools(bindings);
+  return new SessionMcpTools(bindings, clients);
 }
 
 function createClient(server: McpServer): ConnectedMcpClient {
@@ -142,38 +149,66 @@ function createClient(server: McpServer): ConnectedMcpClient {
 class HttpMcpClient implements ConnectedMcpClient {
   private nextId = 1;
   private initialized: Promise<void> | null = null;
+  private initializationController: AbortController | null = null;
+  private initializationWaiters = 0;
   private mcpSessionId: string | undefined;
 
   constructor(private server: McpServerHttp & { type: "http" }) {}
 
-  async listTools(): Promise<McpTool[]> {
-    await this.ensureInitialized();
-    const result = await this.request("tools/list", {}, "tools/list");
+  async listTools(signal?: AbortSignal): Promise<McpTool[]> {
+    await this.awaitInitialization(signal);
+    const result = await this.request("tools/list", {}, "tools/list", signal);
     return extractTools(result);
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    await this.ensureInitialized();
+    await this.awaitInitialization(signal);
     return this.request("tools/call", { name, arguments: args }, "tools/call", signal, name);
   }
 
   async dispose(): Promise<void> {
+    this.initializationController?.abort();
+    this.initializationController = null;
     this.initialized = null;
     this.mcpSessionId = undefined;
   }
 
-  private async ensureInitialized(): Promise<void> {
-    if (this.initialized) return this.initialized;
-    this.initialized = this.initialize();
+  private async awaitInitialization(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error(`MCP ${this.server.name} call cancelled`);
+    const initialization = this.ensureInitialized();
+    const waiting = this.initializationController !== null;
+    if (waiting) this.initializationWaiters += 1;
     try {
-      await this.initialized;
+      await waitForAbort(initialization, signal, `MCP ${this.server.name} call cancelled`);
     } catch (err) {
-      this.initialized = null;
+      if (signal?.aborted && waiting && this.initializationWaiters === 1) {
+        this.initializationController?.abort();
+      }
       throw err;
+    } finally {
+      if (waiting) this.initializationWaiters -= 1;
     }
   }
 
-  private async initialize(): Promise<void> {
+  private ensureInitialized(): Promise<void> {
+    if (this.initialized) return this.initialized;
+    const controller = new AbortController();
+    const initialization = this.initialize(controller.signal);
+    this.initialized = initialization;
+    this.initializationController = controller;
+    void initialization.then(
+      () => {
+        if (this.initialized === initialization) this.initializationController = null;
+      },
+      () => {
+        if (this.initialized === initialization) this.initialized = null;
+        if (this.initializationController === controller) this.initializationController = null;
+      }
+    );
+    return initialization;
+  }
+
+  private async initialize(signal: AbortSignal): Promise<void> {
     const response = await this.fetchJsonRpc(
       "initialize",
       {
@@ -186,13 +221,14 @@ class HttpMcpClient implements ConnectedMcpClient {
           clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
         },
       },
-      "initialize"
+      "initialize",
+      signal
     );
     this.mcpSessionId = response.sessionId;
     await this.sendNotification({
       jsonrpc: "2.0",
       method: "notifications/initialized",
-    });
+    }, signal);
   }
 
   private async request(
@@ -217,11 +253,12 @@ class HttpMcpClient implements ConnectedMcpClient {
     return response.body.result;
   }
 
-  private async sendNotification(body: JsonRpcRequest): Promise<void> {
+  private async sendNotification(body: JsonRpcRequest, signal?: AbortSignal): Promise<void> {
     const response = await fetch(this.server.url, {
       method: "POST",
       headers: this.headers("notifications/initialized"),
       body: JSON.stringify(body),
+      signal,
     });
     if (!response.ok) {
       throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await response.text()}`);
@@ -320,11 +357,11 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.killProcessTree = opts.killProcessTree ?? taskkillTree;
   }
 
-  async listTools(): Promise<McpTool[]> {
+  async listTools(signal?: AbortSignal): Promise<McpTool[]> {
     // Counted as an initialization waiter too, so a concurrent callTool abort cannot
     // tear down the handshake this call is still waiting on.
-    await this.awaitInitialization();
-    return extractTools(await this.request("tools/list", {}, "tools/list"));
+    await this.awaitInitialization(signal);
+    return extractTools(await this.request("tools/list", {}, "tools/list", signal));
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
