@@ -832,6 +832,304 @@ test("closeSession clears the session's task list", async () => {
   assert.equal(todos.has(sessionId), false);
 });
 
+test("shutdown is idempotent and stops new session admission", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  const first = agent.shutdown("disconnect");
+  const second = agent.shutdown("sigterm");
+  assert.strictEqual(first, second);
+  await first;
+  await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
+});
+
+test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain deadline", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    let streamCalls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        if (streamCalls++ === 0) {
+          yield { text: "checkpoint response" };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        yield {
+          toolCall: {
+            id: "stuck-tool",
+            name: "list_files",
+            arguments: JSON.stringify({ path: "." }),
+          },
+        };
+        streamStarted();
+        // Ignores cancellation: never yields again and never returns, so the
+        // prompt cannot finalize its history within the drain deadline.
+        await new Promise<void>(() => {});
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: store,
+      shutdownDrainTimeoutMs: 20,
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "checkpoint" }] });
+    const checkpoint = store.load(sessionId);
+    assert.ok(checkpoint, "the shutdown test needs a valid persisted checkpoint");
+    const expectedCheckpoint = structuredClone(checkpoint);
+
+    void agent.prompt({ sessionId, prompt: [{ type: "text", text: "stuck" }] }).catch(() => undefined);
+    await started;
+    await assert.rejects(agent.shutdown("sigterm"), /timed out waiting for prompt cleanup/);
+
+    const persisted = store.load(sessionId);
+    assert.deepEqual(
+      persisted,
+      expectedCheckpoint,
+      "a prompt that missed the drain deadline must leave the last valid checkpoint unchanged",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("shutdown persists partial streamed assistant text without late UI updates", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    let firstChunkSeen!: () => void;
+    const partialChunkSeen = new Promise<void>((resolve) => { firstChunkSeen = resolve; });
+    const glm = {
+      async *streamChat(
+        _messages: ReadonlyArray<{ role: string }>,
+        signal?: AbortSignal,
+      ): AsyncGenerator<GlmStreamChunk> {
+        // Record a tool call before the partial text so the shutdown checkpoint
+        // must include both the assistant call and its synthetic cancellation
+        // result, keeping the next resumed turn protocol-valid.
+        yield {
+          toolCall: {
+            id: "shutdown-tool",
+            name: "list_files",
+            arguments: JSON.stringify({ path: "." }),
+          },
+        };
+        yield { text: "partial answer" };
+        firstChunkSeen();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        // The provider can have already queued another chunk when shutdown
+        // aborts the request. The prompt loop must discard it from the UI.
+        yield { text: "late answer" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const prompting = agent.prompt({ sessionId, prompt: [{ type: "text", text: "answer" }] });
+    await partialChunkSeen;
+    const stopping = agent.shutdown("sigterm");
+    const result = await prompting;
+    await stopping;
+
+    assert.equal(result.stopReason, "cancelled");
+    const persisted = store.load(sessionId);
+    assert.ok(persisted, "shutdown must checkpoint the in-flight session");
+    assert.deepEqual(
+      persisted?.messages.map((message) => message.role),
+      ["system", "user", "assistant", "tool"],
+      "the partial turn and cancelled tool call must remain valid history",
+    );
+    const persistedAssistant = persisted?.messages[2];
+    assert.equal(persistedAssistant?.content, "partial answer", "shutdown must preserve text received before the abort");
+    assert.deepEqual(
+      (persistedAssistant as { tool_calls?: Array<{ id: string }> } | undefined)?.tool_calls?.map(
+        (toolCall) => toolCall.id,
+      ),
+      ["shutdown-tool"],
+      "the assistant tool call must be retained with the partial text",
+    );
+    assert.equal(
+      (persisted?.messages[3] as { tool_call_id?: string } | undefined)?.tool_call_id,
+      "shutdown-tool",
+      "the interrupted tool call needs a matching synthetic result",
+    );
+    assert.match(
+      String(persisted?.messages[3]?.content),
+      /cancel/i,
+      "the interrupted tool call must be resumable",
+    );
+    assert.equal(
+      conn.updates.some((update) =>
+        (update.update as { sessionUpdate?: string; content?: { text?: string } }).content?.text === "late answer"
+      ),
+      false,
+      "chunks delivered after shutdown begins must not reach the client",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("shutdown disposes a provisional MCP setup that completes after admission closes", async () => {
+  const conn = createConnectionStub();
+  let resolveSetup!: (tools: unknown) => void;
+  const setup = new Promise<unknown>((resolve) => { resolveSetup = resolve; });
+  let disposals = 0;
+  const tools = { async dispose() { disposals += 1; } };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: null,
+    mcpConnector: async () => setup as never,
+  });
+  const creating = agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const stopping = agent.shutdown("disconnect");
+  resolveSetup(tools);
+  await assert.rejects(creating, /shutting down/);
+  await stopping;
+  assert.equal(disposals, 1);
+  assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+});
+
+test("newSession disposes and releases MCP setup when post-connect construction fails", async () => {
+  let disposals = 0;
+  const tools = {
+    get toolDefinitions(): never { throw new Error("tool definitions failed"); },
+    async dispose() { disposals += 1; },
+  };
+  const agent = new GlmAcpAgent(createConnectionStub() as never, {
+    sessionStore: null,
+    mcpConnector: async () => tools as never,
+  });
+
+  await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /tool definitions failed/);
+  assert.equal(disposals, 1);
+  assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+});
+
+test("loadSession disposes its replacement MCP client when replay fails", async () => {
+  const { store, cleanup } = makeTempStore();
+  let disposals = 0;
+  const tools = { async dispose() { disposals += 1; } };
+  const conn = createConnectionStub();
+  conn.sessionUpdate = async () => { throw new Error("replay failed"); };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    mcpConnector: async () => tools as never,
+  });
+  const sessionId = "22222222-2222-2222-2222-222222222222";
+  try {
+    store.save({
+      sessionId,
+      cwd: "/tmp",
+      messages: [{ role: "system", content: "you are a coding assistant" }, { role: "user", content: "ping" }],
+      title: null,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.1",
+      mode: "default",
+    });
+    await assert.rejects(agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] }), /replay failed/);
+    assert.equal(disposals, 1);
+    assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("shutdown joins an in-progress close instead of disposing its MCP tools twice", async () => {
+  const conn = createConnectionStub();
+  let releaseDispose!: () => void;
+  const disposeReleased = new Promise<void>((resolve) => { releaseDispose = resolve; });
+  let resolveDisposeStarted!: () => void;
+  const disposeStarted = new Promise<void>((resolve) => { resolveDisposeStarted = resolve; });
+  let disposals = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: null,
+    mcpConnector: async () => ({
+      async dispose() {
+        disposals += 1;
+        resolveDisposeStarted();
+        await disposeReleased;
+      },
+    }) as never,
+  });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const closing = agent.closeSession({ sessionId });
+  await disposeStarted;
+  const stopping = agent.shutdown("sigterm");
+  releaseDispose();
+  await Promise.all([closing, stopping]);
+  assert.equal(disposals, 1);
+});
+
+for (const [name, restore] of [
+  ["loadSession", (agent: GlmAcpAgent, sessionId: string) => agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] })],
+  ["resumeSession", (agent: GlmAcpAgent, sessionId: string) => agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] })],
+] as const) {
+  test(`shutdown retains a provisional MCP client while ${name} disposes its replaced client`, async () => {
+    const { store, cleanup } = makeTempStore();
+    let releaseOldDispose!: () => void;
+    const oldDisposeReleased = new Promise<void>((resolve) => { releaseOldDispose = resolve; });
+    let oldDisposeStarted!: () => void;
+    const oldDisposeStartedPromise = new Promise<void>((resolve) => { oldDisposeStarted = resolve; });
+    let oldDisposals = 0;
+    let replacementDisposals = 0;
+    const oldTools = {
+      async dispose() {
+        oldDisposals += 1;
+        oldDisposeStarted();
+        await oldDisposeReleased;
+      },
+    };
+    const replacementTools = { async dispose() { replacementDisposals += 1; } };
+    let connections = 0;
+    const agent = new GlmAcpAgent(createConnectionStub() as never, {
+      sessionStore: store,
+      mcpConnector: async () => (++connections === 1 ? oldTools : replacementTools) as never,
+    });
+    const sessionId = "11111111-1111-1111-1111-111111111111";
+    try {
+      store.save({
+        sessionId,
+        cwd: "/tmp",
+        messages: [{ role: "system", content: "you are a coding assistant" }],
+        title: null,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        model: "glm-5.1",
+        mode: "default",
+      });
+      await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+
+      const restoring = restore(agent, sessionId);
+      await oldDisposeStartedPromise;
+      const stopping = agent.shutdown("disconnect");
+      let shutdownFinished = false;
+      void stopping.then(() => { shutdownFinished = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(shutdownFinished, false, "shutdown must wait for the replacement MCP cleanup");
+
+      releaseOldDispose();
+      await assert.rejects(restoring, /shutting down/);
+      await stopping;
+      assert.equal(oldDisposals, 1);
+      assert.equal(replacementDisposals, 1);
+    } finally {
+      releaseOldDispose?.();
+      cleanup();
+    }
+  });
+}
+
 test("authenticate is a no-op", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });

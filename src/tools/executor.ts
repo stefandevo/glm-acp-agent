@@ -18,6 +18,7 @@ import {
   readCommandLimits,
   type CommandLimits,
 } from "./command-limits.js";
+import { ProcessSupervisor } from "./process-supervisor.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -86,7 +87,8 @@ export class ToolExecutor {
     private sessionMcpTools: SessionMcpTools | null = null,
     private sessionCwd: string = process.cwd(),
     private getMode: () => SessionModeId = () => "default",
-    private setTodos: (todos: TodoItem[]) => void = () => undefined
+    private setTodos: (todos: TodoItem[]) => void = () => undefined,
+    private processSupervisor: ProcessSupervisor | null = null
   ) {}
 
   /**
@@ -713,7 +715,8 @@ export class ToolExecutor {
         command,
         this.sessionCwd,
         this.signal,
-        limits
+        limits,
+        this.processSupervisor
       );
       const output = formatCommandOutput(result, limits);
 
@@ -1238,7 +1241,8 @@ function runShellCommand(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  limits: CommandLimits = readCommandLimits()
+  limits: CommandLimits = readCommandLimits(),
+  processSupervisor: ProcessSupervisor | null = null
 ): Promise<ShellCommandResult> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -1258,6 +1262,10 @@ function runShellCommand(
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Register synchronously, before any cancellation listener can observe
+    // the command. A normal shell exit releases background descendants; an
+    // aborted/timed-out command stays owned through TERM/KILL escalation.
+    const managed = processSupervisor?.register(child) ?? null;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let capturedBytes = 0;
@@ -1265,7 +1273,6 @@ function runShellCommand(
     let settled = false;
     let abortRequested = false;
     let timedOut = false;
-    let forceKillTimer: NodeJS.Timeout | undefined;
     let streamDestroyTimer: NodeJS.Timeout | undefined;
 
     const capture = (target: Buffer[], chunk: Buffer | Uint8Array) => {
@@ -1286,18 +1293,15 @@ function runShellCommand(
     };
 
     const terminateAndEscalate = () => {
-      terminateProcessTree(child);
-      // A process can ignore SIGTERM. Escalate after a short grace period so
-      // an aborted or timed-out tool cannot keep the prompt turn alive. The
-      // guard keeps the SIGKILL from ever landing on a process group the OS
-      // has recycled for unrelated work.
-      if (!forceKillTimer) {
-        forceKillTimer = setTimeout(() => {
-          forceKillTimer = undefined;
-          if (!isProcessGroupAlive(child.pid)) return;
-          terminateProcessTree(child, true);
-        }, 250);
+      if (managed) {
+        void managed.terminate(abortRequested ? "abort" : "timeout");
+        return;
       }
+      terminateProcessTree(child);
+      setTimeout(() => {
+        if (!isProcessGroupAlive(child.pid)) return;
+        terminateProcessTree(child, true);
+      }, 250);
     };
 
     const onAbort = () => {
@@ -1313,14 +1317,6 @@ function runShellCommand(
     const cleanup = () => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (streamDestroyTimer) clearTimeout(streamDestroyTimer);
-      if (forceKillTimer) {
-        // Keep escalation armed only while the detached group may still hold
-        // SIGTERM-resistant descendants; once the group is gone the delayed
-        // SIGKILL must never fire (stale process-group ID).
-        if ((!abortRequested && !timedOut) || !isProcessGroupAlive(child.pid)) {
-          clearTimeout(forceKillTimer);
-        }
-      }
       signal?.removeEventListener("abort", onAbort);
     };
 
@@ -1334,13 +1330,17 @@ function runShellCommand(
       if (settled) return;
       settled = true;
       cleanup();
+      // A failed spawn owns no live group; release the registration so a later
+      // runtime shutdown cannot wait on a child that never existed.
+      managed?.releaseAfterNormalExit();
       reject(err);
     });
-    child.on("exit", () => {
+    child.on("exit", (_exitCode, exitSignal) => {
       // The shell is the command's foreground process. Once it exits normally,
       // only inherited pipes from intentionally backgrounded work may remain;
       // do not let the deadline kill that work during the short drain grace.
       clearTimeout(timeoutTimer);
+      if (!abortRequested && !timedOut && exitSignal === null) managed?.releaseAfterNormalExit();
       // The shell exited. Normal commands will close their streams immediately,
       // firing "close" within milliseconds. For daemons that inherit stdio and
       // keep pipes open, forcefully destroy the streams after a brief grace

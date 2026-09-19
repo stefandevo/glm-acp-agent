@@ -53,9 +53,11 @@ import {
   type ThoughtLevel,
 } from "../llm/glm-client.js";
 import { ToolExecutor, type TodoItem } from "../tools/executor.js";
+import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
   discoverSlashCommands,
@@ -152,6 +154,8 @@ interface SessionState {
   closed: boolean;
   /** De-duplicates concurrent closeSession calls. */
   closePromise: Promise<void> | null;
+  /** De-duplicates MCP cleanup between closeSession and agent shutdown. */
+  disposePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -178,6 +182,23 @@ interface SessionState {
    * own. Serialized to indices at save time and rebuilt on load.
    */
   displayText: WeakMap<GlmMessage, string>;
+  /** Synchronous gate for replacement and close transitions. */
+  lifecycle: SessionLifecycle;
+}
+
+interface SessionTransition {
+  lifecycle: SessionLifecycle;
+  promise: Promise<unknown> | null;
+  closePromise: Promise<void> | null;
+  original: SessionState | null;
+  restoreAbortController: AbortController | null;
+}
+
+/** A connected MCP client that remains agent-owned until its session installs it. */
+interface PendingMcpSetup {
+  tools: Promise<SessionMcpTools>;
+  release: () => void;
+  dispose: () => Promise<void>;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -214,6 +235,14 @@ export interface GlmAcpAgentOptions {
    * on first use.
    */
   visionClient?: VisionMcpClient | null;
+  /** Test-only override for the bounded live-restore prompt drain. */
+  sessionDrainTimeoutMs?: number;
+  /** Override session MCP setup for deterministic lifecycle tests. */
+  connectSessionMcpServers?: typeof connectSessionMcpServers;
+  /** Override session MCP setup for shutdown/lifecycle tests. */
+  mcpConnector?: (servers: Parameters<typeof connectSessionMcpServers>[0], signal?: AbortSignal) => Promise<SessionMcpTools>;
+  /** Test-only override for the bounded shutdown prompt-drain deadline. */
+  shutdownDrainTimeoutMs?: number;
 }
 
 /**
@@ -259,6 +288,15 @@ export class GlmAcpAgent implements Agent {
   private sessionStore: SessionStore | null;
   private _visionClient: VisionMcpClient | null;
   private visionClientExplicit: boolean;
+  private sessionDrainTimeoutMs: number;
+  private connectMcpServers: typeof connectSessionMcpServers;
+  private transitions = new Map<string, SessionTransition>();
+  private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
+  private readonly pendingSetups = new Set<PendingMcpSetup>();
+  private readonly processSupervisor = new ProcessSupervisor();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private readonly shutdownDrainTimeoutMs: number;
 
   constructor(
     private connection: AgentSideConnection,
@@ -275,6 +313,10 @@ export class GlmAcpAgent implements Agent {
         : (options.sessionStore ?? new SessionStore());
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
+    this.sessionDrainTimeoutMs = options.sessionDrainTimeoutMs ?? 30_000;
+    this.mcpConnector = options.mcpConnector ?? options.connectSessionMcpServers ?? connectSessionMcpServers;
+    this.connectMcpServers = this.mcpConnector;
+    this.shutdownDrainTimeoutMs = options.shutdownDrainTimeoutMs ?? 4_000;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
@@ -381,10 +423,13 @@ export class GlmAcpAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    const setup = this.connectMcpForSession(params.mcpServers);
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
       role: "system",
@@ -401,6 +446,14 @@ export class GlmAcpAgent implements Agent {
     // default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
+    const lifecycle = new SessionLifecycle();
+    this.transitions.set(sessionId, {
+      lifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.sessions.set(sessionId, {
       cwd: params.cwd,
       messages: [systemPrompt],
@@ -409,6 +462,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -418,16 +472,23 @@ export class GlmAcpAgent implements Agent {
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
       displayText: new WeakMap(),
-    });
+      lifecycle,
+      });
 
-    this.scheduleAvailableCommands(sessionId);
+      this.scheduleAvailableCommands(sessionId);
 
-    return {
-      sessionId,
-      models: this.modelsState(model),
-      modes: this.modesState("default"),
-      configOptions: this.configOptionsState(model, thoughtLevel, "default"),
-    };
+      return {
+        sessionId,
+        models: this.modelsState(model),
+        modes: this.modesState("default"),
+        configOptions: this.configOptionsState(model, thoughtLevel, "default"),
+      };
+    } catch (error) {
+      await setup.dispose();
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   /**
@@ -466,6 +527,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     await this.applySessionModel(params.sessionId, session, params.modelId);
     return {};
   }
@@ -591,6 +653,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     if (params.configId === "mode") {
       // Same reject-don't-coerce policy as thought_level below.
       if (!isSessionModeId(params.value)) {
@@ -691,6 +754,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     if (!isSessionModeId(params.modeId)) {
       throw new Error(
         `Invalid modeId: ${params.modeId}. Valid modes are: ${SESSION_MODE_IDS.join(", ")}`
@@ -733,6 +797,12 @@ export class GlmAcpAgent implements Agent {
     if (!session || session.closing || session.closed) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    if (!session.lifecycle.acceptsPrompts()) {
+      throw new Error(`Session transition in progress: ${params.sessionId}`);
+    }
+    const generation = session.lifecycle.generation;
+    const ownsPrompt = () => this.ownsSession(params.sessionId, session, generation);
+    const preservesDrainingHistory = () => this.isDrainingOriginal(params.sessionId, session);
 
     // Reserve this lifecycle synchronously, before preprocessing can await.
     // Every queued prompt gets a distinct promise and chains behind the prompt
@@ -776,7 +846,7 @@ export class GlmAcpAgent implements Agent {
           // A previous loop's failure is already reported to its caller.
         }
       }
-      if (abortController.signal.aborted || session.closing || session.closed) {
+      if (abortController.signal.aborted || !ownsPrompt()) {
         return cancelledResponse();
       }
 
@@ -800,7 +870,7 @@ export class GlmAcpAgent implements Agent {
             this.visionClient,
             abortController.signal
           );
-      if (abortController.signal.aborted || session.closing || session.closed) {
+      if (abortController.signal.aborted || !ownsPrompt()) {
         return cancelledResponse();
       }
       const userContent = visionNative
@@ -819,11 +889,14 @@ export class GlmAcpAgent implements Agent {
 
       const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
-        session,
-        abortController.signal
+      session,
+      abortController.signal,
+      ownsPrompt,
+      preservesDrainingHistory,
+      this.processSupervisor
       );
 
-      if (session.closing || session.closed) {
+      if (!ownsPrompt()) {
         return cancelledResponse();
       }
       if (session.abortController === abortController) session.abortController = null;
@@ -862,19 +935,21 @@ export class GlmAcpAgent implements Agent {
       error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
-      if (abortController.signal.aborted || session.closing || session.closed) {
+      if (abortController.signal.aborted || !ownsPrompt()) {
         return cancelledResponse();
       }
       // Surface the error to the user as an agent message so the IDE displays
       // something instead of a silent JSON-RPC error.
       const message = err instanceof Error ? err.message : String(err);
-      await safeSessionUpdate(this.connection, {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `\n\n[error] ${message}` },
-        },
-      });
+      if (ownsPrompt()) {
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `\n\n[error] ${message}` },
+          },
+        });
+      }
       throw err;
     } finally {
       connSignal?.removeEventListener("abort", onConnectionClose);
@@ -895,31 +970,134 @@ export class GlmAcpAgent implements Agent {
   }
 
   async closeSession(params: CloseSessionRequest): Promise<void> {
-    const session = this.sessions.get(params.sessionId);
-    if (!session) return;
-    if (session.closePromise) return session.closePromise;
+    const transition = this.transitions.get(params.sessionId);
+    const initial = this.sessions.get(params.sessionId);
+    if (!transition && !initial) return;
+    const record = transition ?? this.registerTransition(params.sessionId, initial!.lifecycle);
+    if (record.closePromise) return record.closePromise;
 
-    session.closing = true;
-    session.abortController?.abort();
+    if (record.lifecycle.phase === "open") {
+      record.lifecycle.begin("closing");
+    } else {
+      // This also records a close for an unloaded session: the record exists
+      // even while restore has not yet installed its replacement state.
+      record.lifecycle.requestClose();
+    }
+    record.restoreAbortController?.abort();
+    initial?.abortController?.abort();
     const closePromise = (async () => {
-      // Wait for the whole lifecycle, including preprocessing and temporary
-      // file cleanup, before persisting or disposing anything it may use.
-      const active = session.promptPromise;
-      if (active) {
-        try { await active; } catch { /* lifecycle promises resolve in finally */ }
+      const pendingTransition = record.promise;
+      if (pendingTransition) {
+        try { await pendingTransition; } catch { /* close owns final cleanup */ }
       }
-      session.closed = true;
-      // Persist final state on close so a subsequent loadSession/resume can
-      // pick the conversation back up. closeSession only releases in-memory
-      // resources; the on-disk record is intentionally retained.
-      this.persistSession(params.sessionId, session);
-      await session.mcpTools?.dispose();
-      this.sessions.delete(params.sessionId);
-      // Session is gone from memory; its task list must not linger in the map.
-      this.sessionTodos.delete(params.sessionId);
+
+      // Restore may have swapped while this close was waiting. Resolve the
+      // current map entry now; never dispose or delete a stale captured state.
+      const current = this.sessions.get(params.sessionId);
+      if (current) {
+        current.closing = true;
+        current.abortController?.abort();
+        if (current.promptPromise) {
+          try { await current.promptPromise; } catch { /* resolves in prompt finally */ }
+        }
+        current.closed = true;
+        this.persistSession(params.sessionId, current);
+        await this.disposeSessionTools(current);
+        if (this.sessions.get(params.sessionId) === current) {
+          this.sessions.delete(params.sessionId);
+        }
+        this.sessionTodos.delete(params.sessionId);
+      }
+      if (this.transitions.get(params.sessionId) === record) {
+        this.transitions.delete(params.sessionId);
+      }
     })();
-    session.closePromise = closePromise;
+    record.closePromise = closePromise;
     return closePromise;
+  }
+
+  /**
+   * Stop admitting work and release all resources owned by this ACP runtime.
+   * Concurrent close/signal paths share one promise so disposals and process
+   * termination happen once.
+   */
+  shutdown(_reason: "disconnect" | "sigterm" | "sigint" | "fatal"): Promise<void> {
+    void _reason;
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    this.shutdownPromise = (async () => {
+      const sessions = [...this.sessions.entries()];
+
+      // Close the lifecycle gates synchronously before aborting prompts. This
+      // makes the in-flight loop retain canonical partial history while its
+      // owned connection suppresses all late UI chunks.
+      for (const [sessionId, record] of this.transitions) {
+        if (record.lifecycle.phase === "open") record.lifecycle.begin("closing");
+        else record.lifecycle.requestClose();
+        record.restoreAbortController?.abort();
+        void sessionId;
+      }
+      for (const [, session] of sessions) {
+        const record = [...this.transitions.values()].find((candidate) => candidate.lifecycle === session.lifecycle);
+        if (record && record.lifecycle.phase === "open") record.lifecycle.begin("closing");
+        else record?.lifecycle.requestClose();
+        record?.restoreAbortController?.abort();
+        session.closing = true;
+        session.abortController?.abort();
+      }
+
+      await this.processSupervisor.terminateAll();
+      const deadlineMs = this.shutdownDrainTimeoutMs;
+      const promptsSettled = await Promise.all(sessions.map(([, session]) =>
+        session.promptPromise
+          ? settlesWithin(session.promptPromise, deadlineMs)
+          : Promise.resolve(true),
+      ));
+
+      const transitions = [...this.transitions.values()]
+        .map((record) => record.promise)
+        .filter((promise): promise is Promise<unknown> => promise !== null);
+      const closes = sessions
+        .map(([, session]) => session.closePromise)
+        .filter((close): close is Promise<void> => close !== null);
+      const setups = [...this.pendingSetups].map((setup) => setup.dispose());
+      const auxDrained = await settlesWithin(
+        Promise.allSettled([...transitions, ...closes, ...setups]),
+        deadlineMs,
+      );
+
+      for (let index = 0; index < sessions.length; index += 1) {
+        const [sessionId, session] = sessions[index]!;
+        session.closed = true;
+        // A prompt that missed the drain deadline may still hold an unmatched
+        // assistant tool call. Leave the last valid on-disk checkpoint intact.
+        if (promptsSettled[index] === true) this.persistSession(sessionId, session);
+        await this.disposeSessionTools(session).catch(() => undefined);
+        if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
+        this.sessionTodos.delete(sessionId);
+      }
+      this.transitions.clear();
+      await this._visionClient?.dispose();
+
+      if (this.processSupervisor.hasActiveProcesses()) {
+        await this.processSupervisor.forceTerminateAll();
+      }
+      if (this.processSupervisor.hasActiveProcesses()) {
+        throw new Error("Agent shutdown left active command processes");
+      }
+      if (!auxDrained || promptsSettled.some((settled) => !settled)) {
+        throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+      }
+    })();
+    return this.shutdownPromise;
+  }
+
+  /** Used by the CLI deadline path before reporting a nonzero exit. */
+  async forceShutdown(): Promise<void> {
+    await this.processSupervisor.forceTerminateAll();
+    if (this.processSupervisor.hasActiveProcesses()) {
+      throw new Error("Agent shutdown left active command processes");
+    }
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -976,75 +1154,25 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
-    const restoredMessages = rebuildRestoredMessages(
-      persisted.messages,
-      params.cwd,
-      toolDefinitions
-    );
-
-    // Restore in-memory state. We do NOT carry over the abortController /
-    // promptPromise — those are transient.
-    const restored: SessionState = {
-      cwd: params.cwd,
-      messages: restoredMessages,
-      abortController: null,
-      promptPromise: null,
-      closing: false,
-      closed: false,
-      closePromise: null,
-      title: persisted.title,
-      updatedAt: persisted.updatedAt,
-      model: persisted.model,
-      toolDefinitions,
-      mcpTools,
-      mode: persisted.mode,
-      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeRestoredDisplayText(
-        persisted.messages,
-        restoredMessages,
-        persisted.displayText
-      ),
-    };
-    this.sessions.set(params.sessionId, restored);
-
-    // Replay user/assistant text turns so the client can rehydrate its UI.
-    // Tool / system messages are skipped — they're internal and the client
-    // doesn't render them on its own.
-    await this.replayMessages(
-      params.sessionId,
-      restoredMessages,
-      restored.displayText
-    );
-
-    this.scheduleAvailableCommands(params.sessionId);
-
-    return {
-      models: this.modelsState(persisted.model),
-      modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(
-        restored.model,
-        restored.thoughtLevel,
-        restored.mode
-      ),
-    };
+    return this.restoreSession(params, true);
   }
 
   async unstable_forkSession(
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const source = this.sessions.get(params.sessionId);
     const persisted = source
       ? this.snapshot(params.sessionId, source)
       : this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    const setup = this.connectMcpForSession(params.mcpServers ?? []);
+    let installed: SessionState | null = null;
+    let newSessionId: string | null = null;
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
-    const newSessionId = randomUUID();
+    newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
     const forkedMessages = rebuildRestoredMessages(
@@ -1052,6 +1180,7 @@ export class GlmAcpAgent implements Agent {
       params.cwd,
       toolDefinitions
     );
+    const forkLifecycle = new SessionLifecycle();
     const forked: SessionState = {
       cwd: params.cwd,
       // Deep-clone messages so the fork doesn't share state with the parent.
@@ -1061,6 +1190,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1076,8 +1206,17 @@ export class GlmAcpAgent implements Agent {
         forkedMessages,
         persisted.displayText
       ),
+      lifecycle: forkLifecycle,
     };
     this.sessions.set(newSessionId, forked);
+    installed = forked;
+    this.transitions.set(newSessionId, {
+      lifecycle: forkLifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
@@ -1094,63 +1233,317 @@ export class GlmAcpAgent implements Agent {
         forked.mode
       ),
     };
+    } catch (error) {
+      if (installed) {
+        if (this.sessions.get(newSessionId!) === installed) this.sessions.delete(newSessionId!);
+        await this.disposeSessionTools(installed);
+      } else {
+        await setup.dispose();
+      }
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   async resumeSession(
     params: ResumeSessionRequest
   ): Promise<ResumeSessionResponse> {
-    const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
-    const restoredMessages = rebuildRestoredMessages(
-      persisted.messages,
-      params.cwd,
-      toolDefinitions
-    );
+    return this.restoreSession(params, false);
+  }
 
-    const restored: SessionState = {
-      cwd: params.cwd,
-      messages: restoredMessages,
-      abortController: null,
-      promptPromise: null,
-      closing: false,
-      closed: false,
+  private async restoreSession(
+    params: { sessionId: string; cwd: string; mcpServers?: LoadSessionRequest["mcpServers"] },
+    replay: boolean
+  ): Promise<LoadSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
+    const original = this.sessions.get(params.sessionId);
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, original?.lifecycle ?? new SessionLifecycle());
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("restoring");
+    record.original = original ?? null;
+    const restoreAbortController = new AbortController();
+    record.restoreAbortController = restoreAbortController;
+    let deferLeaseRelease = false;
+
+    const transition = Promise.resolve().then(async (): Promise<LoadSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      let swapped = false;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
+      try {
+        let persisted: PersistedSession;
+        if (original) {
+          original.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(original);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(pending, original, lifecycle, lease, record);
+            throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
+          this.assertRestoreOwner(lifecycle, lease);
+          // This must be taken only after the reserved prompt chain settles:
+          // disk can be older than a just-finished live turn.
+          persisted = this.snapshot(params.sessionId, original);
+        } else {
+          persisted = this.requirePersisted(params.sessionId);
+        }
+
+        this.assertRestoreOwner(lifecycle, lease);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], restoreAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (restoreAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          restoreAbortController.signal,
+          `Session restore cancelled: ${params.sessionId}`
+        );
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+
+        const toolDefinitions = this.availableToolDefinitions(provisional);
+        // Configuration updates remain responsive while MCP setup is in
+        // flight. Prompts are gated, so this second live projection keeps
+        // those latest settings without reopening the history race.
+        const restoreSource = original ? this.snapshot(params.sessionId, original) : persisted;
+        const restoredMessages = rebuildRestoredMessages(
+          restoreSource.messages,
+          params.cwd,
+          toolDefinitions
+        );
+        const restored: SessionState = {
+          cwd: params.cwd,
+          messages: restoredMessages,
+          abortController: null,
+          promptPromise: null,
+          closing: false,
+          closed: false,
+          closePromise: null,
+          disposePromise: null,
+          title: restoreSource.title,
+          updatedAt: restoreSource.updatedAt,
+          model: restoreSource.model,
+          toolDefinitions,
+          mcpTools: provisional,
+          mode: restoreSource.mode,
+          thoughtLevel: resolveThoughtLevel(restoreSource.model, restoreSource.thoughtLevel ?? "max"),
+          commands: discoverSlashCommands(params.cwd),
+          displayText: deserializeRestoredDisplayText(
+            restoreSource.messages,
+            restoredMessages,
+            restoreSource.displayText
+          ),
+          lifecycle,
+        };
+
+        // Replaying a load is part of preparing the replacement. If the
+        // client rejects a replay notification, leave the live original in
+        // place and dispose the provisional resources below.
+        if (replay) {
+          await this.replayMessages(params.sessionId, restoredMessages, restored.displayText);
+        }
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+        if (original && this.sessions.get(params.sessionId) === original) {
+          // Configuration setters stay responsive while a load replays, and
+          // they mutate the still-installed original. Carry those latest
+          // values into the replacement instead of installing the values
+          // captured before replay started.
+          restored.model = original.model;
+          restored.mode = original.mode;
+          restored.thoughtLevel = original.thoughtLevel;
+        }
+        this.sessions.set(params.sessionId, restored);
+        this.sessionTodos.delete(params.sessionId);
+        swapped = true;
+        // Checkpoint the merged state immediately: it can retain a partially
+        // received turn from the drained prompt, which otherwise exists only
+        // in memory until the next prompt or close.
+        this.persistSession(params.sessionId, restored);
+        // Ownership transfers only after the replacement is installed. The
+        // old resources are released afterwards, so setup and replay failures
+        // still retain a valid original session.
+        if (original) await this.disposeSessionTools(original);
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+        this.scheduleAvailableCommands(params.sessionId);
+        return {
+          models: this.modelsState(restored.model),
+          modes: this.modesState(restored.mode),
+          configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
+        };
+      } catch (err) {
+        if (!swapped) {
+          if (provisional) await disposeProvisional(provisional);
+        }
+        throw err;
+      } finally {
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
+    try {
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === original) record.original = null;
+      if (record.restoreAbortController === restoreAbortController) {
+        record.restoreAbortController = null;
+      }
+    }
+  }
+
+  private async drainPrompt(
+    session: SessionState
+  ): Promise<{ drained: boolean; pending: Promise<void> | null }> {
+    const pending = session.promptPromise;
+    if (!pending) return { drained: true, pending: null };
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      if (this.sessionDrainTimeoutMs <= 0) queueMicrotask(() => resolve("timeout"));
+      else timer = setTimeout(() => resolve("timeout"), this.sessionDrainTimeoutMs);
+    });
+    const outcome = await Promise.race([
+      pending.then(() => "drained" as const),
+      timeout,
+    ]);
+    if (timer) clearTimeout(timer);
+    return { drained: outcome === "drained", pending };
+  }
+
+  private releaseAfterPromptDrain(
+    pending: Promise<void> | null,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition
+  ): void {
+    // The promise captured when the drain started must be the one observed
+    // here: the prompt's cleanup can null `session.promptPromise` right after
+    // the timeout resolves, and re-reading the field would never attach the
+    // release callback, leaving the lease stuck in `restoring` forever.
+    void pending?.then(() => {
+      if (!lifecycle.closeRequested) lease.release();
+      if (record.original === session) record.original = null;
+    });
+  }
+
+  private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
+    const record: SessionTransition = {
+      lifecycle,
+      promise: null,
       closePromise: null,
-      title: persisted.title,
-      updatedAt: persisted.updatedAt,
-      model: persisted.model,
-      toolDefinitions,
-      mcpTools,
-      mode: persisted.mode,
-      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeRestoredDisplayText(
-        persisted.messages,
-        restoredMessages,
-        persisted.displayText
-      ),
+      original: null,
+      restoreAbortController: null,
     };
-    this.sessions.set(params.sessionId, restored);
+    this.transitions.set(sessionId, record);
+    return record;
+  }
 
-    this.scheduleAvailableCommands(params.sessionId);
-
-    // Resume does NOT replay history — the client keeps its own UI state and
-    // just wants the agent to pick up where it left off.
-    return {
-      models: this.modelsState(persisted.model),
-      modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(
-        restored.model,
-        restored.thoughtLevel,
-        restored.mode
-      ),
-    };
+  private assertRestoreOwner(lifecycle: SessionLifecycle, lease: TransitionLease): void {
+    if (!lifecycle.owns(lease) || lifecycle.closeRequested) {
+      throw new Error("Session restore cancelled");
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Persistence helpers
   // ---------------------------------------------------------------------------
+
+  private ownsSession(sessionId: string, session: SessionState, generation: number): boolean {
+    return this.sessions.get(sessionId) === session
+      && !session.closing
+      && !session.closed
+      && session.lifecycle.phase === "open"
+      && session.lifecycle.generation === generation;
+  }
+
+  private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
+    const record = this.transitions.get(sessionId);
+    if (record?.original === session && record.lifecycle.phase === "restoring") return true;
+    // A normal close aborts the prompt and waits for it before persisting. The
+    // closing generation must still finish its canonical history (without UI
+    // notifications), otherwise already-received text or an in-flight tool
+    // result disappears from the final checkpoint.
+    return this.sessions.get(sessionId) === session
+      && record?.lifecycle === session.lifecycle
+      && record.lifecycle.phase === "closing"
+      && !session.closed;
+  }
+
+  private ownedPromptConnection(ownsPrompt: () => boolean): AgentSideConnection {
+    const connection = this.connection;
+    return new Proxy(connection, {
+      get(target, property, receiver) {
+        if (property === "sessionUpdate") {
+          return async (params: Parameters<AgentSideConnection["sessionUpdate"]>[0]) => {
+            if (ownsPrompt()) await connection.sessionUpdate(params);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  private assertConfigurable(sessionId: string, session: SessionState): void {
+    if (session.closing || session.closed || session.lifecycle.closeRequested) {
+      throw new Error(`Session is closing: ${sessionId}`);
+    }
+  }
+
+  /** Track MCP setup until it installs into a session or shutdown disposes it. */
+  private connectMcpForSession(
+    servers: Parameters<typeof connectSessionMcpServers>[0]
+  ): PendingMcpSetup {
+    let disposePromise: Promise<void> | null = null;
+    const source = Promise.resolve().then(() => this.mcpConnector(servers));
+    const setup: PendingMcpSetup = {
+      tools: source.then(async (mcpTools) => {
+        if (this.shuttingDown) {
+          await setup.dispose();
+          throw new Error("Agent is shutting down");
+        }
+        return mcpTools;
+      }),
+      release: () => this.pendingSetups.delete(setup),
+      dispose: () => {
+        if (!disposePromise) {
+          disposePromise = source.then(
+            (mcpTools) => mcpTools.dispose(),
+            () => undefined,
+          ).finally(() => setup.release());
+        }
+        return disposePromise;
+      },
+    };
+    this.pendingSetups.add(setup);
+    void source.catch(() => setup.release());
+    return setup;
+  }
+
+  private disposeSessionTools(session: SessionState): Promise<void> {
+    if (!session.disposePromise) {
+      session.disposePromise = session.mcpTools?.dispose() ?? Promise.resolve();
+    }
+    return session.disposePromise;
+  }
 
   private snapshot(sessionId: string, session: SessionState): PersistedSession {
     const displayText = serializeDisplayText(session.messages, session.displayText);
@@ -1170,6 +1563,7 @@ export class GlmAcpAgent implements Agent {
   }
 
   private persistSession(sessionId: string, session: SessionState): void {
+    if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
       this.sessionStore.save(this.snapshot(sessionId, session));
@@ -1250,10 +1644,13 @@ export class GlmAcpAgent implements Agent {
   private async runPromptLoop(
     sessionId: string,
     session: SessionState,
-    signal: AbortSignal
+    signal: AbortSignal,
+    ownsPrompt: () => boolean,
+    preservesDrainingHistory: () => boolean,
+    processSupervisor: ProcessSupervisor
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
     const executor = new ToolExecutor(
-      this.connection,
+      this.ownedPromptConnection(ownsPrompt),
       sessionId,
       this.clientCapabilities,
       signal,
@@ -1262,7 +1659,10 @@ export class GlmAcpAgent implements Agent {
       session.cwd,
       // Use a thunk so mode changes mid-turn take effect on the next tool call.
       () => this.sessions.get(sessionId)?.mode ?? "default",
-      (todos) => this.sessionTodos.set(sessionId, todos)
+      (todos) => {
+        if (ownsPrompt()) this.sessionTodos.set(sessionId, todos);
+      },
+      processSupervisor
     );
 
     let totalUsage: Usage | undefined;
@@ -1292,7 +1692,7 @@ export class GlmAcpAgent implements Agent {
     };
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
-      if (signal.aborted) return { stopReason: "cancelled", usage: totalUsage };
+      if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
 
       // Proactive compaction: check if history exceeds 90% of context window.
       const window = getContextWindow(session.model);
@@ -1329,12 +1729,12 @@ export class GlmAcpAgent implements Agent {
           tools: session.toolDefinitions,
           reasoningEffort: session.thoughtLevel,
         })) {
-          if (signal.aborted) {
+          if (signal.aborted || !ownsPrompt()) {
             cancelledDuringStream = true;
             break;
           }
 
-          if (chunk.thinking && this.streamThinking) {
+          if (chunk.thinking && this.streamThinking && ownsPrompt()) {
             await this.connection.sessionUpdate({
               sessionId,
               update: {
@@ -1344,7 +1744,7 @@ export class GlmAcpAgent implements Agent {
             });
           }
 
-          if (chunk.text) {
+          if (chunk.text && ownsPrompt()) {
             assistantText += chunk.text;
             await this.connection.sessionUpdate({
               sessionId,
@@ -1405,6 +1805,10 @@ export class GlmAcpAgent implements Agent {
 
       // Record the assistant turn in history so the model has full context for
       // the next iteration.
+      const retainDrainedHistory = preservesDrainingHistory();
+      if (!ownsPrompt() && !retainDrainedHistory) {
+        return { stopReason: "cancelled", usage: totalUsage };
+      }
       if (toolCalls.length > 0) {
         session.messages.push({
           role: "assistant",
@@ -1420,7 +1824,9 @@ export class GlmAcpAgent implements Agent {
       }
 
       if (cancelledDuringStream || signal.aborted) {
-        for (const tc of toolCalls) cancelledToolResult(tc.id);
+        if (ownsPrompt() || retainDrainedHistory) {
+          for (const tc of toolCalls) cancelledToolResult(tc.id);
+        }
         return { stopReason: "cancelled", usage: totalUsage };
       }
 
@@ -1432,8 +1838,8 @@ export class GlmAcpAgent implements Agent {
       // Execute tool calls in declaration order and feed each result back.
       let cancellationObserved = false;
       for (const tc of toolCalls) {
-        if (signal.aborted) {
-          cancelledToolResult(tc.id);
+        if (signal.aborted || !ownsPrompt()) {
+          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
           cancellationObserved = true;
           continue;
         }
@@ -1442,22 +1848,27 @@ export class GlmAcpAgent implements Agent {
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
         } catch (err) {
-          if (!signal.aborted) throw err;
-          cancelledToolResult(tc.id);
+          if (!signal.aborted && !preservesDrainingHistory()) throw err;
+          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
           cancellationObserved = true;
           continue;
         }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
+        const retainToolResult = preservesDrainingHistory();
+        if (!ownsPrompt() && !retainToolResult) {
+          cancellationObserved = true;
+          continue;
+        }
         session.messages.push({
           role: "tool",
           tool_call_id: tc.id,
           content: result.content,
         });
-        if (signal.aborted) cancellationObserved = true;
+        if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
       }
 
-      if (cancellationObserved || signal.aborted) {
+      if (cancellationObserved || signal.aborted || !ownsPrompt()) {
         return { stopReason: "cancelled", usage: totalUsage };
       }
 
@@ -1467,6 +1878,7 @@ export class GlmAcpAgent implements Agent {
 
     // Reached MAX_TURNS without resolution. Tell the user why we stopped —
     // without this, hitting the cap is indistinguishable from a normal end.
+    if (!ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
     await this.connection.sessionUpdate({
       sessionId,
       update: {
@@ -1846,6 +2258,32 @@ async function safeSessionUpdate(
   }
 }
 
+/** Reject the owner immediately while retaining a handler for a late setup result. */
+function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error(message));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const claim = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      return true;
+    };
+    const onAbort = () => {
+      if (claim()) reject(new Error(message));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (claim()) resolve(value);
+      },
+      (error) => {
+        if (claim()) reject(error);
+      }
+    );
+  });
+}
+
 /**
  * Token cost charged to a single `image_url` content part.
  *
@@ -1889,6 +2327,18 @@ function estimateTokens(messages: GlmMessage[]): number {
     }
   }
   return tokens + Math.ceil(chars / 4);
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**

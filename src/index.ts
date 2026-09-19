@@ -14,7 +14,7 @@
  *   ACP_GLM_COMMAND_TIMEOUT_MS - (optional) run_command deadline in milliseconds (default: 120000)
  *   ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES - (optional) combined run_command stdout/stderr capture limit (default: 65536)
  */
-import { startConnection } from "./protocol/connection.js";
+import { startAgentRuntime } from "./protocol/connection.js";
 import { parseMaxTurnsFlag } from "./cli-args.js";
 import { runSetup } from "./setup.js";
 
@@ -58,16 +58,51 @@ if (args.includes("--setup")) {
   );
   process.exit(0);
 } else {
-  const connection = startConnection({ maxTurns: parseMaxTurnsFlag(args) });
+  const runtime = startAgentRuntime({ maxTurns: parseMaxTurnsFlag(args) });
+  let finishing: Promise<void> | null = null;
+  let signalExitCode: number | null = null;
 
-  // Keep the process alive until the connection closes
-  connection.closed
-    .then(() => {
-      process.exit(0);
-    })
-    .catch((err: unknown) => {
+  const finish = (reason: "disconnect" | "sigterm" | "sigint" | "fatal", exitCode: number) => {
+    if (reason === "sigterm" || reason === "sigint") signalExitCode = exitCode;
+    if (finishing) return finishing;
+
+    finishing = (async () => {
+      const clean = await settlesWithin(runtime.shutdown(reason), 5_000);
+      if (clean) {
+        runtime.closeTransport();
+        process.exitCode = signalExitCode ?? exitCode;
+        return;
+      }
+      process.stderr.write("glm-acp-agent: shutdown deadline exceeded; forcing active command cleanup\n");
+      await settlesWithin(runtime.forceShutdown(), 1_000);
+      process.exitCode = signalExitCode ?? 1;
+      // An unresolved client/MCP handle would otherwise keep the CLI alive
+      // indefinitely after the documented deadline. Command cleanup had its
+      // forced attempt above; report the incomplete shutdown as nonzero.
+      process.exit(process.exitCode);
+    })().catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`Fatal error: ${message}\n`);
-      process.exit(1);
+      process.stderr.write(`Fatal shutdown error: ${message}\n`);
+      process.exitCode = signalExitCode ?? 1;
     });
+    return finishing;
+  };
+
+  void runtime.connection.closed
+    .then(() => finish("disconnect", 0))
+    .catch(() => finish("fatal", 1));
+  process.on("SIGINT", () => { void finish("sigint", 130); });
+  process.on("SIGTERM", () => { void finish("sigterm", 143); });
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => false),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
