@@ -67,6 +67,15 @@ import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { validateStreamCompletion } from "../llm/stream-state.js";
+import {
+  appendCompactionNote,
+  assertValidHistory,
+  compactToBudget,
+  estimateMessagesTokens,
+  estimateSerializedTokens,
+  type ContextBudget,
+} from "./context-budget.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -194,6 +203,7 @@ export interface GlmAcpAgentOptions {
       signal?: AbortSignal,
       options?: StreamChatOptions
     ) => AsyncIterable<GlmStreamChunk>;
+    getMaxOutputTokens?: () => number;
   };
   /**
    * Maximum number of model/tool turns per single prompt. Default 100,
@@ -1294,12 +1304,7 @@ export class GlmAcpAgent implements Agent {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled", usage: totalUsage };
 
-      // Proactive compaction: check if history exceeds 90% of context window.
-      const window = getContextWindow(session.model);
-      const limit = Math.floor(window * 0.9);
-      if (estimateTokens(session.messages) > limit) {
-        session.messages = compactMessages(session.messages, Math.floor(window * 0.8));
-      }
+      this.compactSessionForRequest(session, false);
 
       debug(`promptLoop: turn=${turn} session=${sessionId} model=${session.model} messages=${session.messages.length}`);
 
@@ -1310,6 +1315,7 @@ export class GlmAcpAgent implements Agent {
       }> = [];
 
       let assistantText = "";
+      let assistantReasoning = "";
       let lastStopReason: string | undefined;
       let turnUsage: Usage | undefined;
       let usageCommitted = false;
@@ -1334,6 +1340,7 @@ export class GlmAcpAgent implements Agent {
             break;
           }
 
+          if (chunk.thinking) assistantReasoning += chunk.thinking;
           if (chunk.thinking && this.streamThinking) {
             await this.connection.sessionUpdate({
               sessionId,
@@ -1370,6 +1377,12 @@ export class GlmAcpAgent implements Agent {
             lastStopReason = chunk.stopReason;
           }
         }
+        if (!signal.aborted) {
+          lastStopReason = validateStreamCompletion(lastStopReason, toolCalls);
+          if (lastStopReason === "length" || lastStopReason === "content_filter") {
+            toolCalls.length = 0;
+          }
+        }
       } catch (err) {
         commitTurnUsage();
         if (signal.aborted) {
@@ -1383,15 +1396,22 @@ export class GlmAcpAgent implements Agent {
 
         if (!cancelledDuringStream && isOverflow && overflowRetryCount < 1) {
           debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
-          const window = getContextWindow(session.model);
-          session.messages = compactMessages(session.messages, Math.floor(window * 0.7), {
-            force: true,
-          });
+          const rejectedBytes = this.requestPayloadBytes(session);
+          const changed = this.compactSessionForRequest(session, true);
+          const retryBytes = this.requestPayloadBytes(session);
+          if (!changed || retryBytes >= rejectedBytes) {
+            throw new Error("Context overflow could not reduce the request payload; narrow the current request or start a new session.", { cause: err });
+          }
           overflowRetryCount++;
           retryTurn = true;
         } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
         } else if (!cancelledDuringStream) {
+          // Keep text the client has already seen, but never retain an
+          // incomplete executable tool batch from an interrupted stream.
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
           throw err;
         }
       }
@@ -1403,20 +1423,28 @@ export class GlmAcpAgent implements Agent {
 
       commitTurnUsage();
 
+      // Provider continuity is independent of the client's thought display.
+      // Never replay reasoning from a cancelled or truncated response as a
+      // completed reasoning chain.
+      const reasoning = assistantReasoning.length > 0 && !cancelledDuringStream && !signal.aborted &&
+        (lastStopReason === "stop" || lastStopReason === "tool_calls")
+        ? { reasoning_content: assistantReasoning } : {};
+
       // Record the assistant turn in history so the model has full context for
       // the next iteration.
       if (toolCalls.length > 0) {
         session.messages.push({
           role: "assistant",
           content: assistantText.length > 0 ? assistantText : null,
+          ...reasoning,
           tool_calls: toolCalls.map((tc) => ({
             id: tc.id,
             type: "function" as const,
             function: { name: tc.name, arguments: tc.arguments },
           })),
         });
-      } else if (assistantText.length > 0) {
-        session.messages.push({ role: "assistant", content: assistantText });
+      } else if (assistantText.length > 0 || reasoning.reasoning_content !== undefined) {
+        session.messages.push({ role: "assistant", content: assistantText || null, ...reasoning });
       }
 
       if (cancelledDuringStream || signal.aborted) {
@@ -1498,6 +1526,58 @@ export class GlmAcpAgent implements Agent {
   }
 
   /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
+  private contextBudget(session: SessionState): ContextBudget {
+    const contextWindow = getContextWindow(session.model);
+    const maxOutputTokens = this.glm.getMaxOutputTokens?.() ?? 32_768;
+    const toolSchemaTokens = estimateSerializedTokens(session.toolDefinitions);
+    return {
+      contextWindow,
+      maxOutputTokens,
+      toolSchemaTokens,
+      safetyTokens: Math.max(4096, Math.floor(contextWindow * 0.05)),
+    };
+  }
+
+  /**
+   * Compact before every provider request. The estimate is a heuristic, so a
+   * provider overflow gets one forceful retry with a byte-level progress test.
+   */
+  private compactSessionForRequest(session: SessionState, force: boolean): boolean {
+    const budget = this.contextBudget(session);
+    const indispensable = estimateMessagesTokens([
+      session.messages[0]!,
+      ...(session.messages.filter(message => message.role === "user").slice(-1)),
+    ]) + budget.maxOutputTokens + budget.toolSchemaTokens + budget.safetyTokens;
+    if (indispensable > budget.contextWindow) {
+      throw new Error("Context too large: system context, current user request, tool schemas, output reservation, and safety margin exceed this model's context window. Narrow the request or choose a larger-context model.");
+    }
+    const result = compactToBudget(session.messages, budget, force);
+    if (!result.changed) return false;
+    let lastUser = -1;
+    for (let index = result.messages.length - 1; index >= 0; index--) {
+      if (result.messages[index]?.role === "user") { lastUser = index; break; }
+    }
+    const messages = result.messages.map((message, index) => {
+      if (index !== lastUser) return message;
+      const replacement = appendCompactionNote(message, result.removedExchanges, result.reducedToolResults);
+      const display = session.displayText.get(message);
+      if (display !== undefined) session.displayText.set(replacement, display);
+      return replacement;
+    });
+    assertValidHistory(messages);
+    session.messages = messages;
+    debug(`context budget: heuristic=${result.estimatedTokens} schemas=${budget.toolSchemaTokens} output=${budget.maxOutputTokens} removed=${result.removedExchanges} reducedTools=${result.reducedToolResults}`);
+    return true;
+  }
+
+  private requestPayloadBytes(session: SessionState): number {
+    return Buffer.byteLength(JSON.stringify({
+      messages: session.messages,
+      tools: session.toolDefinitions,
+      max_tokens: this.glm.getMaxOutputTokens?.() ?? 32_768,
+    }), "utf8");
+  }
+
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
     const names = ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "web_search", "web_reader"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
@@ -1844,151 +1924,4 @@ async function safeSessionUpdate(
   } catch {
     // best-effort
   }
-}
-
-/**
- * Token cost charged to a single `image_url` content part.
- *
- * Vision-native GLM models tile an image into 14px patches and merge them 2x2,
- * so a full-size input (capped at 1120x1120) costs (1120/14)^2 / 4 = 1600
- * tokens. The wire form — an HTTPS URL or a base64 data URL — says nothing
- * about the decoded dimensions, so charge every image that ceiling:
- * over-counting only makes compaction fire early, while under-counting is what
- * lets an image-heavy session sail past the window and get rejected.
- */
-const IMAGE_PART_TOKENS = 1600;
-
-/**
- * Heuristically estimate the number of tokens in a list of messages.
- * Uses a simple 4-character-per-token rule, which is a safe baseline for
- * English and code, plus a flat per-image charge for native `image_url` parts
- * (see {@link IMAGE_PART_TOKENS}).
- */
-function estimateTokens(messages: GlmMessage[]): number {
-  let chars = 0;
-  let tokens = 0;
-  for (const m of messages) {
-    if (typeof m.content === "string") {
-      chars += m.content.length;
-    } else if (Array.isArray(m.content)) {
-      for (const part of m.content) {
-        if ("text" in part && typeof part.text === "string") {
-          chars += part.text.length;
-        } else if (part.type === "image_url") {
-          tokens += IMAGE_PART_TOKENS;
-        }
-      }
-    }
-    if (m.role === "assistant" && m.tool_calls) {
-      for (const tc of m.tool_calls) {
-        if ("function" in tc) {
-          chars += tc.function.name.length;
-          chars += tc.function.arguments.length;
-        }
-      }
-    }
-  }
-  return tokens + Math.ceil(chars / 4);
-}
-
-/**
- * Prune message history to stay within a target token limit.
- *
- * Strategy:
- * 1. Always keep the System prompt (index 0).
- * 2. Always keep the last `preserveTurns` interaction groups (default 10) to
- *    maintain conversation flow. An interaction group (turn) typically starts
- *    with a user message followed by assistant and tool responses.
- * 3. Evict the largest remaining interaction groups until the total estimate
- *    is below `targetTokens`.
- *
- * `force` is for the emergency path after the provider itself rejected the
- * history. There {@link estimateTokens} has been proven wrong, so it can set
- * neither the stopping point nor what is off limits: the target is halved, and
- * the preserved tail becomes evictable from its oldest end. Only the final turn
- * is sacred — it carries the live user message, and a request without it is not
- * a retry of anything.
- */
-function compactMessages(
-  messages: GlmMessage[],
-  targetTokens: number,
-  { preserveTurns = 10, force = false }: { preserveTurns?: number; force?: boolean } = {}
-): GlmMessage[] {
-  if (messages.length <= 1) return messages;
-
-  const systemPrompt = messages[0];
-  const remaining = messages.slice(1);
-
-  // Group messages into interaction turns. A turn starts with a "user" message.
-  const turns: GlmMessage[][] = [];
-  let currentTurn: GlmMessage[] = [];
-
-  for (const m of remaining) {
-    if (m.role === "user" && currentTurn.length > 0) {
-      turns.push(currentTurn);
-      currentTurn = [];
-    }
-    currentTurn.push(m);
-  }
-  if (currentTurn.length > 0) {
-    turns.push(currentTurn);
-  }
-
-  // The final turn holds the live user message, so it is never evictable —
-  // with nothing else to drop there is no compaction to do.
-  if (turns.length < 2) return messages;
-  if (!force && turns.length <= preserveTurns) return messages;
-
-  let currentEstimate = estimateTokens(messages);
-  if (!force && currentEstimate <= targetTokens) return messages;
-
-  // An estimate already above target names a real reduction to aim for, forced
-  // or not. One that sits *below* target while the provider is rejecting the
-  // payload has been disproven, and stopping on it would spend the single retry
-  // on another oversized request — so halve it instead. Wrong by an unknown
-  // factor still shrinks geometrically, and only that case pays the extra loss.
-  const estimateDisproven = force && currentEstimate <= targetTokens;
-  const effectiveTarget = estimateDisproven
-    ? Math.floor(currentEstimate / 2)
-    : targetTokens;
-
-  debug(
-    `compactMessages: currentEstimate=${currentEstimate} target=${effectiveTarget} turns=${turns.length} force=${force}`
-  );
-
-  const sized = turns.map((turn, index) => ({ index, tokens: estimateTokens(turn) }));
-  const protectedFrom = turns.length - preserveTurns;
-  const evictedIndices = new Set<number>();
-
-  // Largest first, among the turns outside the preserved tail.
-  const candidateTurns = sized
-    .filter((c) => c.index < protectedFrom)
-    .sort((a, b) => b.tokens - a.tokens);
-  for (const c of candidateTurns) {
-    if (currentEstimate <= effectiveTarget) break;
-    evictedIndices.add(c.index);
-    currentEstimate -= c.tokens;
-  }
-
-  // Still over, and forced? Then the preserved tail is itself the problem — a
-  // run of image-heavy prompts can exceed the window on its own, leaving the
-  // candidates above unable to reach the target however many are dropped. Eat
-  // into the tail from its oldest end so the freshest context survives.
-  if (force) {
-    for (let i = Math.max(protectedFrom, 0); i < turns.length - 1; i++) {
-      if (currentEstimate <= effectiveTarget) break;
-      evictedIndices.add(i);
-      currentEstimate -= sized[i].tokens;
-    }
-  }
-
-  const compacted: GlmMessage[] = [systemPrompt];
-  for (let i = 0; i < turns.length; i++) {
-    if (!evictedIndices.has(i)) {
-      compacted.push(...turns[i]);
-    }
-  }
-
-  debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} messageCount=${compacted.length}`);
-  return compacted;
 }

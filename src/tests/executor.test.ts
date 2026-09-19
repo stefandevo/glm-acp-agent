@@ -8,6 +8,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
+import type { ResourceLimits } from "../tools/resource-limits.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 interface StubTerminal {
@@ -344,6 +345,95 @@ test("read_file truncates large files with a range marker", async () => {
   }
 });
 
+test("read_file treats editor line pagination as pagination, not byte truncation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-page-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, "line-1\nline-2\nline-3\nline-4", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    async readTextFile(params: { line?: number; limit?: number }) {
+      const lines = ["line-1", "line-2", "line-3", "line-4"];
+      const line = params.line ?? 1;
+      const limit = params.limit ?? lines.length;
+      return { content: lines.slice(line - 1, line - 1 + limit).join("\n") };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, limit: 2 }),
+    );
+    assert.match(result.content, /showing lines 1-2 \(total unknown\); pass offset=3/);
+    assert.doesNotMatch(result.content, /scan stopped at .*byte read limit/);
+
+    const next = await exec.execute(
+      "tc2",
+      "read_file",
+      JSON.stringify({ path, offset: 3, limit: 2 }),
+    );
+    assert.match(next.content, /^line-3\nline-4(?:\n|$)/);
+    assert.doesNotMatch(next.content, /line-1|line-2/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file paginates a legacy editor full buffer for a short offset page", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-page-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, "line-1\nline-2\nline-3", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    // Older ACP clients ignore both line and limit and return the full buffer.
+    async readTextFile() {
+      return { content: "line-1\nline-2\nline-3" };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 2, limit: 2 }),
+    );
+    assert.match(result.content, /^line-2\nline-3\n/);
+    assert.doesNotMatch(result.content, /^line-1\n/);
+    assert.match(result.content, /showing lines 2-3 .*end of file/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file treats a one-line legacy editor buffer as EOF past its only line", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-single-line-"));
+  const path = join(dir, "single-line.txt");
+  writeFileSync(path, "only-line", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    // This client ignores both line and limit, including the far-beyond-EOF probe.
+    async readTextFile() {
+      return { content: "only-line" };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 2, limit: 2 }),
+    );
+    assert.match(result.content, /offset 2 is beyond the last line of .* \(1 line\)/);
+    assert.doesNotMatch(result.content, /only-line/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file final page reports end of file without a next-offset hint", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-"));
   const path = join(dir, "paged.txt");
@@ -391,6 +481,27 @@ test("read_file offset beyond EOF returns an EOF result without clamping or a hi
   }
 });
 
+test("read_file labels a bounded partial line without reporting an impossible range", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-partial-line-"));
+  const path = join(dir, "partial.txt");
+  writeFileSync(path, "abc\ndefgh", "utf8");
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 5, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 2, limit: 1 }));
+    assert.match(result.content, /showing complete lines none/);
+    assert.match(result.content, /line 2 is incomplete/);
+    assert.doesNotMatch(result.content, /complete lines 2-1/);
+    assert.match(result.content, /^d\n/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file elides the client content channel while the tool result stays full", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
   const path = join(dir, "long.txt");
@@ -411,6 +522,26 @@ test("read_file elides the client content channel while the tool result stays fu
     const text = completed.update.content[0]?.content.text ?? "";
     assert.match(text, /chars\]$/);
     assert.ok(text.length < 300);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file bounds a real large local result before it can enter model history", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-bounded-result-"));
+  const path = join(dir, "large.txt");
+  writeFileSync(path, "🙂".repeat(150_000), "utf8");
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 128, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.toolResultBytes);
+    assert.match(result.content, /bytes omitted/);
+    assert.ok(!result.content.includes("\uFFFD"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1349,6 +1480,23 @@ test("list_files rejects empty path", async () => {
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
   const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "" }));
   assert.match(result.content, /non-empty string/);
+});
+
+test("list_files caps an oversized empty-directory header and marks it truncated", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `glm-executor-list-header-${"x".repeat(90)}-`));
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 128,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "." }));
+    assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.listBytes);
+    assert.match(result.content, /\[listing truncated:/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

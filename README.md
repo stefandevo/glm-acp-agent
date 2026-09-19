@@ -4,6 +4,10 @@ An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written 
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
+Streaming responses must include a supported terminal finish reason. An early connection close is reported as an interrupted response, with received text retained for session replay. Tool calls run only after a complete `tool_calls` response; calls in output-limit (`length`) or filtered (`content_filter`) responses are discarded and the corresponding stop reason is preserved.
+
+Completed provider reasoning is retained unchanged in conversation history and saved sessions for subsequent model calls, even when thought display is disabled. `ACP_GLM_STREAM_THINKING=false` controls client display only. Reasoning from cancelled, incomplete, or output-limited responses is not replayed as a completed reasoning chain.
+
 ---
 
 ## Coding Plan Only
@@ -65,7 +69,7 @@ ACP Client (IDE plugin, CLI, …)
 
 The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. When it advertises both `fs.readTextFile` and `fs.writeTextFile`, `read_file` and edit-file reads also use the editor buffer; otherwise those reads fall back to the agent process filesystem. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
 
-Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count, while the model keeps receiving complete payloads through the tool-result channel. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
+Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count. Model-facing tool results are also capped at a UTF-8 byte boundary; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
 ---
 
@@ -73,11 +77,11 @@ Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (a
 
 | Tool | Runs on | Permission behavior | Description |
 |------|---------|---------------------|-------------|
-| `read_file` | ACP client when both fs read/write capabilities are advertised, otherwise agent process | Always silent | Read a text file or editor buffer, paginated by offset/limit (default 2000 lines, capped at 5000); the result reports the shown range, advertises the next offset only while lines remain, and reports EOF past the last line |
+| `read_file` | ACP client when both fs read/write capabilities are advertised, otherwise agent process | Always silent | Read a text file or editor buffer, paginated by offset/limit (default 2000 lines, capped at 5000). Local scans are byte-bounded; totals can be unknown and an incomplete line is never given a next offset. |
 | `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
-| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file — a surgical edit instead of a full rewrite. Re-reads and re-validates after the permission prompt so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
+| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file. It refuses an input or editor buffer over the read/edit budget, and re-validates after permission so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
 | `todowrite` | Agent process | Always silent | Create or replace the session's structured task list so multi-step progress is tracked instead of narrated in chat. Each call replaces the list; the tool result renders it back to the model. |
-| `list_files` | Agent process | Always silent | List a directory using Node filesystem APIs |
+| `list_files` | Agent process | Always silent | List a directory through a bounded iterator; a truncated result is a disclosed subset. |
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | Always silent | Fetch and parse a web page (markdown or plain text) |
@@ -183,6 +187,10 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_TOOL_RESULT_LIMIT_BYTES` | No | `262144` | Inclusive UTF-8 byte limit for every model-facing tool result. It preserves a prefix and suffix with an omitted-bytes marker; values below 128 fall back with a stderr warning. |
+| `ACP_GLM_READ_FILE_LIMIT_BYTES` | No | `8388608` | Maximum local bytes consumed while reading a page or whole file for `edit_file`. A bounded scan may not know the total line count. |
+| `ACP_GLM_LIST_FILES_MAX_ENTRIES` | No | `2000` | Maximum entries collected by `list_files`; larger directories return a disclosed subset. |
+| `ACP_GLM_LIST_FILES_LIMIT_BYTES` | No | `262144` | Maximum bytes assembled for a `list_files` result before its truncation marker. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |

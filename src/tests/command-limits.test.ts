@@ -71,6 +71,19 @@ async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
   return existsSync(path);
 }
 
+async function settlesWithinRealTime(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let settled = false;
+  void promise.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (!settled && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return settled;
+}
+
 test("command limits use the documented defaults when env is absent", () => {
   const warnings: string[] = [];
   const limits = readCommandLimits({}, (message) => warnings.push(message));
@@ -116,7 +129,9 @@ test("finite command output is capped across stdout and stderr with a truncation
   try {
     const result = await withEnv(
       {
-        ACP_GLM_COMMAND_TIMEOUT_MS: "1000",
+        // This test exercises output accounting, not startup latency. Windows
+        // CI can take more than a second to start Git Bash under full-suite load.
+        ACP_GLM_COMMAND_TIMEOUT_MS: "10000",
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "10",
       },
       () =>
@@ -146,7 +161,7 @@ test("a byte cap never exposes a partial UTF-8 code point", async () => {
   try {
     await withEnv(
       {
-        ACP_GLM_COMMAND_TIMEOUT_MS: "1000",
+        ACP_GLM_COMMAND_TIMEOUT_MS: "10000",
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "1",
       },
       () =>
@@ -166,26 +181,31 @@ test("a byte cap never exposes a partial UTF-8 code point", async () => {
 
 test("a command timeout terminates the process tree and marks the tool failed", async () => {
   const connection = createConnectionStub();
+  const abortController = new AbortController();
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-timeout-"));
   const ready = join(cwd, "ready");
+  const fire = join(cwd, "fire");
   const marker = join(cwd, "late");
   writeFileSync(
     join(cwd, "timeout-fixture.cjs"),
-    'const fs = require("node:fs");\n' +
+      'const fs = require("node:fs");\n' +
       'fs.writeFileSync("ready", "ready");\n' +
       'setInterval(() => process.stdout.write("x"), 1);\n' +
-      'setTimeout(() => fs.writeFileSync("late", "late"), 700);\n',
+      'setInterval(() => {\n' +
+      '  if (fs.existsSync("fire")) fs.writeFileSync("late", "late");\n' +
+      '}, 1);\n',
     "utf8"
   );
+  mock.timers.enable({ apis: ["setTimeout"] });
+  let pendingCleanup: Promise<unknown> | null = null;
   try {
-    const started = Date.now();
-    const result = await withEnv(
+    const pending = withEnv(
       {
-        ACP_GLM_COMMAND_TIMEOUT_MS: "250",
+        ACP_GLM_COMMAND_TIMEOUT_MS: "1000",
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "1024",
       },
       () =>
-        commandExecutor(connection, cwd).execute(
+        commandExecutor(connection, cwd, abortController.signal).execute(
           "tc1",
           "run_command",
           JSON.stringify({
@@ -193,13 +213,19 @@ test("a command timeout terminates the process tree and marks the tool failed", 
           })
         )
     );
-    assert.ok(Date.now() - started < 2_000);
-    assert.match(result.content, /timed out after 250 ms/i);
+    pendingCleanup = pending;
+    assert.equal(await waitForFile(ready, 5_000), true);
+    mock.timers.tick(1_000);
+    const result = await pending;
+    assert.match(result.content, /timed out after 1000 ms/i);
     assert.equal(lastUpdate(connection).status, "failed");
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    assert.equal(existsSync(ready), true);
-    assert.equal(existsSync(marker), false);
+    writeFileSync(fire, "fire");
+    assert.equal(await waitForFile(marker, 800), false);
   } finally {
+    abortController.abort();
+    mock.timers.tick(250);
+    mock.timers.reset();
+    await pendingCleanup?.catch(() => undefined);
     await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
@@ -216,7 +242,7 @@ test("a normal background shell exit survives a longer deadline", async () => {
   try {
     const result = await withEnv(
       {
-        ACP_GLM_COMMAND_TIMEOUT_MS: "1000",
+        ACP_GLM_COMMAND_TIMEOUT_MS: "10000",
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "1024",
       },
       () =>
@@ -238,6 +264,7 @@ test("a normal background shell exit survives a longer deadline", async () => {
 
 test("shell-exit cleanup prevents a deadline from killing inherited pipes", async () => {
   const connection = createConnectionStub();
+  const abortController = new AbortController();
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-background-race-"));
   const ready = join(cwd, "ready");
   const release = join(cwd, "release");
@@ -272,6 +299,7 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
     }) as typeof childProcess.spawn
   );
   syncBuiltinESMExports();
+  let pendingCleanup: Promise<unknown> | null = null;
   try {
     const pending = withEnv(
       {
@@ -279,7 +307,7 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "1024",
       },
       () =>
-        commandExecutor(connection, cwd).execute(
+        commandExecutor(connection, cwd, abortController.signal).execute(
           "tc1",
           "run_command",
           JSON.stringify({
@@ -287,24 +315,31 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
           })
         )
     );
+    pendingCleanup = pending;
 
     assert.equal(await waitForFile(ready, 2_000), true);
     mock.timers.tick(950);
     writeFileSync(release, "release");
     // Wait for the actual ChildProcess exit event. Its continuation runs after
     // the executor's exit handler has cleared the command deadline.
-    await shellExitEvent;
+    assert.equal(
+      await settlesWithinRealTime(shellExitEvent, 5_000),
+      true,
+      "shell did not exit after the foreground fixture was released",
+    );
     mock.timers.tick(100);
     const result = await pending;
     assert.match(result.content, /Exit code: 0/);
     assert.doesNotMatch(result.content, /timed out/i);
-    mock.timers.reset();
     assert.equal(await waitForFile(marker, 2_500), true);
     assert.equal(lastUpdate(connection).status, "completed");
   } finally {
+    abortController.abort();
+    mock.timers.tick(250);
     spawnMock.mock.restore();
     syncBuiltinESMExports();
     mock.timers.reset();
+    await pendingCleanup?.catch(() => undefined);
     await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

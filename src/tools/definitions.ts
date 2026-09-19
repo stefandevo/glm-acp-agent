@@ -22,7 +22,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "read_file",
       description:
-        "Read the text content of a file from the agent process. Relative paths resolve against the ACP session working directory. Large responses are truncated: pass offset (1-based start line) and limit (max lines, default 2000) to page through; the result reports the shown range and the total line count.",
+        "Read text from a file or editor buffer. Relative paths resolve against the ACP session working directory. Use offset (1-based) and limit (default 2000, maximum 5000) to page. Local scans are byte-bounded, so total lines can be unknown and an incomplete line must be narrowed or inspected with a bounded command.",
       parameters: {
         type: "object",
         properties: {
@@ -48,7 +48,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "edit_file",
       description:
-        "Replace one exact snippet inside an existing text file — a surgical edit that does not rewrite the whole file. Prefer this over write_file when modifying existing files: it is smaller, faster, and avoids output-token limits. old_text must match the file exactly (including whitespace) and must occur exactly once; include surrounding lines to disambiguate.",
+        "Replace one exact snippet inside an existing text file. old_text must match exactly once, including whitespace. The complete local file or editor buffer must fit the configured read/edit budget; use write_file for an intentional full rewrite.",
       parameters: {
         type: "object",
         properties: {
@@ -96,7 +96,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "list_files",
       description:
-        "List the files and directories at the given path from the agent process. Relative paths resolve against the ACP session working directory.",
+        "List files and directories at the given path. Relative paths resolve against the ACP session working directory. Results are a bounded, sorted subset and state when listing limits are reached.",
       parameters: {
         type: "object",
         properties: {

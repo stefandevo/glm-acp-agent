@@ -3,7 +3,8 @@ import type {
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
-import { lstat, readdir, readFile, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { lstat, opendir, writeFile } from "node:fs/promises";
 import { join as pathJoin, resolve as pathResolve } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
@@ -18,6 +19,9 @@ import {
   readCommandLimits,
   type CommandLimits,
 } from "./command-limits.js";
+import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
+import { boundToolResult, takeUtf8Prefix } from "./tool-output.js";
+import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./file-reader.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -43,6 +47,8 @@ export interface TodoItem {
 const DEFAULT_READ_LIMIT = 2000;
 /** Upper bound for an explicit limit — keeps one call from flooding the context. */
 const HARD_READ_LIMIT = 5000;
+/** Valid ACP line number that is beyond any practical editor buffer. */
+const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
@@ -86,7 +92,8 @@ export class ToolExecutor {
     private sessionMcpTools: SessionMcpTools | null = null,
     private sessionCwd: string = process.cwd(),
     private getMode: () => SessionModeId = () => "default",
-    private setTodos: (todos: TodoItem[]) => void = () => undefined
+    private setTodos: (todos: TodoItem[]) => void = () => undefined,
+    private resourceLimits: ResourceLimits = readResourceLimits(),
   ) {}
 
   /**
@@ -108,10 +115,10 @@ export class ToolExecutor {
     } catch {
       const message = `Error: could not parse tool arguments as JSON: ${rawArguments}`;
       await this.failedToolCall(toolCallId, toolName, {}, message);
-      return { content: message };
+      return { content: boundToolResult(message, this.resourceLimits.toolResultBytes) };
     }
 
-    switch (toolName) {
+    const result = await (async (): Promise<ToolResult> => { switch (toolName) {
       case "read_file":
         return this.readFile(toolCallId, args);
       case "write_file":
@@ -138,7 +145,10 @@ export class ToolExecutor {
         await this.failedToolCall(toolCallId, toolName, args, message);
         return { content: message };
       }
-    }
+    }} )();
+    // This is the sole boundary before a result becomes a model-history tool
+    // message. Permission arguments and write payloads never cross this path.
+    return { content: boundToolResult(result.content, this.resourceLimits.toolResultBytes) };
   }
 
   // ---------------------------------------------------------------------------
@@ -175,17 +185,9 @@ export class ToolExecutor {
     });
 
     try {
-      const full = await this.performRead(absolutePath);
-      const lines = full.split("\n");
-      // split() turns a trailing newline into a phantom empty last line; drop
-      // it so the reported line count matches what an editor shows.
-      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      const totalLines = lines.length;
-
-      // Past EOF: report it plainly instead of clamping back into the last
-      // line — clamping made the "next chunk" hint reappear forever.
-      if (offset > totalLines) {
-        const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${totalLines} line${totalLines === 1 ? "" : "s"})]`;
+      const page = await this.readTextPage(absolutePath, offset, limit);
+      if (page.totalLines !== undefined && offset > page.totalLines) {
+        const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${page.totalLines} line${page.totalLines === 1 ? "" : "s"})]`;
         await this.connection.sessionUpdate({
           sessionId: this.sessionId,
           update: {
@@ -199,15 +201,18 @@ export class ToolExecutor {
         return { content };
       }
 
-      const start = offset;
-      const end = Math.min(start + limit - 1, totalLines);
-      let content = lines.slice(start - 1, end).join("\n");
-      // Only advertise a next offset while lines remain — a hint on the final
-      // page would send the model back into the EOF branch above on a loop.
-      if (end < totalLines) {
-        content += `\n[showing lines ${start}-${end} of ${totalLines}; pass offset=${end + 1} to read the next chunk]`;
-      } else if (start > 1) {
-        content += `\n[showing lines ${start}-${end} of ${totalLines}; end of file]`;
+      let content = page.text;
+      const shown = page.lastCompleteLine >= page.firstLine
+        ? `${page.firstLine}-${page.lastCompleteLine}`
+        : "none";
+      if (page.incompleteLine !== undefined) {
+        content += `${content ? "\n" : ""}[showing complete lines ${shown}; line ${page.incompleteLine} is incomplete because the ${this.resourceLimits.fileReadBytes}-byte scan limit was reached. Narrow the input or use an explicitly bounded command for byte-level inspection.]`;
+      } else if (page.truncated) {
+        content += `\n[scan stopped at the ${this.resourceLimits.fileReadBytes}-byte read limit after line ${page.lastCompleteLine}; total lines are unknown${page.nextLine === undefined ? ". Narrow the input or use an explicitly bounded command for byte-level inspection." : `; pass offset=${page.nextLine} to continue`} ]`;
+      } else if (page.nextLine !== undefined) {
+        content += `\n[showing lines ${shown}${page.totalLines === undefined ? " (total unknown)" : ` of ${page.totalLines}`}; pass offset=${page.nextLine} to read the next chunk]`;
+      } else if (page.totalLines !== undefined && offset > 1) {
+        content += `\n[showing lines ${shown} of ${page.totalLines}; end of file]`;
       }
 
       await this.connection.sessionUpdate({
@@ -418,9 +423,59 @@ export class ToolExecutor {
       this.clientCapabilities?.fs?.writeTextFile
     ) {
       const response = await this.connection.readTextFile({ sessionId: this.sessionId, path });
+      if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+        throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+      }
       return response.content;
     }
-    return readFile(path, "utf8");
+    return readLocalTextFileBounded(path, this.resourceLimits.fileReadBytes, this.signal);
+  }
+
+  private async readTextPage(path: string, offset: number, limit: number): Promise<TextPage> {
+    if (this.clientCapabilities?.fs?.readTextFile && this.clientCapabilities?.fs?.writeTextFile) {
+      // ACP's line/limit form makes the editor responsible for paging. One
+      // lookahead line tells us whether to advertise another request; no page
+      // is misrepresented as a whole-buffer line count.
+      const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
+        const response = await this.connection.readTextFile({
+          sessionId: this.sessionId, path, line, limit: pageLimit,
+        } as never);
+        const lines = response.content.split("\n");
+        if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+        return lines;
+      };
+      let lines = await readEditorLines(offset, limit + 1);
+      let legacyFullBuffer = false;
+      if (offset > 1 && lines.length > 0 && lines.length <= limit + 1) {
+        // A few older ACP clients ignore line/limit and return a short full
+        // buffer. A short file is indistinguishable from a conforming page,
+        // so probe a far-beyond-EOF line before deciding which line numbers
+        // the response represents. ACP defines line as a uint32, so this is
+        // valid for conforming clients and cannot be a real file line here.
+        const probe = await readEditorLines(EDITOR_EOF_PROBE_LINE, 1);
+        if (probe.length > 0) {
+          lines = probe;
+          legacyFullBuffer = true;
+        }
+      }
+      // Older ACP clients ignore line/limit and return the complete buffer.
+      // Retain their correct local pagination instead of treating the first
+      // lines as the requested offset; conforming clients stay on the bounded
+      // lookahead path below.
+      if (legacyFullBuffer || lines.length > limit + 1) {
+        const totalLines = lines.length;
+        if (offset > totalLines) return { text: "", firstLine: offset, lastCompleteLine: totalLines, totalLines, truncated: false };
+        const visible = lines.slice(offset - 1, offset - 1 + limit);
+        const end = offset + visible.length - 1;
+        return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: end, totalLines,
+          ...(end < totalLines ? { nextLine: end + 1 } : {}), truncated: false };
+      }
+      const hasNext = lines.length > limit;
+      const visible = lines.slice(0, limit);
+      return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: offset + visible.length - 1,
+        ...(hasNext ? { nextLine: offset + visible.length } : {}), truncated: false };
+    }
+    return readLocalTextPage(path, offset, limit, this.resourceLimits.fileReadBytes, this.signal);
   }
 
   private async editFile(
@@ -598,18 +653,47 @@ export class ToolExecutor {
     });
 
     try {
-      const entries = await readdir(absolutePath, { withFileTypes: true });
-      const lines = await Promise.all(
-        entries
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map(async (entry) => {
-            const entryPath = pathJoin(absolutePath, entry.name);
-            const info = await lstat(entryPath);
-            const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
-            return `${type}\t${info.size}\t${entry.name}`;
-          })
-      );
-      const output = [`Listing for ${path} (${absolutePath})`, ...lines].join("\n");
+      const directory = await opendir(absolutePath);
+      const entries: Dirent[] = [];
+      let entryLimitReached = false;
+      try {
+        for await (const entry of directory) {
+          if (entries.length >= this.resourceLimits.listEntries) {
+            entryLimitReached = true;
+            break;
+          }
+          entries.push(entry);
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
+      }
+      const sorted = entries.sort((a, b) => a.name.localeCompare(b.name));
+      const lines = await mapWithConcurrency(sorted, this.resourceLimits.fsConcurrency, async entry => {
+        const info = await lstat(pathJoin(absolutePath, entry.name));
+        const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
+        return `${type}\t${info.size}\t${entry.name}`;
+      });
+      const outputLines = [`Listing for ${path} (${absolutePath})`];
+      let byteLimitReached = Buffer.byteLength(outputLines[0]!, "utf8") > this.resourceLimits.listBytes;
+      if (!byteLimitReached) {
+        for (const line of lines) {
+          if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > this.resourceLimits.listBytes) {
+            byteLimitReached = true;
+            break;
+          }
+          outputLines.push(line);
+        }
+      }
+      const marker = `[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`;
+      const listingTruncated = entryLimitReached || byteLimitReached;
+      const output = listingTruncated
+        ? (() => {
+            const markerBytes = Buffer.byteLength(marker, "utf8");
+            const prefixBudget = Math.max(0, this.resourceLimits.listBytes - markerBytes - 1);
+            const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
+            return `${prefix ? `${prefix}\n` : ""}${marker}`;
+          })()
+        : outputLines.join("\n");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -1232,6 +1316,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function runShellCommand(
