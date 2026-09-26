@@ -72,7 +72,7 @@ for (const display of ["true", "false"]) {
   });
 }
 
-test("session store rejects non-string reasoning and preserves valid empty reasoning", () => {
+test("session store rejects non-string reasoning and preserves valid empty reasoning", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-reasoning-shape-"));
   const store = new SessionStore(cwd);
   try {
@@ -81,7 +81,7 @@ test("session store rejects non-string reasoning and preserves valid empty reaso
         updatedAt: new Date().toISOString(), messages: [
           { role: "assistant", content: "answer", reasoning_content: value } as GlmMessage,
         ] };
-      if (typeof value === "string") store.save(record);
+      if (typeof value === "string") await store.save(record);
       else {
         assert.throws(() => store.save(record), /invalid persisted/i);
         writeFileSync(join(cwd, "shape.json"), JSON.stringify(record));

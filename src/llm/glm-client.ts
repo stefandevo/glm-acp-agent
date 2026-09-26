@@ -154,10 +154,18 @@ export interface StreamChatOptions {
   tools?: ToolDefinition[];
   /** Reasoning effort for this call, or undefined to use the model defaults. */
   reasoningEffort?: ThoughtLevel;
+  /** Maximum silence while awaiting one provider stream item. */
+  idleTimeoutMs?: number;
+}
+
+/** A provider stream stopped yielding while its next item was being read. */
+export class ModelStreamIdleTimeoutError extends Error {
+  override name = "ModelStreamIdleTimeoutError";
 }
 
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 /** Default GLM model when neither client nor user has chosen one. */
 export const DEFAULT_MODEL = "glm-5.3";
@@ -354,6 +362,16 @@ export class GlmClient {
       throw err;
     }
 
+    const requestedIdleTimeout = options?.idleTimeoutMs;
+    const idleTimeoutMs = requestedIdleTimeout !== undefined && requestedIdleTimeout > 0
+      ? requestedIdleTimeout
+      : parseIntEnv("ACP_GLM_STREAM_IDLE_TIMEOUT_MS", DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+    const idleBoundedStream = readWithIdleTimeout(
+      stream as AsyncIterable<unknown> & { controller?: AbortController },
+      signal,
+      idleTimeoutMs,
+    );
+
     // Tool call deltas arrive interleaved across chunks; assemble by index.
     const pendingToolCalls: Map<
       number,
@@ -363,7 +381,11 @@ export class GlmClient {
     let lastFinishReason: string | undefined;
     let terminalChoiceSeen = false;
 
-    for await (const chunk of stream) {
+    for await (const rawChunk of idleBoundedStream) {
+      const chunk = rawChunk as {
+        choices: Array<{ delta: unknown; finish_reason?: string | null }>;
+        usage?: unknown;
+      };
       if (chunk.choices.length > 1) {
         throw new IncompleteModelStreamError(
           "Incomplete model stream: received multiple model choices for one completion."
@@ -468,6 +490,73 @@ function parseIntEnv(name: string, fallback: number): number {
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
+/** Bound only provider reads; yielded items leave the timer stopped during ACP backpressure. */
+async function* readWithIdleTimeout<T>(
+  stream: AsyncIterable<T> & { controller?: AbortController },
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): AsyncGenerator<T> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let completed = false;
+  try {
+    while (true) {
+      if (signal?.aborted) throw abortError(signal);
+      const next = Promise.resolve().then(() => iterator.next());
+      const result = await new Promise<IteratorResult<T>>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const rejectForAbort = () => settleReject(abortError(signal!));
+        const settleResolve = (value: IteratorResult<T>) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (signal?.aborted) reject(abortError(signal));
+          else resolve(value);
+        };
+        const settleReject = (reason: unknown) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(signal?.aborted ? abortError(signal) : reason);
+        };
+        const onAbort = () => rejectForAbort();
+        const timer = setTimeout(() => {
+          if (signal?.aborted) {
+            rejectForAbort();
+            return;
+          }
+          settleReject(new ModelStreamIdleTimeoutError(`No provider stream data for ${timeoutMs}ms`));
+        }, timeoutMs);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) rejectForAbort();
+        next.then(settleResolve, settleReject);
+      });
+      if (result.done) {
+        completed = true;
+        return;
+      }
+      yield result.value;
+    }
+  } finally {
+    if (!completed) {
+      stream.controller?.abort();
+      try {
+        const cleanup = iterator.return?.();
+        if (cleanup) void Promise.resolve(cleanup).catch(() => undefined);
+      } catch {
+        // Stream cancellation is best-effort while unwinding an error or abort.
+      }
+    }
+  }
+}
+
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error("Model stream aborted");
+}
+
 
 /**
  * Decide whether a model supports GLM "thinking" mode based on its name

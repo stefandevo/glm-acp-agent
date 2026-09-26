@@ -188,7 +188,7 @@ test("load shifts display mapping when an old record lacks a leading system mess
   const b = workspace("beta");
   const sessionId = "33333333-3333-3333-3333-333333333333";
   try {
-    store.save({
+    await store.save({
       sessionId,
       cwd: "/old/project",
       messages: [{ role: "user", content: "expanded command body" }],

@@ -1,15 +1,6 @@
 import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  unlinkSync,
-  writeSync,
-} from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
@@ -275,6 +266,7 @@ function defaultSessionDir(): string {
  */
 export class SessionStore {
   private dir: string;
+  private pendingSaves = new Map<string, Promise<void>>();
 
   constructor(dir: string = defaultSessionDir()) {
     this.dir = dir;
@@ -290,46 +282,66 @@ export class SessionStore {
     return join(this.dir, `${sessionId}.json`);
   }
 
-  /** Persist a session, creating directories as needed. */
-  save(session: PersistedSession): void {
+  /** Persist an immutable invocation-time snapshot using atomic async I/O. */
+  save(session: PersistedSession): Promise<void> {
     const path = this.pathFor(session.sessionId);
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     // Write the schema version *after* the spread so the constant always wins,
-    // even if a caller accidentally sets `schemaVersion` on the input.
+    // even if a caller accidentally sets schemaVersion on the input.
     const body: PersistedSession = {
       ...session,
       schemaVersion: SESSION_SCHEMA_VERSION,
     };
     if (!parsePersistedSession(body, session.sessionId)) {
-      throw new Error(`Invalid persisted session: ${session.sessionId}`);
+      throw new Error("Invalid persisted session: " + session.sessionId);
     }
+    // Serialize before returning or yielding to the event loop: callers may
+    // continue mutating their live session while this snapshot waits in queue.
+    const bytes = Buffer.from(JSON.stringify(body, null, 2) + "\n", "utf8");
+    const tempPath = join(this.dir, "." + basename(path) + "." + randomUUID() + ".tmp");
 
-    const tempPath = join(this.dir, `.${basename(path)}.${randomUUID()}.tmp`);
-    let fd: number | undefined;
-    try {
-      fd = openSync(tempPath, "wx", 0o600);
-      const contents = JSON.stringify(body, null, 2) + "\n";
-      const bytes = Buffer.from(contents, "utf8");
-      for (let offset = 0; offset < bytes.byteLength;) {
-        offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
-      }
-      fsyncSync(fd);
-      closeSync(fd);
-      fd = undefined;
-      renameSync(tempPath, path);
-    } finally {
-      if (fd !== undefined) {
+    const previous = this.pendingSaves.get(session.sessionId) ?? Promise.resolve();
+    const savePromise = previous.catch(() => undefined).then(async () => {
+      await mkdir(this.dir, { recursive: true, mode: 0o700 });
+      let file: Awaited<ReturnType<typeof open>> | undefined;
+      try {
+        file = await open(tempPath, "wx", 0o600);
+        await file.writeFile(bytes);
+        await file.sync();
+        await file.close();
+        file = undefined;
+        await rename(tempPath, path);
+      } finally {
+        if (file) {
+          try {
+            await file.close();
+          } catch {
+            // Preserve the original save error.
+          }
+        }
         try {
-          closeSync(fd);
+          await unlink(tempPath);
         } catch {
-          // Preserve the original save error.
+          // The rename succeeded, or the temp file was never created.
         }
       }
-      try {
-        unlinkSync(tempPath);
-      } catch {
-        // The rename succeeded, or the temp file was never created.
+    });
+
+    this.pendingSaves.set(session.sessionId, savePromise);
+    const clearIfCurrent = () => {
+      if (this.pendingSaves.get(session.sessionId) === savePromise) {
+        this.pendingSaves.delete(session.sessionId);
       }
+    };
+    void savePromise.then(clearIfCurrent, clearIfCurrent);
+    return savePromise;
+  }
+
+  /** Wait for every accepted write, including writes queued while flushing. */
+  async flush(): Promise<void> {
+    while (this.pendingSaves.size > 0) {
+      await Promise.all(
+        [...this.pendingSaves.values()].map((save) => save.catch(() => undefined)),
+      );
     }
   }
 
@@ -347,6 +359,27 @@ export class SessionStore {
     } catch {
       return undefined;
     }
+    return this.parseRawSession(raw, sessionId);
+  }
+
+  /** Async variant used by protocol requests so disk reads do not block the event loop. */
+  async loadAsync(sessionId: string): Promise<PersistedSession | undefined> {
+    let path: string;
+    try {
+      path = this.pathFor(sessionId);
+    } catch {
+      return undefined;
+    }
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch {
+      return undefined;
+    }
+    return this.parseRawSession(raw, sessionId);
+  }
+
+  private parseRawSession(raw: string, sessionId: string): PersistedSession | undefined {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw) as unknown;
@@ -359,11 +392,8 @@ export class SessionStore {
   }
 
   /**
-   * List metadata for all persisted sessions, sorted newest-first by
-   * `updatedAt`. This is the hot path for `session/list`; we still parse each
-   * file (single-file-per-session has no shared index), but discard the
-   * `messages` array immediately so memory usage scales with the number of
-   * sessions, not their length.
+   * List metadata synchronously for compatibility with existing store users.
+   * Protocol requests use listMetadataAsync to avoid blocking on file I/O.
    */
   listMetadata(): PersistedSessionMetadata[] {
     let entries: string[];
@@ -375,19 +405,40 @@ export class SessionStore {
     const out: PersistedSessionMetadata[] = [];
     for (const name of entries) {
       if (!name.endsWith(".json")) continue;
-      const sessionId = name.slice(0, -".json".length);
-      const sess = this.load(sessionId);
-      if (!sess) continue;
-      out.push({
-        sessionId: sess.sessionId,
-        cwd: sess.cwd,
-        title: sess.title,
-        updatedAt: sess.updatedAt,
-        model: sess.model,
-        mode: sess.mode,
-      });
+      const sess = this.load(name.slice(0, -".json".length));
+      if (sess) out.push(this.toMetadata(sess));
     }
-    out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
-    return out;
+    return this.sortMetadata(out);
+  }
+
+  async listMetadataAsync(): Promise<PersistedSessionMetadata[]> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.dir);
+    } catch {
+      return [];
+    }
+    const out: PersistedSessionMetadata[] = [];
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue;
+      const sess = await this.loadAsync(name.slice(0, -".json".length));
+      if (sess) out.push(this.toMetadata(sess));
+    }
+    return this.sortMetadata(out);
+  }
+
+  private toMetadata(sess: PersistedSession): PersistedSessionMetadata {
+    return {
+      sessionId: sess.sessionId,
+      cwd: sess.cwd,
+      title: sess.title,
+      updatedAt: sess.updatedAt,
+      model: sess.model,
+      mode: sess.mode,
+    };
+  }
+
+  private sortMetadata(out: PersistedSessionMetadata[]): PersistedSessionMetadata[] {
+    return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
   }
 }

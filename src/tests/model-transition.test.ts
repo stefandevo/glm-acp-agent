@@ -76,7 +76,7 @@ test("restored incompatible image history fails before making a provider request
   const store = new SessionStore(join(cwd, "sessions"));
   let calls = 0;
   const messages: GlmMessage[] = [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.invalid/image.png" } }] }];
-  store.save({ sessionId: "incompatible", cwd, title: null, updatedAt: new Date().toISOString(), model: "glm-5.3", mode: "default", messages });
+  await store.save({ sessionId: "incompatible", cwd, title: null, updatedAt: new Date().toISOString(), model: "glm-5.3", mode: "default", messages });
   const agent = new GlmAcpAgent({ sessionUpdate: async () => {} } as never, { sessionStore: store, visionClient: null,
     glm: { async *streamChat() { calls++; yield { done: true, stopReason: "stop" }; } },
   });

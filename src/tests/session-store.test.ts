@@ -221,12 +221,12 @@ test("load migrates valid v1 through v4 records without losing fields", () => {
   }
 });
 
-test("save atomically replaces a broad-mode record and keeps the file private", () => {
+test("save atomically replaces a broad-mode record and keeps the file private", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
     const first = validSession({ updatedAt: "2026-09-16T10:00:00.000Z" });
-    store.save(first);
+    await store.save(first);
     const path = join(dir, `${first.sessionId}.json`);
     chmodSync(path, 0o666);
 
@@ -235,7 +235,7 @@ test("save atomically replaces a broad-mode record and keeps the file private", 
       updatedAt: "2026-09-16T11:00:00.000Z",
       messages: [...first.messages, { role: "user", content: "new turn" }],
     });
-    store.save(second);
+    await store.save(second);
 
     // POSIX exposes the mode bits; Windows does not provide this permission
     // contract, while the replacement/load/temporary-file assertions remain
@@ -250,7 +250,26 @@ test("save atomically replaces a broad-mode record and keeps the file private", 
   }
 });
 
-test("save cleans up its temporary file when replacement fails", () => {
+test("save uses invocation-time snapshots and orders concurrent writes per session", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const first = validSession({ sessionId: "ordered", title: "first snapshot" });
+    const firstSave = store.save(first);
+    first.title = "mutated after save invocation";
+    await firstSave;
+    assert.equal(store.load(first.sessionId)?.title, "first snapshot");
+
+    const older = store.save(validSession({ sessionId: "ordered", title: "older queued snapshot" }));
+    const newer = store.save(validSession({ sessionId: "ordered", title: "newer queued snapshot" }));
+    await Promise.all([older, newer]);
+    assert.equal(store.load(first.sessionId)?.title, "newer queued snapshot");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("save cleans up its temporary file when replacement fails", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -258,7 +277,7 @@ test("save cleans up its temporary file when replacement fails", () => {
     const target = join(dir, `${session.sessionId}.json`);
     mkdirSync(target);
 
-    assert.throws(() => store.save(session));
+    await assert.rejects(store.save(session));
     assert.equal(existsSync(target), true);
     assert.equal(statSync(target).isDirectory(), true);
     assert.deepEqual(
@@ -271,12 +290,12 @@ test("save cleans up its temporary file when replacement fails", () => {
   }
 });
 
-test("save preserves the prior record when serializing the replacement fails", () => {
+test("save preserves the prior record when serializing the replacement fails", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
     const first = validSession({ sessionId: "serialization-fails" });
-    store.save(first);
+    await store.save(first);
     const path = join(dir, `${first.sessionId}.json`);
     const before = readFileSync(path, "utf8");
     const cyclicMessage = { role: "user", content: "bad" } as Record<string, unknown>;

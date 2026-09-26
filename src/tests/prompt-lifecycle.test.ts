@@ -260,9 +260,9 @@ test("close waits for preprocessing cleanup before persisting and removing the s
   };
   let saveSawCleanedImage = false;
   const save = sessionStore.save.bind(sessionStore);
-  sessionStore.save = (session) => {
+  sessionStore.save = async (session) => {
     saveSawCleanedImage = !existsSync(sourcePath);
-    save(session);
+    await save(session);
   };
   const agent = new GlmAcpAgent(conn as never, {
     visionClient: vision,
@@ -703,7 +703,7 @@ test("close is retained while an unloaded resume is setting up replacement resou
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-close-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "44444444-4444-4444-4444-444444444444";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],
@@ -750,7 +750,7 @@ test("close aborts stalled restore MCP setup and disposes a late empty-catalog r
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-abort-restore-setup-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "55555555-5555-5555-5555-555555555555";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],
@@ -1396,7 +1396,7 @@ test("fork rejects persisted history with an unmatched assistant tool call", asy
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-invalid-history-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "33333333-3333-4333-8333-333333333333";
-  store.save({
+  await store.save({
     sessionId,
     cwd: tmpdir(),
     messages: [
@@ -1600,7 +1600,7 @@ test("close interrupts a stalled unloaded restore replay", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-replay-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "66666666-6666-6666-6666-666666666666";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [
@@ -1643,7 +1643,7 @@ test("a failed unloaded restore removes its transition record", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-failure-record-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "77777777-7777-7777-7777-777777777777";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],

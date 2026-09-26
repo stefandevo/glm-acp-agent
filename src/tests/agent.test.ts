@@ -1074,7 +1074,7 @@ test("loadSession disposes its replacement MCP client when replay fails", async 
   });
   const sessionId = "22222222-2222-2222-2222-222222222222";
   try {
-    store.save({
+    await store.save({
       sessionId,
       cwd: "/tmp",
       messages: [{ role: "system", content: "you are a coding assistant" }, { role: "user", content: "ping" }],
@@ -1144,7 +1144,7 @@ for (const [name, restore] of [
     });
     const sessionId = "11111111-1111-1111-1111-111111111111";
     try {
-      store.save({
+      await store.save({
         sessionId,
         cwd: "/tmp",
         messages: [{ role: "system", content: "you are a coding assistant" }],
@@ -2743,7 +2743,7 @@ test("prompt persists session state to the SessionStore", async () => {
 test("loadSession restores messages and replays them as session updates", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd: "/tmp",
       messages: [
@@ -2815,7 +2815,7 @@ test("unstable_forkSession creates a new sessionId with a deep-copied history", 
 test("resumeSession restores in-memory state without replaying messages", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd: "/tmp",
       messages: [
@@ -2885,7 +2885,7 @@ test("unstable_forkSession works on a session that exists only on disk", async (
   const { store, cleanup } = makeTempStore();
   try {
     const sourceId = "22222222-2222-2222-2222-222222222222";
-    store.save({
+    await store.save({
       sessionId: sourceId,
       cwd: "/tmp/orig",
       messages: [
@@ -2938,7 +2938,7 @@ test("unstable_setSessionModel emits a session_info_update notification", async 
 test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "11111111-1111-1111-1111-111111111111",
       cwd: "/tmp",
       messages: [{ role: "system", content: "" }],
@@ -3380,7 +3380,7 @@ test("loadSession advertises commands after replaying history", async () => {
   const { store, cleanup: cleanupStore } = makeTempStore();
   const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd,
       messages: [
@@ -3446,7 +3446,7 @@ test("resumeSession advertises commands for the resumed cwd", async () => {
   const { store, cleanup: cleanupStore } = makeTempStore();
   const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd,
       messages: [{ role: "system", content: "system" }],

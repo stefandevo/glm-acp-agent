@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GlmClient, type GlmStreamChunk } from "../llm/glm-client.js";
+import { GlmClient, ModelStreamIdleTimeoutError, type GlmStreamChunk } from "../llm/glm-client.js";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
 
@@ -44,6 +44,70 @@ async function withProvider(
 function delta(content: Record<string, unknown>, reason: string | null = null) {
   return { choices: [{ index: 0, delta: content, finish_reason: reason }] };
 }
+async function withStalledProvider(run: (client: GlmClient) => Promise<void>): Promise<void> {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify(delta({ content: "partial output" }))}\n\n`);
+    res.flushHeaders();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedUrl = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "fixture-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v4`;
+  try {
+    await run(new GlmClient());
+  } finally {
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedUrl === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedUrl;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+}
+
+test("HTTP idle timeout covers provider next only and retains already yielded text", async () => {
+  await withStalledProvider(async client => {
+    const partial: string[] = [];
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 40 })) {
+        if (chunk.text) partial.push(chunk.text);
+      }
+    }, (error: unknown) => error instanceof ModelStreamIdleTimeoutError);
+    assert.deepEqual(partial, ["partial output"]);
+  });
+});
+
+test("HTTP idle timeout preserves external abort as cancellation", async () => {
+  await withStalledProvider(async client => {
+    const controller = new AbortController();
+    const cancel = setTimeout(() => controller.abort(), 20);
+    try {
+      await assert.rejects(async () => {
+        for await (const chunk of client.streamChat([], controller.signal, { model: "glm-5.3", idleTimeoutMs: 200 })) void chunk;
+      }, (error: unknown) => error instanceof Error && error.name === "AbortError");
+    } finally {
+      clearTimeout(cancel);
+    }
+  });
+});
+
+test("HTTP idle timeout does not include downstream consumer backpressure", async () => {
+  await withProvider([delta({ content: "first" }), delta({}, "stop")], async client => {
+    const text: string[] = [];
+    for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 20 })) {
+      if (chunk.text) {
+        text.push(chunk.text);
+        await new Promise(resolve => setTimeout(resolve, 60));
+      }
+    }
+    assert.deepEqual(text, ["first"]);
+  });
+});
 
 for (const frames of [[], [delta({ content: "partial answer" })]]) {
   test(`HTTP EOF without terminal reason rejects (${frames.length} frames)`, async () => {
