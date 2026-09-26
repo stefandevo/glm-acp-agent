@@ -76,7 +76,7 @@ import {
   assertValidHistory,
   compactToBudget,
   estimateMessagesTokens,
-  estimateSerializedTokens,
+  ToolSchemaTokenCache,
   type ContextBudget,
 } from "./context-budget.js";
 
@@ -303,6 +303,7 @@ export class GlmAcpAgent implements Agent {
   private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
   private readonly pendingSetups = new Set<PendingMcpSetup>();
   private readonly processSupervisor = new ProcessSupervisor();
+  private readonly toolSchemaTokenCache = new ToolSchemaTokenCache();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
   private readonly shutdownDrainTimeoutMs: number;
@@ -2089,7 +2090,8 @@ export class GlmAcpAgent implements Agent {
   private contextBudget(session: SessionState): ContextBudget {
     const contextWindow = getContextWindow(session.model);
     const maxOutputTokens = this.glm.getMaxOutputTokens?.() ?? 32_768;
-    const toolSchemaTokens = estimateSerializedTokens(session.toolDefinitions);
+    // Session catalogs are immutable after assembly; a replacement catalog has a new identity.
+    const toolSchemaTokens = this.toolSchemaTokenCache.get(session.toolDefinitions);
     return {
       contextWindow,
       maxOutputTokens,

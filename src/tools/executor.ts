@@ -55,6 +55,37 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
 
+/** Format a bounded listing while measuring each candidate line only once. */
+export function formatDirectoryListing(
+  header: string,
+  lines: readonly string[],
+  byteLimit: number,
+  marker: string,
+  entriesTruncated = false,
+  byteLength: (text: string) => number = text => Buffer.byteLength(text, "utf8"),
+): string {
+  const outputLines = [header];
+  let usedBytes = byteLength(header);
+  let byteLimitReached = usedBytes > byteLimit;
+  if (!byteLimitReached) {
+    for (const line of lines) {
+      const candidateBytes = usedBytes + 1 + byteLength(line);
+      if (candidateBytes > byteLimit) {
+        byteLimitReached = true;
+        break;
+      }
+      outputLines.push(line);
+      usedBytes = candidateBytes;
+    }
+  }
+  if (!entriesTruncated && !byteLimitReached) return outputLines.join("\n");
+
+  const markerBytes = byteLength(marker);
+  const prefixBudget = Math.max(0, byteLimit - markerBytes - 1);
+  const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
+  return `${prefix ? `${prefix}\n` : ""}${marker}`;
+}
+
 /**
  * Elide a single long string for client-facing display (UI cards, read
  * previews) — never for tool results or permission prompts.
@@ -690,27 +721,15 @@ export class ToolExecutor {
         const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
         return `${type}\t${info.size}\t${entry.name}`;
       });
-      const outputLines = [`Listing for ${path} (${absolutePath})`];
-      let byteLimitReached = Buffer.byteLength(outputLines[0]!, "utf8") > this.resourceLimits.listBytes;
-      if (!byteLimitReached) {
-        for (const line of lines) {
-          if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > this.resourceLimits.listBytes) {
-            byteLimitReached = true;
-            break;
-          }
-          outputLines.push(line);
-        }
-      }
+      const header = `Listing for ${path} (${absolutePath})`;
       const marker = `[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`;
-      const listingTruncated = entryLimitReached || byteLimitReached;
-      const output = listingTruncated
-        ? (() => {
-            const markerBytes = Buffer.byteLength(marker, "utf8");
-            const prefixBudget = Math.max(0, this.resourceLimits.listBytes - markerBytes - 1);
-            const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
-            return `${prefix ? `${prefix}\n` : ""}${marker}`;
-          })()
-        : outputLines.join("\n");
+      const output = formatDirectoryListing(
+        header,
+        lines,
+        this.resourceLimits.listBytes,
+        marker,
+        entryLimitReached,
+      );
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,

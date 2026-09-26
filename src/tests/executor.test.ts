@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
-import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
+import { takeUtf8Prefix } from "../tools/tool-output.js";
+import { ToolExecutor, formatDirectoryListing, isProcessGroupAlive } from "../tools/executor.js";
 import type { ResourceLimits } from "../tools/resource-limits.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
@@ -1569,6 +1570,48 @@ test("run_command turn abort during permission prompt reports cancelled by turn"
 // ---------------------------------------------------------------------------
 // list_files
 // ---------------------------------------------------------------------------
+
+test("directory listing formatting preserves UTF-8 truncation with linear byte measurements", () => {
+  const header = "Listing for . (中 path)";
+  const marker = "[listing truncated: returned a subset; entries=2000, bytes=96]";
+  const lines = Array.from({ length: 700 }, (_, index) => `${index % 2 ? "file" : "dir"}\t${index}\t${index % 3 ? "entry" : "🚀中"}-${index}`);
+  const reference = (byteLimit: number, entriesTruncated: boolean): string => {
+    const outputLines = [header];
+    let byteLimitReached = Buffer.byteLength(outputLines[0]!, "utf8") > byteLimit;
+    if (!byteLimitReached) {
+      for (const line of lines) {
+        if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > byteLimit) {
+          byteLimitReached = true;
+          break;
+        }
+        outputLines.push(line);
+      }
+    }
+    if (!entriesTruncated && !byteLimitReached) return outputLines.join("\n");
+    const markerBytes = Buffer.byteLength(marker, "utf8");
+    const prefixBudget = Math.max(0, byteLimit - markerBytes - 1);
+    const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
+    return `${prefix ? `${prefix}\n` : ""}${marker}`;
+  };
+
+  let byteMeasurements = 0;
+  const full = formatDirectoryListing(header, lines, 1_000_000, marker, false, text => {
+    byteMeasurements += 1;
+    return Buffer.byteLength(text, "utf8");
+  });
+  assert.equal(full, reference(1_000_000, false));
+  assert.equal(byteMeasurements, lines.length + 1, "header and each entry are measured once");
+
+  for (const byteLimit of [1, 80, 180, 900, 100_000]) {
+    for (const entriesTruncated of [false, true]) {
+      assert.equal(
+        formatDirectoryListing(header, lines, byteLimit, marker, entriesTruncated),
+        reference(byteLimit, entriesTruncated),
+        `byteLimit=${byteLimit}, entriesTruncated=${entriesTruncated}`,
+      );
+    }
+  }
+});
 
 test("list_files resolves relative paths against the session cwd", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-list-"));
