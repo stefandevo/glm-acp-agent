@@ -54,6 +54,7 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
+const PREVIEW_PAYLOAD_LIMIT_BYTES = 16_384;
 
 /**
  * Elide a single long string for client-facing display (UI cards, read
@@ -70,14 +71,21 @@ function elideStringForPreview(value: string): string {
  * The full payload still reaches the model through the tool result channel.
  */
 function elideForPreview(value: unknown): unknown {
-  if (typeof value === "string") {
-    return elideStringForPreview(value);
+  const preview = elidePreviewStrings(value);
+  const serialized = JSON.stringify(preview);
+  if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") > PREVIEW_PAYLOAD_LIMIT_BYTES) {
+    return { truncated: `Preview exceeds ${PREVIEW_PAYLOAD_LIMIT_BYTES}-byte limit` };
   }
-  if (Array.isArray(value)) return value.map(elideForPreview);
+  return preview;
+}
+
+function elidePreviewStrings(value: unknown): unknown {
+  if (typeof value === "string") return elideStringForPreview(value);
+  if (Array.isArray(value)) return value.map(elidePreviewStrings);
   if (typeof value === "object" && value !== null) {
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = elideForPreview(item);
+      out[key] = elidePreviewStrings(item);
     }
     return out;
   }
@@ -175,10 +183,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read file: ${path}`,
+        title: elideStringForPreview(`Read file: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -302,9 +310,9 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: todos.some((t) => t.status === "in_progress")
+        title: elideStringForPreview(todos.some((t) => t.status === "in_progress")
           ? `Task list: ${todos.find((t) => t.status === "in_progress")?.activeForm ?? todos.find((t) => t.status === "in_progress")?.content ?? ""}`
-          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`,
+          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`),
         kind: "other",
         status: "completed",
         rawInput: elideForPreview(args),
@@ -332,10 +340,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Write file: ${path}`,
+        title: elideStringForPreview(`Write file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -520,10 +528,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Edit file: ${path}`,
+        title: elideStringForPreview(`Edit file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -661,10 +669,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `List files: ${path}`,
+        title: elideStringForPreview(`List files: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -751,7 +759,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Run command: ${command}`,
+        title: elideStringForPreview(`Run command: ${command}`),
         kind: "execute",
         status: "pending",
         locations: [],
@@ -876,7 +884,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Web search: ${query}`,
+        title: elideStringForPreview(`Web search: ${query}`),
         kind: "fetch",
         status: "in_progress",
         locations: [],
@@ -905,7 +913,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(output) } }],
           rawOutput: elideForPreview({ resultCount }),
         },
       });
@@ -938,10 +946,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read URL: ${url}`,
+        title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: url }],
+        locations: url.length <= PREVIEW_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -965,7 +973,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(output) } }],
           rawOutput: elideForPreview({ title, url: resultUrl }),
         },
       });
@@ -1006,10 +1014,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Analyze image: ${imageSource}`,
+        title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: imageSource }],
+        locations: imageSource.length <= PREVIEW_STRING_LIMIT ? [{ path: imageSource }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1026,7 +1034,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(text) } }],
           rawOutput: elideForPreview({ text }),
         },
       });
@@ -1048,7 +1056,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "in_progress",
         locations: [],
@@ -1065,8 +1073,8 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
-          rawOutput: mcpResult,
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(text) } }],
+          rawOutput: elideForPreview(mcpResult),
         },
       });
       return { content: text };
@@ -1169,16 +1177,13 @@ export class ToolExecutor {
   private permissionOutcome(permissionResponse: {
     outcome: { outcome: string; optionId?: string };
   }): { type: "allow" } | { type: "reject" } | { type: "cancelled" } {
-    if (permissionResponse.outcome.outcome === "cancelled") {
+    if (permissionResponse?.outcome?.outcome === "cancelled") {
       return { type: "cancelled" };
     }
-    if (
-      permissionResponse.outcome.outcome === "selected" &&
-      permissionResponse.outcome.optionId === "reject"
-    ) {
-      return { type: "reject" };
-    }
-    return { type: "allow" };
+    return permissionResponse?.outcome?.outcome === "selected" &&
+      permissionResponse.outcome.optionId === "allow"
+      ? { type: "allow" }
+      : { type: "reject" };
   }
 
   /** Mark an in-progress tool call as failed. */
@@ -1189,7 +1194,7 @@ export class ToolExecutor {
         sessionUpdate: "tool_call_update",
         toolCallId,
         status: "failed",
-        rawOutput: { error: message },
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }
@@ -1209,12 +1214,12 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "failed",
         locations: [],
-        rawInput,
-        rawOutput: { error: message },
+        rawInput: elideForPreview(rawInput),
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }

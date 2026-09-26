@@ -6,6 +6,7 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
+import { readMcpResponseText } from "./mcp-response-limit.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -219,7 +220,7 @@ export class ZaiMcpClient {
       signal,
     });
     if (!response.ok) {
-      const text = await response.text();
+      const text = await readMcpResponseText(response);
       throw new Error(formatMcpError(mcpMethod, response.status, text));
     }
   }
@@ -240,7 +241,7 @@ export class ZaiMcpClient {
       body: JSON.stringify(body),
       signal,
     });
-    const text = await response.text();
+    const text = await readMcpResponseText(response);
     if (!response.ok) {
       throw new Error(formatMcpError(stage, response.status, text));
     }

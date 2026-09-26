@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import { StdioVisionMcpClient } from "../tools/vision-mcp-client.js";
+import { MCP_RESPONSE_LIMIT_BYTES } from "../tools/mcp-response-limit.js";
 
 interface FakeChild extends EventEmitter {
   stdin: Writable;
@@ -221,6 +222,22 @@ test("StdioVisionMcpClient does not kill an initialized server when a caller abo
   await client.dispose();
 });
 
+test("StdioVisionMcpClient terminates an oversized newline-less server frame", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const pending = client.callTool("image_analysis", { image_source: "demo" });
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(written.length >= 4);
+  pushStdout("x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1));
+  await assert.rejects(pending, /byte limit/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(getKillCount() > 0);
+  await client.dispose();
+});
 test("StdioVisionMcpClient launches npx through cmd.exe on Windows", async () => {
   const { child } = makeFakeChild();
   let command = "";

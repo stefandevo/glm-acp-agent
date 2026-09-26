@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
+import { MCP_RESPONSE_LIMIT_BYTES } from "../tools/mcp-response-limit.js";
 import {
   HttpMcpClient,
   SessionMcpTools,
@@ -136,6 +137,29 @@ test("HTTP MCP cancels a stalled shared initialization when its only waiter abor
   }
 });
 
+test("HTTP MCP rejects an oversized discovery response before JSON parsing", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async (_url, init) => {
+    const request = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+    if (request.method === "initialize") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (request.method === "tools/list") {
+      return new Response("x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1), { headers: { "Content-Type": "application/json" } });
+    }
+    throw new Error(`unexpected method ${String(request.method)}`);
+  }) as typeof fetch;
+  const client = new HttpMcpClient(httpServer());
+  try {
+    await assert.rejects(client.listTools(), /MCP response exceeds/);
+  } finally {
+    await client.dispose();
+    globalThis.fetch = previous;
+  }
+});
 test("HTTP MCP retries initialization for a caller started immediately after cancellation", async () => {
   const originalFetch = globalThis.fetch;
   let initializeCalls = 0;
@@ -898,6 +922,20 @@ test("StdioMcpClient keeps a shared initialization alive for a concurrent listTo
   await client.dispose();
 });
 
+test("StdioMcpClient terminates an oversized newline-less server frame", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const list = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await list;
+  const pending = client.callTool("search", {});
+  await tick();
+  pushStdout("x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1));
+  await assert.rejects(pending, /byte limit/);
+  await tick();
+  assert.ok(getKillCount() > 0);
+  await client.dispose();
+});
 test("StdioMcpClient does not resurrect a disposed server", async () => {
   const { child } = makeFakeChild();
   let spawnCount = 0;

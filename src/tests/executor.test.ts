@@ -19,7 +19,7 @@ interface StubTerminal {
 }
 
 function createConnectionStub(opts: {
-  permission?: "allow" | "reject" | "cancelled";
+  permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown";
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
@@ -80,6 +80,12 @@ function createConnectionStub(opts: {
           return { outcome: { outcome: "selected", optionId: "reject" } };
         case "cancelled":
           return { outcome: { outcome: "cancelled" } };
+        case "missing":
+          return { outcome: { outcome: "selected" } };
+        case "unoffered":
+          return { outcome: { outcome: "selected", optionId: "allow_always" } };
+        case "unknown":
+          return { outcome: { outcome: "unknown" } };
       }
     },
   };
@@ -725,6 +731,75 @@ test("write_file rejected by user marks call failed and skips writing", async ()
   }
 });
 
+for (const permission of ["missing", "unoffered", "unknown"] as const) {
+  test(`unexpected ${permission} permission outcome never writes or executes`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-permission-invalid-"));
+    try {
+      const path = join(dir, "denied.txt");
+      const conn = createConnectionStub({ permission });
+      const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+      const write = await executor.execute("write", "write_file", JSON.stringify({ path, content: "secret" }));
+      assert.match(write.content, /rejected/i);
+      assert.equal(existsSync(path), false);
+      const command = await executor.execute("command", "run_command", JSON.stringify({ command: "echo unsafe" }));
+      assert.match(command.content, /rejected/i);
+      assert.deepEqual(conn.terminalCalls, []);
+      assert.equal(conn.permissionRequests.length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("session MCP notifications elide large content and aggregate small fields", async () => {
+  const conn = createConnectionStub();
+  const text = "x".repeat(50_000);
+  const raw = { content: [{ type: "text", text }], metadata: Array.from({ length: 1_000 }, (_, i) => ({ key: i, value: "v".repeat(30) })) };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp", "custom_tool", JSON.stringify({ fields: Array.from({ length: 1_000 }, (_, i) => ({ key: i })) }));
+  assert.equal(result.content, text);
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+  const final = conn.updates.at(-1)?.update as { rawOutput: unknown; content: Array<{ content: { text: string } }> };
+  assert.ok(final.content[0]?.content.text.length < 240);
+  assert.notDeepEqual(final.rawOutput, raw);
+});
+test("failed tool cards bound both invalid arguments and upstream error bodies", async () => {
+  const text = "z".repeat(50_000);
+  const conn = createConnectionStub();
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const invalid = await executor.execute("invalid", "write_file", JSON.stringify({ path: "", content: text }));
+  assert.match(invalid.content, /path.*required/i);
+  const tools = { hasTool: () => true, callTool: async () => { throw new Error(text); } };
+  const mcpExecutor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const failed = await mcpExecutor.execute("error", "custom_tool", "{}");
+  assert.match(failed.content, /Error calling MCP tool/);
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+});
+test("tool-card titles and locations stay bounded without shortening approval payloads", async () => {
+  const path = "p".repeat(50_000);
+  const command = "echo " + "c".repeat(50_000);
+  const conn = createConnectionStub({ permission: "reject" });
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  await executor.execute("read", "read_file", JSON.stringify({ path }));
+  await executor.execute("write", "write_file", JSON.stringify({ path, content: "body" }));
+  await executor.execute("run", "run_command", JSON.stringify({ command }));
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+  const first = conn.updates[0]?.update as { locations?: unknown[] };
+  assert.deepEqual(first.locations, []);
+  const writeApproval = conn.permissionRequests[0] as { toolCall: { title: string; rawInput: { path: string } } };
+  assert.equal(writeApproval.toolCall.title, `Write file: ${path}`);
+  assert.equal(writeApproval.toolCall.rawInput.path, path);
+  const executeApproval = conn.permissionRequests[1] as { toolCall: { title: string; rawInput: { command: string } } };
+  assert.equal(executeApproval.toolCall.title, `Run command: ${command}`);
+  assert.equal(executeApproval.toolCall.rawInput.command, command);
+});
 test("write_file cancelled by user marks call failed", async () => {
   const conn = createConnectionStub({ permission: "cancelled" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
