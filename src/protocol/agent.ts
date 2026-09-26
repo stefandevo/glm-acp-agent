@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
+import { PACKAGE_VERSION } from "../package-version.js";
 import type { ChatCompletionContentPart } from "openai/resources/index.js";
 import type {
   Agent,
@@ -364,7 +365,7 @@ export class GlmAcpAgent implements Agent {
       protocolVersion: negotiatedVersion,
       agentInfo: {
         name: "glm-acp-agent",
-        version: "1.0.0",
+        version: PACKAGE_VERSION,
       },
       // Advertise auth methods so the ACP registry verifier and capable
       // clients can discover how to configure us. The `agent`-default method

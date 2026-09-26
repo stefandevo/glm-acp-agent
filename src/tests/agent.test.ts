@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -170,6 +170,10 @@ test("initialize returns negotiated protocol version, agent info, and auth metho
 
   assert.equal(result.protocolVersion, PROTOCOL_VERSION);
   assert.equal(result.agentInfo?.name, "glm-acp-agent");
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8")
+  ) as { version: string };
+  assert.equal(result.agentInfo?.version, packageJson.version);
   assert.equal(result.agentCapabilities?.loadSession, true);
   assert.equal(result.agentCapabilities?.mcpCapabilities?.http, true);
   assert.equal(result.agentCapabilities?.promptCapabilities?.embeddedContext, true);

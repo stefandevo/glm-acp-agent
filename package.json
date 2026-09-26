@@ -8,7 +8,13 @@
     "glm-acp-agent": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist/*.js",
+    "dist/*.d.ts",
+    "dist/*.map",
+    "dist/llm",
+    "dist/protocol",
+    "dist/registry",
+    "dist/tools"
   ],
   "scripts": {
     "build": "tsc",
