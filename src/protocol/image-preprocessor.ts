@@ -21,6 +21,8 @@ export interface ImagePreprocessorFileOps {
 
 const defaultFileOps: ImagePreprocessorFileOps = { mkdtemp, writeFile, rm };
 
+const MAX_CONCURRENT_IMAGE_ANALYSES = 3;
+
 /**
  * Replace every ACP image block with a text annotation containing the result
  * of a Vision MCP `image_analysis` call. ACP image blocks may carry a usable
@@ -41,72 +43,92 @@ export async function preprocessImageBlocks(
     return { blocks: [...blocks], cleanups: [] };
   }
 
-  const out: Block[] = [];
+  const out = new Array<Block>(blocks.length);
   const cleanups: Array<() => Promise<void>> = [];
+  const imageIndexes = new Map<number, number>();
   let imageIndex = 0;
+  blocks.forEach((block, blockIndex) => {
+    if (block.type === "image") imageIndexes.set(blockIndex, ++imageIndex);
+  });
+  let nextBlockIndex = 0;
+  let fatalFailure = false;
 
-  try {
-    for (const block of blocks) {
-      if (block.type !== "image") {
-        out.push(block);
-        continue;
-      }
-      imageIndex += 1;
+  const processBlock = async (blockIndex: number): Promise<void> => {
+    const block = blocks[blockIndex];
+    if (block.type !== "image") {
+      out[blockIndex] = block;
+      return;
+    }
+    const index = imageIndexes.get(blockIndex);
+    if (index === undefined) throw new Error("Image index was not assigned");
 
+    throwIfAborted(signal);
+
+    if (!visionClient) {
+      out[blockIndex] = textBlock(`<image_attached index="${index}" mime="${block.mimeType}">image attached (not analyzed; Vision MCP unavailable)</image_attached>`);
+      return;
+    }
+
+    let imageSource: string;
+    if (typeof block.data === "string" && block.data.length > 0) {
+      const dir = await fileOps.mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
+      cleanups.push(async () => {
+        try { await fileOps.rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      });
       throwIfAborted(signal);
+      const ext = guessExtension(block.mimeType);
+      const path = pathJoin(dir, `image-${index}${ext}`);
+      await fileOps.writeFile(path, Buffer.from(block.data, "base64"));
+      throwIfAborted(signal);
+      imageSource = path;
+    } else if (typeof block.uri === "string" && block.uri.length > 0) {
+      imageSource = block.uri;
+    } else {
+      out[blockIndex] = textBlock(`<image_analysis_error index="${index}">image block has neither a uri nor base64 data</image_analysis_error>`);
+      return;
+    }
 
-      if (!visionClient) {
-        out.push(textBlock(`<image_attached index="${imageIndex}" mime="${block.mimeType}">image attached (not analyzed; Vision MCP unavailable)</image_attached>`));
-        continue;
-      }
-
-      let imageSource: string;
-      if (typeof block.data === "string" && block.data.length > 0) {
-        const dir = await fileOps.mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
-        // Register cleanup as soon as the directory exists. A write failure
-        // must not strand the directory before the caller receives a result.
-        cleanups.push(async () => {
-          try { await fileOps.rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-        });
+    try {
+      throwIfAborted(signal);
+      const visionOperation = Promise.resolve().then(() => {
         throwIfAborted(signal);
-        const ext = guessExtension(block.mimeType);
-        const path = pathJoin(dir, `image-${imageIndex}${ext}`);
-        await fileOps.writeFile(path, Buffer.from(block.data, "base64"));
-        throwIfAborted(signal);
-        imageSource = path;
-      } else if (typeof block.uri === "string" && block.uri.length > 0) {
-        imageSource = block.uri;
-      } else {
-        out.push(textBlock(`<image_analysis_error index="${imageIndex}">image block has neither a uri nor base64 data</image_analysis_error>`));
-        continue;
-      }
+        return visionClient.callTool("image_analysis", {
+          image_source: imageSource,
+          prompt: "Describe this image in detail, including any text, code, UI elements, or other visible content.",
+        }, signal);
+      });
+      const result = await waitForAbort(visionOperation, signal);
+      const text = extractText(result);
+      out[blockIndex] = textBlock(`<image_analysis index="${index}">\n${text}\n</image_analysis>`);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      out[blockIndex] = textBlock(`<image_analysis_error index="${index}">${message}</image_analysis_error>`);
+    }
+  };
 
+  const runWorker = async (): Promise<void> => {
+    while (true) {
+      if (fatalFailure) return;
+      throwIfAborted(signal);
+      const blockIndex = nextBlockIndex++;
+      if (blockIndex >= blocks.length) return;
       try {
-        throwIfAborted(signal);
-        const visionOperation = Promise.resolve().then(() => {
-          // Cancellation can happen between the synchronous check above and
-          // this queued callback, especially for URI images with no fs await.
-          throwIfAborted(signal);
-          return visionClient.callTool("image_analysis", {
-            image_source: imageSource,
-            prompt: "Describe this image in detail, including any text, code, UI elements, or other visible content.",
-          }, signal);
-        });
-        const result = await waitForAbort(
-          visionOperation,
-          signal,
-        );
-        const text = extractText(result);
-        out.push(textBlock(`<image_analysis index="${imageIndex}">\n${text}\n</image_analysis>`));
+        await processBlock(blockIndex);
       } catch (err) {
-        if (signal?.aborted) throw err;
-        const message = err instanceof Error ? err.message : String(err);
-        out.push(textBlock(`<image_analysis_error index="${imageIndex}">${message}</image_analysis_error>`));
+        // Any unexpected preparation failure makes this batch unusable. Let current work drain, but do not schedule more blocks.
+        fatalFailure = true;
+        throw err;
       }
     }
+  };
+
+  try {
+    const workerCount = Math.min(MAX_CONCURRENT_IMAGE_ANALYSES, blocks.length);
+    const results = await Promise.allSettled(Array.from({ length: workerCount }, () => runWorker()));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   } catch (err) {
-    // The caller cannot receive our cleanup callbacks when preprocessing
-    // rejects, so perform them here before propagating the original error.
     await runCleanups(cleanups);
     throw err;
   }

@@ -243,7 +243,13 @@ test("CLI SIGINT upgrades a disconnect shutdown exit code", { skip: process.plat
 test("CLI shutdown preserves intentionally backgrounded commands after normal shell exit", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-cli-background-"));
   const marker = join(cwd, "marker");
-  const code = `setTimeout(()=>require("node:fs").writeFileSync(${JSON.stringify(marker)}, "done"), 300)`;
+  const pending = join(cwd, "pending");
+  // Reveal the marker only after its write closes; otherwise teardown can race the background writer.
+  const code = [
+    'const fs=require("node:fs");',
+    `setTimeout(()=>{fs.writeFileSync(${JSON.stringify(pending)}, "done");`,
+    `fs.renameSync(${JSON.stringify(pending)}, ${JSON.stringify(marker)});}, 300);`,
+  ].join("");
   const command = `${shellQuote(process.execPath)} -e ${shellQuote(code)} >/dev/null 2>&1 & echo started`;
   const { child, started, close } = await runCliUntilCommand(command, cwd);
   try {

@@ -24,6 +24,7 @@ const SECRET_ENV_NAME = /key|token|secret|password|passwd|pwd|credential|auth|co
 const NON_SECRET_ENV_NAMES = new Set(["PWD", "OLDPWD"]);
 const CHILD_TERM_GRACE_MS = 250;
 const CHILD_KILL_SETTLE_MS = 500;
+const MAX_CONCURRENT_MCP_SERVER_STARTUPS = 3;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -129,21 +130,46 @@ export async function connectSessionMcpServers(
   const usedNames = new Set(TOOL_DEFINITIONS.map((tool) => tool.function.name));
   const bindings: ToolBinding[] = [];
   const clients: ConnectedMcpClient[] = [];
+  const clientsByServer: Array<ConnectedMcpClient | undefined> = new Array(servers.length);
+  const discoveredTools: Array<McpTool[] | undefined> = new Array(servers.length);
+  let nextServerIndex = 0;
+  let setupFailed = false;
+
+  const connectNextServer = async (): Promise<void> => {
+    while (!setupFailed) {
+      const index = nextServerIndex++;
+      if (index >= servers.length) return;
+      const server = servers[index];
+      try {
+        if (signal?.aborted) throw new Error("MCP session setup cancelled");
+        const client = createClient(server);
+        clients.push(client);
+        clientsByServer[index] = client;
+        const tools = await client.listTools(signal);
+        assertUniqueSourceNames(tools, server.name);
+        discoveredTools[index] = tools;
+      } catch (err) {
+        setupFailed = true;
+        throw err;
+      }
+    }
+  };
 
   try {
-    for (const server of servers) {
-      if (signal?.aborted) throw new Error("MCP session setup cancelled");
-      const client = createClient(server);
-      clients.push(client);
-      const tools = await client.listTools(signal);
-      assertUniqueSourceNames(tools, server.name);
+    const workerCount = Math.min(MAX_CONCURRENT_MCP_SERVER_STARTUPS, servers.length);
+    await Promise.all(Array.from({ length: workerCount }, () => connectNextServer()));
+    for (let index = 0; index < servers.length; index += 1) {
+      const server = servers[index];
+      const serverClient = clientsByServer[index];
+      const tools = discoveredTools[index];
+      if (!serverClient || !tools) throw new Error(`MCP server "${server.name}" did not return a tool catalog`);
       for (const tool of tools) {
         const exposedName = chooseToolName(tool.name, server.name, usedNames);
         usedNames.add(exposedName);
         bindings.push({
           exposedName,
           sourceName: tool.name,
-          client,
+          client: serverClient,
           definition: {
             type: "function",
             function: {

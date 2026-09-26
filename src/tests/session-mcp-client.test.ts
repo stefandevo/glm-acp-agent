@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
-import type { McpServerStdio } from "@agentclientprotocol/sdk";
+import { createServer, type Server } from "node:http";
+import { once } from "node:events";
+import type { McpServer, McpServerStdio } from "@agentclientprotocol/sdk";
 import {
   HttpMcpClient,
   SessionMcpTools,
@@ -99,6 +101,119 @@ test("connectSessionMcpServers aborts stalled HTTP initialization", async () => 
 function httpServer() {
   return { type: "http" as const, name: "fixture", url: "https://fixture.invalid", headers: [] };
 }
+
+interface DelayedMcpFixtureConfig {
+  name: string;
+  delayMs: number;
+  toolsListDelayMs?: number;
+  failToolsList?: boolean;
+}
+
+async function createDelayedMcpFixtures(configs: DelayedMcpFixtureConfig[]) {
+  let activeRequests = 0;
+  let peakActiveRequests = 0;
+  const deleteCounts = new Map<string, number>();
+  const fixtures: Server[] = [];
+  const servers: McpServer[] = [];
+
+  for (const config of configs) {
+    deleteCounts.set(config.name, 0);
+    const fixture = createServer((request, response) => {
+      void (async () => {
+        if (request.method === "DELETE") {
+          deleteCounts.set(config.name, (deleteCounts.get(config.name) ?? 0) + 1);
+          response.writeHead(202).end();
+          return;
+        }
+        let text = "";
+        for await (const chunk of request) text += chunk;
+        const message = JSON.parse(text) as { id?: number; method?: string };
+        activeRequests += 1;
+        peakActiveRequests = Math.max(peakActiveRequests, activeRequests);
+        try {
+          const delayMs = message.method === "tools/list" ? config.toolsListDelayMs ?? config.delayMs : config.delayMs;
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          if (response.destroyed) return;
+          if (message.method === "notifications/initialized") {
+            response.writeHead(202).end();
+            return;
+          }
+          if (message.method === "tools/list" && config.failToolsList) {
+            response.writeHead(500).end("fixture discovery failure");
+            return;
+          }
+          const result = message.method === "initialize"
+            ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: config.name, version: "1" } }
+            : { tools: [{ name: "phase5_fixture_tool", inputSchema: { type: "object", properties: {} } }] };
+          if (message.method === "initialize") response.setHeader("MCP-Session-Id", config.name);
+          response.writeHead(200, { "Content-Type": "application/json" })
+            .end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+        } finally {
+          activeRequests -= 1;
+        }
+      })().catch((error: unknown) => response.destroy(error instanceof Error ? error : undefined));
+    });
+    fixture.listen(0, "127.0.0.1");
+    await once(fixture, "listening");
+    const address = fixture.address();
+    if (!address || typeof address === "string") throw new Error("MCP fixture did not bind a TCP port");
+    fixtures.push(fixture);
+    servers.push({ type: "http", name: config.name, url: "http://127.0.0.1:" + address.port, headers: [] });
+  }
+
+  return {
+    servers,
+    get peakActiveRequests() { return peakActiveRequests; },
+    deleteCount: (name: string) => deleteCounts.get(name) ?? 0,
+    close: async () => {
+      await Promise.all(fixtures.map((fixture) => new Promise<void>((resolve, reject) => {
+        fixture.close((error) => error ? reject(error) : resolve());
+      })));
+    },
+  };
+}
+
+test("connectSessionMcpServers bounds parallel discovery and preserves configured naming order", async () => {
+  const fixtures = await createDelayedMcpFixtures([
+    { name: "first", delayMs: 35 },
+    { name: "second", delayMs: 25 },
+    { name: "third", delayMs: 5 },
+    { name: "fourth", delayMs: 15 },
+    { name: "fifth", delayMs: 1 },
+  ]);
+  let tools: SessionMcpTools | undefined;
+  try {
+    tools = await connectSessionMcpServers(fixtures.servers);
+    assert.equal(fixtures.peakActiveRequests, 3);
+    assert.deepEqual(tools.toolNames, [
+      "phase5_fixture_tool",
+      "second_phase5_fixture_tool",
+      "third_phase5_fixture_tool",
+      "fourth_phase5_fixture_tool",
+      "fifth_phase5_fixture_tool",
+    ]);
+  } finally {
+    await tools?.dispose();
+    await fixtures.close();
+  }
+});
+
+test("connectSessionMcpServers disposes every started client after parallel discovery failure", async () => {
+  const fixtures = await createDelayedMcpFixtures([
+    { name: "broken", delayMs: 5, toolsListDelayMs: 5, failToolsList: true },
+    { name: "slow-one", delayMs: 5, toolsListDelayMs: 100 },
+    { name: "slow-two", delayMs: 5, toolsListDelayMs: 100 },
+  ]);
+  try {
+    await assert.rejects(connectSessionMcpServers(fixtures.servers), /broken tools\/list failed/);
+    assert.equal(fixtures.peakActiveRequests, 3);
+    assert.equal(fixtures.deleteCount("broken"), 1);
+    assert.equal(fixtures.deleteCount("slow-one"), 1);
+    assert.equal(fixtures.deleteCount("slow-two"), 1);
+  } finally {
+    await fixtures.close();
+  }
+});
 
 test("HTTP MCP cancels a stalled shared initialization when its only waiter aborts", async () => {
   const originalFetch = globalThis.fetch;
