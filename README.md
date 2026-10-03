@@ -257,6 +257,8 @@ When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` fami
 
 The provider stream itself is guarded against stalls. The Z.AI SDK's HTTP timeout only covers waiting for response headers — a response whose body stops mid-stream would otherwise hang the turn forever. The agent therefore aborts a provider stream read that produces no data for `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` milliseconds (default `300000`; invalid values for the variable fall back to the default with a stderr warning). On timeout, whatever partial output already reached the user is kept, an `[error]` message is appended as an agent message, the turn ends, and the last valid on-disk session checkpoint is preserved. A slow ACP client back-pressuring chunks it already received does not trip the watchdog — only silence from the provider between reads does.
 
+A dropped network connection is handled separately from a stall. If the provider request fails before an HTTP status arrives (`APIConnectionError`, or a socket error such as `ECONNRESET`), the agent discards its HTTP client and retries the open twice. If the link is still down, the turn ends with `stopReason: "cancelled"` instead of a JSON-RPC internal error, so the session stays open. A turn that produced no assistant text or tool result drops that user message and asks for it to be sent again. Partial text that already streamed is kept, and the next message continues the same session on a new connection. An HTTP error such as 401 or 429 still fails the turn.
+
 #### Thought level (reasoning effort)
 
 The agent advertises a `thought_level` [SessionConfigOption](https://agentclientprotocol.com) so clients that support config options (e.g. a "Thinking" selector) can control reasoning effort per session. The available levels depend on the active model:
@@ -505,6 +507,7 @@ The test suite covers:
 
 - **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` (or `node dist/index.js --setup` from a source clone) once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
+- **`Connection lost. Send the message again when you are back online.`** — the link to Z.AI dropped before this turn produced a reply. The session is still open. Send the prompt again once the network is back.
 - **Writes or commands never get to run.** — make sure your ACP client supports `session/request_permission` and that you approve the prompt for the specific tool call.
 
 ---

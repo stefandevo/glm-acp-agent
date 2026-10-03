@@ -163,6 +163,59 @@ export class ModelStreamIdleTimeoutError extends Error {
   override name = "ModelStreamIdleTimeoutError";
 }
 
+/** Opens of one request before the turn is handed back as a lost connection. */
+const TRANSPORT_OPEN_ATTEMPTS = 3;
+const TRANSPORT_RETRY_DELAYS_MS = [50, 200];
+
+const TRANSPORT_CAUSE_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+/**
+ * A provider call failed before any HTTP status arrived.
+ *
+ * `APIConnectionError` is the OpenAI SDK's message for that case ("Connection
+ * error."). A socket reset while the body is already streaming surfaces as the
+ * raw cause code instead, and still means this client should not be reused.
+ * An error that carries an HTTP status is a provider response, not a drop.
+ */
+export function isRecoverableTransportError(err: unknown): boolean {
+  if (err instanceof OpenAI.APIConnectionError) return true;
+  if (!err || typeof err !== "object") return false;
+  if ("status" in err && typeof (err as { status?: unknown }).status === "number") return false;
+  let current: unknown = err;
+  for (let depth = 0; depth < 6 && current && typeof current === "object"; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && TRANSPORT_CAUSE_CODES.has(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function waitForTransportRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw signal.reason ?? new Error("Model stream aborted");
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Model stream aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -283,19 +336,13 @@ export function getDefaultModel(): string {
  */
 export class GlmClient {
   private client: OpenAI;
+  private readonly baseURL: string;
   private maxTokens: number;
   /** Resolved once at construction; later env changes cannot affect a running client. */
   private readonly streamIdleTimeoutMs: number;
 
   constructor() {
-    const apiKey = resolveApiKey();
-    if (!apiKey) {
-      throw new Error(
-        "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
-      );
-    }
-
-    const baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
+    this.baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
     // 32768 leaves room for whole-file writes and GLM thinking tokens in the
     // same turn; reasoning counts against this cap, so a small value starves
     // the actual content and trips finish_reason=length ("output limit
@@ -306,7 +353,34 @@ export class GlmClient {
     // env re-reads cannot change behaviour mid-session.
     this.streamIdleTimeoutMs = parseIntEnv("ACP_GLM_STREAM_IDLE_TIMEOUT_MS", DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 
-    this.client = new OpenAI({ apiKey, baseURL });
+    this.client = this.buildClient();
+  }
+
+  /**
+   * Build a new HTTP client. Called at startup and after a transport failure
+   * so a dead keep-alive socket is not reused when the network returns.
+   */
+  private buildClient(): OpenAI {
+    const apiKey = resolveApiKey();
+    if (!apiKey) {
+      throw new Error(
+        "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
+      );
+    }
+    return new OpenAI({ apiKey, baseURL: this.baseURL });
+  }
+
+  /** Drop the current HTTP client. The next request opens a new connection. */
+  private discardTransport(): void {
+    try {
+      this.client = this.buildClient();
+    } catch (err) {
+      warn(
+        `could not replace the provider client after a connection failure: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
   }
 
   /** The same resolved reservation used in the outgoing `max_tokens` field. */
@@ -345,27 +419,41 @@ export class GlmClient {
     // that to pass GLM-specific fields like `thinking` and `reasoning_effort`.
     const extraBody: Record<string, unknown> = { ...thinkingParams };
 
-    let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>>;
-    try {
-      stream = await this.client.chat.completions.create(
-        {
-          model,
-          messages,
-          tools,
-          tool_choice: "auto",
-          stream: true,
-          // Always ask the API to include final usage in the streaming response.
-          stream_options: { include_usage: true },
-          max_tokens: this.maxTokens,
-          ...extraBody,
-        },
-        { signal }
-      );
-    } catch (err) {
-      const status = (err as { status?: number })?.status;
-      const body = (err as { error?: unknown })?.error;
-      error(`streamChat request failed: status=${status}`, JSON.stringify(body) ?? String(err));
-      throw err;
+    let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>> | undefined;
+    for (let attempt = 1; attempt <= TRANSPORT_OPEN_ATTEMPTS; attempt++) {
+      try {
+        stream = await this.client.chat.completions.create(
+          {
+            model,
+            messages,
+            tools,
+            tool_choice: "auto",
+            stream: true,
+            // Always ask the API to include final usage in the streaming response.
+            stream_options: { include_usage: true },
+            max_tokens: this.maxTokens,
+            ...extraBody,
+          },
+          { signal }
+        );
+        break;
+      } catch (err) {
+        const recoverable = isRecoverableTransportError(err);
+        // Replace the client even on the final attempt, so a later prompt in
+        // this same process does not reuse the socket that just died.
+        if (recoverable) this.discardTransport();
+        const retry = recoverable && !signal?.aborted && attempt < TRANSPORT_OPEN_ATTEMPTS;
+        if (!retry) {
+          const status = (err as { status?: number })?.status;
+          const body = (err as { error?: unknown })?.error;
+          error(`streamChat request failed: status=${status}`, JSON.stringify(body) ?? String(err));
+          throw err;
+        }
+        await waitForTransportRetry(TRANSPORT_RETRY_DELAYS_MS[attempt - 1] ?? 200, signal);
+      }
+    }
+    if (!stream) {
+      throw new Error("streamChat did not open a provider stream");
     }
 
     const requestedIdleTimeout = options?.idleTimeoutMs;
@@ -387,6 +475,7 @@ export class GlmClient {
     let lastFinishReason: string | undefined;
     let terminalChoiceSeen = false;
 
+    try {
     for await (const rawChunk of idleBoundedStream) {
       const chunk = rawChunk as {
         choices: Array<{ delta: unknown; finish_reason?: string | null }>;
@@ -477,6 +566,10 @@ export class GlmClient {
         debug(`streamChat usage: input=${usage.inputTokens} output=${usage.outputTokens} total=${usage.totalTokens}`);
         yield { usage };
       }
+    }
+    } catch (err) {
+      if (isRecoverableTransportError(err)) this.discardTransport();
+      throw err;
     }
 
     signal?.throwIfAborted();

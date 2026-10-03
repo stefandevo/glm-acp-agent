@@ -44,6 +44,7 @@ import {
   getContextWindow,
   isVisionNativeModel,
   ERR_CONTEXT_OVERFLOW,
+  isRecoverableTransportError,
   getThoughtLevels,
   resolveThoughtLevel,
   isThoughtLevel,
@@ -203,6 +204,12 @@ interface SessionState {
    * own. Serialized to indices at save time and rebuilt on load.
    */
   displayText: WeakMap<GlmMessage, string>;
+  /**
+   * Message list from before this prompt's compaction. A connection drop
+   * before any reply restores it, so the shortened transcript is not saved.
+   * Not persisted.
+   */
+  messagesBeforeCompaction?: GlmMessage[];
   /** Synchronous gate for replacement and close transitions. */
   lifecycle: SessionLifecycle;
 }
@@ -871,6 +878,7 @@ export class GlmAcpAgent implements Agent {
       if (userMessageId) cancelled.userMessageId = userMessageId;
       return cancelled;
     };
+    let userMessage: GlmMessage | undefined;
 
     try {
       if (predecessor) {
@@ -910,7 +918,7 @@ export class GlmAcpAgent implements Agent {
       const userContent = visionNative
         ? renderVisionNativePromptBlocks(preprocessed.blocks)
         : renderPromptBlocks(preprocessed.blocks).content;
-      const userMessage: GlmMessage = { role: "user", content: userContent };
+      userMessage = { role: "user", content: userContent };
       session.messages.push(userMessage);
 
       // What the user typed, rendered from the blocks as they arrived — before
@@ -929,6 +937,16 @@ export class GlmAcpAgent implements Agent {
       preservesDrainingHistory,
       this.processSupervisor
       );
+
+      // A queued prompt aborts this turn. The loop then reports cancellation
+      // instead of the connection error, and the following save would replace
+      // the checkpoint with the shortened transcript.
+      if (abortController.signal.aborted || stopReason === "cancelled") {
+        if (this.restoreCompactedUnsentPrompt(session) === "restored") {
+          session.updatedAt = new Date().toISOString();
+          await this.persistSession(params.sessionId, session);
+        }
+      }
 
       if (!ownsPrompt()) {
         return cancelledResponse();
@@ -971,6 +989,52 @@ export class GlmAcpAgent implements Agent {
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
+        if (this.restoreCompactedUnsentPrompt(session) === "restored") {
+          session.updatedAt = new Date().toISOString();
+          await this.persistSession(params.sessionId, session);
+        }
+        return cancelledResponse();
+      }
+      // A dropped provider connection must not fail the JSON-RPC prompt.
+      // Paseo and other clients turn a thrown error into -32603 and then keep
+      // sending later prompts through the same dead HTTP client. End the turn
+      // as cancelled, keep any text that already streamed, and leave the
+      // session idle so the next message opens a new connection.
+      if (isRecoverableTransportError(err) && userMessage) {
+        // Compaction replaces the live user message with a new object before
+        // the provider call, so identity lookup misses the turn that just ran.
+        const rollback = this.restoreCompactedUnsentPrompt(session);
+        const lastUserIndex = (messages: GlmMessage[]): number => {
+          for (let index = messages.length - 1; index >= 0; index--) {
+            if (messages[index]?.role === "user") return index;
+          }
+          return -1;
+        };
+        let keptWork = rollback === "kept";
+        if (rollback === "none") {
+          const start = lastUserIndex(session.messages);
+          const currentTurn = start >= 0 ? session.messages[start] : undefined;
+          keptWork = currentTurn !== undefined && session.messages.slice(start + 1)
+            .some((message) => message.role === "assistant" || message.role === "tool");
+          if (currentTurn && !keptWork) {
+            session.messages.splice(start, 1);
+            session.displayText.delete(currentTurn);
+          }
+        }
+        session.updatedAt = new Date().toISOString();
+        await this.persistSession(params.sessionId, session);
+        await safeSessionUpdate(promptConnection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: keptWork
+                ? "\n\nConnection lost. Send a message to continue.\n"
+                : "\n\nConnection lost. Send the message again when you are back online.\n",
+            },
+          },
+        });
         return cancelledResponse();
       }
       // Surface the error to the user as an agent message so the IDE displays
@@ -996,6 +1060,9 @@ export class GlmAcpAgent implements Agent {
       // may clear them, and resolution follows all preprocessing/cleanup.
       if (session.abortController === abortController) session.abortController = null;
       if (session.promptPromise === promptPromise) session.promptPromise = null;
+      // Release the pre-compaction list only after this prompt has used it.
+      // The next prompt does not run until this one resolves.
+      session.messagesBeforeCompaction = undefined;
       resolvePromptPromise();
       // A timed-out fork/restore attaches its durable checkpoint to the prompt
       // drain. Signal the chain first (the checkpoint depends on it), then keep
@@ -1734,6 +1801,33 @@ export class GlmAcpAgent implements Agent {
   // Persistence helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * A cancelled prompt can leave the shortened transcript in memory. Put the
+   * pre-compaction messages back and drop the unsent prompt before any save.
+   */
+  private restoreCompactedUnsentPrompt(session: SessionState): "restored" | "kept" | "none" {
+    const prior = session.messagesBeforeCompaction;
+    if (!prior) return "none";
+    const lastUserIndex = (messages: GlmMessage[]): number => {
+      for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index]?.role === "user") return index;
+      }
+      return -1;
+    };
+    let start = lastUserIndex(session.messages);
+    const keptWork = start >= 0 && session.messages.slice(start + 1)
+      .some((message) => message.role === "assistant" || message.role === "tool");
+    if (keptWork) return "kept";
+    session.messages = prior;
+    start = lastUserIndex(session.messages);
+    const currentTurn = start >= 0 ? session.messages[start] : undefined;
+    if (currentTurn) {
+      session.messages.splice(start, 1);
+      session.displayText.delete(currentTurn);
+    }
+    return "restored";
+  }
+
   private ownsSession(sessionId: string, session: SessionState, generation: number): boolean {
     return this.sessions.get(sessionId) === session
       && !session.closing
@@ -2319,6 +2413,9 @@ export class GlmAcpAgent implements Agent {
     }
     const result = compactToBudget(session.messages, budget, force);
     if (!result.changed) return false;
+    if (session.messagesBeforeCompaction === undefined) {
+      session.messagesBeforeCompaction = session.messages;
+    }
     let lastUser = -1;
     for (let index = result.messages.length - 1; index >= 0; index--) {
       if (result.messages[index]?.role === "user") { lastUser = index; break; }

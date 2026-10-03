@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
+import OpenAI from "openai";
 import {
   GlmClient,
   ModelStreamIdleTimeoutError,
@@ -15,6 +16,7 @@ import {
   resolveThoughtLevel,
   buildThinkingParams,
   isVisionNativeModel,
+  isRecoverableTransportError,
 } from "../llm/glm-client.js";
 
 test("constructor uses the coding endpoint by default", () => {
@@ -657,4 +659,83 @@ test("streamChat rejects inconsistent partial tool calls instead of reporting su
     }
   }, /inconsistent|incomplete/i);
   assert.equal(calls.length, 0);
+});
+
+test("isRecoverableTransportError accepts connection drops and rejects HTTP statuses", () => {
+  assert.equal(
+    isRecoverableTransportError(new OpenAI.APIConnectionError({ message: "Connection error." })),
+    true
+  );
+  assert.equal(isRecoverableTransportError(Object.assign(new Error("reset"), { code: "ECONNRESET" })), true);
+  assert.equal(isRecoverableTransportError(Object.assign(new Error("upstream"), { status: 502 })), false);
+  assert.equal(isRecoverableTransportError(new Error("fixture interrupted")), false);
+});
+
+test("streamChat replaces the client after a connection error and retries the open", async () => {
+  process.env["Z_AI_API_KEY"] = "test-key";
+  const c = new GlmClient();
+  let calls = 0;
+  let builds = 0;
+  const stub = {
+    chat: {
+      completions: {
+        create: () => {
+          calls += 1;
+          if (calls === 1) throw new OpenAI.APIConnectionError({ message: "Connection error." });
+          return Promise.resolve(fakeStream([
+            { choices: [{ delta: { content: "back" }, finish_reason: "stop" }] },
+          ]));
+        },
+      },
+    },
+  };
+  const client = c as unknown as { client: unknown; buildClient: () => unknown };
+  client.client = stub;
+  client.buildClient = () => {
+    builds += 1;
+    return stub;
+  };
+  const text: string[] = [];
+  try {
+    for await (const chunk of c.streamChat([])) {
+      if (chunk.text) text.push(chunk.text);
+    }
+  } finally {
+    delete process.env["Z_AI_API_KEY"];
+  }
+  assert.deepEqual(text, ["back"]);
+  assert.equal(calls, 2);
+  assert.equal(builds, 1);
+});
+
+test("streamChat replaces the client when the body fails with a socket reset", async () => {
+  process.env["Z_AI_API_KEY"] = "test-key";
+  const c = new GlmClient();
+  let builds = 0;
+  const broken = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return Promise.reject(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+        },
+      };
+    },
+  };
+  const stub = { chat: { completions: { create: () => Promise.resolve(broken) } } };
+  const client = c as unknown as { client: unknown; buildClient: () => unknown };
+  client.client = stub;
+  client.buildClient = () => {
+    builds += 1;
+    return stub;
+  };
+  try {
+    await assert.rejects(async () => {
+      for await (const _chunk of c.streamChat([])) {
+        void _chunk;
+      }
+    });
+  } finally {
+    delete process.env["Z_AI_API_KEY"];
+  }
+  assert.equal(builds, 1);
 });
