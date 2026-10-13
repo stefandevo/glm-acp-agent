@@ -22,13 +22,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "read_file",
       description:
-        "Read text from a file or editor buffer. Relative paths resolve against the ACP session working directory. Use offset (1-based) and limit (default 2000, maximum 5000) to page. Local scans are byte-bounded, so total lines can be unknown and an incomplete line must be narrowed or inspected with a bounded command.",
+        "Read text from a file or editor buffer inside the ACP session workspace. Relative paths resolve against the session working directory; absolute paths and symlink targets must resolve inside the workspace or the read is rejected. Use offset (1-based) and limit (default 2000, maximum 5000) to page. Local scans are byte-bounded, so total lines can be unknown and an incomplete line must be narrowed or inspected with a bounded command.",
       parameters: {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "Absolute or relative path to the file to read.",
+            description: "Absolute or relative path to a file inside the session workspace.",
           },
           offset: {
             type: "number",

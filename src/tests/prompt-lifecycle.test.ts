@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1559,6 +1559,56 @@ test("restore snapshots assistant text already received before it aborts the dra
   }
 });
 
+for (const writeTextFile of [false, true]) {
+  test(`cancelling a pending editor read settles the prompt before the RPC (${writeTextFile ? "read+write" : "read-only"})`, async () => {
+    const cwd = realpathSync(await mkdtemp(join(tmpdir(), "glm-acp-abort-pending-read-")));
+    await writeFile(join(cwd, "buffer.txt"), "on disk", "utf8");
+    const held = deferred<{ content: string }>();
+    const started = deferred<void>();
+    let readCalls = 0;
+    let modelCalls = 0;
+    const conn = {
+      ...connection(),
+      readTextFile() {
+        readCalls += 1;
+        started.resolve();
+        return held.promise;
+      },
+    };
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "pending-read", name: "read_file", arguments: JSON.stringify({ path: "buffer.txt" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read buffer" }] });
+    try {
+      await withoutNotificationRelease(started.promise);
+      await agent.cancel({ sessionId });
+      assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+      assert.equal(readCalls, 1);
+      assert.equal(modelCalls, 1);
+      assert.equal(conn.permissionRequests.length, 0);
+      assert.ok(!conn.updates.some(update => (update.update as { status?: string }).status === "completed"));
+      const beforeLateSettlement = JSON.stringify(conn.updates);
+      held.resolve({ content: "late cancelled buffer contents" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(JSON.stringify(conn.updates), beforeLateSettlement);
+      assert.ok(!beforeLateSettlement.includes("late cancelled buffer contents"));
+    } finally {
+      await agent.cancel({ sessionId });
+      held.resolve({ content: "teardown" });
+      await withoutNotificationRelease(Promise.allSettled([prompt]));
+      await withoutNotificationRelease(agent.closeSession({ sessionId }));
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
 test("restore suppresses late tool updates while retaining an active tool result in history", async () => {
   const updates: Array<Record<string, unknown>> = [];
   let readStarted!: () => void;
@@ -1701,7 +1751,7 @@ test("close persists an in-flight tool result without late tool updates", async 
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "read-close" &&
-        message.content === "contents before close"
+        message.content === "Error reading file: The operation was aborted"
     ));
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1771,7 +1821,7 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
       (message) => message.role === "tool" && message.tool_call_id === "fork-read"
     );
     assert.ok(assistant);
-    assert.equal(result?.content, "forked contents");
+    assert.equal(result?.content, "Error reading file: The operation was aborted");
     assert.equal(connections, 2);
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1836,7 +1886,7 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "second-read" &&
-        message.content === "second turn contents"
+        message.content === "Error reading file: The operation was aborted"
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {
@@ -1900,7 +1950,7 @@ test("fork checkpoints a settled parent after configuration persists during drai
     assert.equal(persisted?.mode, "bypass_permissions");
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "racing-read" &&
-        message.content === "racing contents"
+        message.content === "Error reading file: The operation was aborted"
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {
