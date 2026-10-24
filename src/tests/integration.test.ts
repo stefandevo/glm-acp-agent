@@ -471,7 +471,7 @@ test("end-to-end: the client receives an available_commands_update after session
     ).availableCommands;
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["deploy"]
+      ["deploy", "usage"]
     );
     assert.equal(commands[0]?.description, "Ship the current branch");
     assert.equal(commands[0]?.input?.hint, "<environment>");

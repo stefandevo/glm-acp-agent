@@ -36,7 +36,7 @@ import type {
   StopReason,
   Usage,
 } from "@agentclientprotocol/sdk";
-import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION as VERSION, RequestError } from "@agentclientprotocol/sdk";
 import {
   GlmClient,
   getAvailableModels,
@@ -71,6 +71,7 @@ import {
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
+import { QuotaClient, formatQuotaUsage } from "../llm/quota-client.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
 import { validateStreamCompletion } from "../llm/stream-state.js";
 import {
@@ -236,6 +237,8 @@ type InternalStopReason = StopReason;
  * Optional dependencies for tests.
  */
 export interface GlmAcpAgentOptions {
+  /** Account quota reader shared by /usage and the _glm/usage extension. */
+  quotaClient?: Pick<QuotaClient, "getUsage">;
   /** Override the GLM client (used in tests). */
   glm?: {
     streamChat: (
@@ -326,6 +329,7 @@ export class GlmAcpAgent implements Agent {
   private readonly processSupervisor = new ProcessSupervisor();
   private readonly toolSchemaTokenCache = new ToolSchemaTokenCache();
   private shuttingDown = false;
+  private readonly quotaClient: Pick<QuotaClient, "getUsage">;
   private shutdownPromise: Promise<void> | null = null;
   private readonly shutdownDrainTimeoutMs: number;
 
@@ -333,6 +337,8 @@ export class GlmAcpAgent implements Agent {
     private connection: AgentSideConnection,
     options: GlmAcpAgentOptions = {}
   ) {
+    // The SDK's connection signal is not initialized until its agent factory returns.
+    this.quotaClient = options.quotaClient ?? new QuotaClient({ signal: () => connection.signal });
     this._glm = options.glm ?? null;
     const candidateMaxTurns = options.maxTurns ?? envMaxTurns() ?? DEFAULT_MAX_TURNS;
     const floored = Math.floor(candidateMaxTurns);
@@ -418,6 +424,9 @@ export class GlmAcpAgent implements Agent {
         },
       ],
       agentCapabilities: {
+        _meta: {
+          "glm-acp-agent/usage": { version: 1, method: "_glm/usage" },
+        },
         loadSession: true,
         mcpCapabilities: {
           http: true,
@@ -451,6 +460,17 @@ export class GlmAcpAgent implements Agent {
     // is first called.
     void params;
     return {};
+  }
+
+  /** Custom account-level quota query; separate from ACP context-window usage. */
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method !== "_glm/usage") throw RequestError.methodNotFound(method);
+    if (!params || typeof params !== "object" || Array.isArray(params) || Object.keys(params).length > 0) {
+      throw RequestError.invalidParams(undefined, "_glm/usage takes an empty object.");
+    }
+    if (this.shuttingDown) throw RequestError.internalError({ details: "Agent is shutting down" });
+    const snapshot = await this.quotaClient.getUsage();
+    return { ...snapshot };
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
@@ -890,6 +910,24 @@ export class GlmAcpAgent implements Agent {
       }
       if (abortController.signal.aborted || !ownsPrompt()) {
         return cancelledResponse();
+      }
+
+      // Reserve /usage before file-backed command expansion and image preprocessing.
+      // This informational command never calls the model or changes model history.
+      const firstText = params.prompt.find(block => block.type === "text" && block.text.trim());
+      if (firstText?.type === "text" && /^\/usage(?:\s|$)/.test(firstText.text.trim())) {
+        const standalone = params.prompt.every(block => block.type === "text") &&
+          params.prompt.map(block => block.type === "text" ? block.text : "").join("\n").trim() === "/usage";
+        const text = standalone
+          ? formatQuotaUsage(await waitForAbort(this.quotaClient.getUsage(), abortController.signal, "Quota lookup cancelled"))
+          : "Usage: /usage (send without arguments or attachments)";
+        if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
+        await promptConnection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+        });
+        if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
+        return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
       }
 
       // Convert ACP content blocks into a GLM user message. Most models receive
@@ -2724,13 +2762,14 @@ function availableModelsWith(currentModelId: string): ModelInfo[] {
 function availableCommandsState(
   commands: ReadonlyArray<SlashCommand>
 ): AvailableCommand[] {
-  return commands.map((command) => ({
+  return [...commands.filter(command => command.name !== "usage").map((command) => ({
     name: command.name,
     description: command.description,
     ...(command.argumentHint !== undefined
       ? { input: { hint: command.argumentHint } }
       : {}),
-  }));
+  })), { name: "usage", description: "Show GLM Coding Plan quota and reset times (no model call)." }]
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**

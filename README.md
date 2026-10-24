@@ -43,6 +43,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
 - **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
+- **Coding Plan quota** – built-in `/usage` reports account allowance and reset times without a model call; clients can query the advertised `_glm/usage` extension
 
 ---
 
@@ -136,7 +137,7 @@ sends an ACP [`available_commands_update`](https://agentclientprotocol.com/proto
 notification. Clients such as Zed and Paseo use it to populate their `/` autocomplete.
 Each notification is a full snapshot that replaces the previous list.
 
-The snapshot is built from the same on-disk layout Claude Code uses, read from the
+The snapshot always includes the built-in `/usage` command. Other commands use the same on-disk layout Claude Code uses, read from the
 session's working directory and from `~/.claude` for user-level definitions:
 
 | Path | Command name |
@@ -156,6 +157,99 @@ that text names an advertised command, the agent injects the definition's body i
 the user message, substituting `$ARGUMENTS` where the file asks for it and otherwise
 appending the typed arguments. Unknown `/foo` is left untouched and reaches the model
 as prose, so typing a slash by accident never fails the turn.
+
+### Coding Plan usage and quota
+
+Send `/usage` by itself to see the account's Coding Plan quota windows, percentage
+used, remaining allowance, and reset times when the provider supplies them. The
+command runs locally in the agent: it makes a quota API request but no model or
+tool calls, and its request and output are not added to model history or saved
+session replay. `/usage` is reserved and takes precedence over a file-backed
+command or skill with that name. Arguments and attachments produce usage guidance.
+
+Quota queries use the existing `Z_AI_API_KEY` / `--setup` credentials and
+`GET /api/monitor/usage/quota/limit`, the endpoint used by
+[Z.AI's official usage plugin](https://github.com/zai-org/zai-coding-plugins/blob/main/plugins/glm-plan-usage/skills/usage-query-skill/scripts/query-usage.mjs).
+The origin follows `ACP_GLM_BASE_URL`: only HTTPS on `api.z.ai`,
+`open.bigmodel.cn`, and `dev.bigmodel.cn` is supported. Custom proxies, custom
+ports, and redirects are rejected for quota lookup; no key is sent to them.
+This does not change model endpoint configuration.
+
+Results are cached in memory for 60 seconds and concurrent lookups share one
+request per account. Failed attempts are also cached for 60 seconds. A refresh
+has a 10-second deadline and a 256 KiB response cap. A transient failure retains
+the previous values with an explicit stale notice and their last successful
+timestamp. Authentication failures clear previous values; changing credentials or
+origin invalidates the cache. Cancelling `/usage` stops waiting immediately; a
+shared request can finish and populate the cache for another caller. Disconnecting
+the ACP transport aborts the request.
+
+The reader accepts both `CREDIT_LIMIT` and legacy `TOKENS_LIMIT` entries, plus
+`TIME_LIMIT` MCP allowances. It uses returned percentages and counts, deriving
+percentages or remaining counts only when the necessary totals are present.
+Unknown quota types are ignored; missing or unrecognized data is reported as
+unavailable rather than zero. No fixed plan allowances are assumed. Duration
+units known to the reader are hours, days, and weeks; other units retain an
+unspecified duration. The monitoring endpoint is not a versioned public quota
+contract, so provider changes or account restrictions may make quota unavailable.
+
+### ACP quota extension (version 1)
+
+Initialization advertises this custom capability in `agentCapabilities._meta`:
+
+```json
+{
+  "glm-acp-agent/usage": { "version": 1, "method": "_glm/usage" }
+}
+```
+
+Clients can then send an account-level request, without creating a session:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "_glm/usage", "params": {} }
+```
+
+The response's `result` has this shape (illustrative values):
+
+```json
+{
+  "version": 1,
+  "checkedAt": "2026-10-24T12:00:00.000Z",
+  "stale": false,
+  "windows": [{
+    "id": "credit_limit-3-5",
+    "label": "5-hour Model quota",
+    "kind": "session",
+    "windowDurationMins": 300,
+    "usedPercent": 25,
+    "used": 500,
+    "limit": 2000,
+    "remaining": 1500,
+    "unit": "credits",
+    "resetsAt": "2026-10-24T17:00:00.000Z"
+  }]
+}
+```
+
+`kind` is `session`, `weekly`, `monthly`, or `other`. `usedPercent` is bounded to
+0–100. Duration, counts, count unit (`credits` or `calls`), and reset timestamp
+are optional; legacy counts intentionally have no asserted unit. `checkedAt`
+and `resetsAt` are UTC ISO timestamps. Window IDs identify the provider's quota
+type and duration; clients should replace the window list on each response.
+
+Unavailable results include `unavailable: { "reason": "…", "message": "…" }`.
+Reasons are `missingCredentials`, `unsupportedEndpoint`, `authenticationFailed`,
+`requestFailed`, and `invalidResponse`. With cached data, `stale` is true and
+`checkedAt` remains the time of the last successful read; otherwise `windows` is
+empty, `stale` is false, and `checkedAt` is the attempt time. Provider bodies,
+keys, and raw network errors are never returned. Nonempty or invalid parameters
+produce JSON-RPC `-32602`; unknown methods produce `-32601`.
+
+This extension describes account quota, not the model's context window or
+per-prompt token usage. It does not emit ACP `usage_update`. Clients such as T3
+Code must explicitly implement the extension to populate native plan-limit bars;
+the built-in `/usage` command works without that integration. There is no quota
+request during initialization or ordinary model prompts, and no background poller.
 
 ---
 
@@ -505,6 +599,7 @@ The test suite covers:
 - Prompt loop streaming, tool-call assembly, max-turn cap, cancellation, stop-reason mapping (`stop` → `end_turn`, `length` → `max_tokens`, `content_filter` → `refusal`, `tool_calls` exhausted → `max_turn_requests`)
 - Content-block conversion (`text`, `resource_link`, embedded `resource`)
 - Token usage reporting on the `PromptResponse`
+- Coding Plan quota parsing, cache and stale behavior, bounded failures, `/usage` cancellation, and extension requests over the real ACP transport
 - Tool call lifecycle (`pending` → `in_progress` → `completed` / `failed`)
 - Agent-owned local file and shell tools that work without ACP `fs` / `terminal` client capabilities
 - Permission flows for `write_file` and `run_command` (allow / reject / cancel)
