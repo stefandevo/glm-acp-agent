@@ -2268,6 +2268,18 @@ export class GlmAcpAgent implements Agent {
       }
 
       commitTurnUsage();
+      if (turnUsage && ownsPrompt()) {
+        // Context now held for the next request: its prompt plus the reply just generated.
+        // Unlike the summed `usage` on the prompt response, this does not re-count history.
+        await promptConnection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: turnUsage.inputTokens + turnUsage.outputTokens,
+            size: getContextWindow(session.model),
+          },
+        });
+      }
 
       // Provider continuity is independent of the client's thought display.
       // Never replay reasoning from a cancelled or truncated response as a

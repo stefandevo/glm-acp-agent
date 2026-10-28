@@ -2171,6 +2171,55 @@ test("aggregates usage across model calls and counts one usage object per respon
   });
 });
 
+test("reports context usage after each model request, not the summed turn total", async () => {
+  const conn = createConnectionStub();
+  let callIndex = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      callIndex++;
+      if (callIndex === 1) {
+        yield { usage: { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 } };
+        yield { toolCall: { id: "tc-ctx", name: "list_files", arguments: JSON.stringify({ path: "." }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      } else {
+        yield { usage: { inputTokens: 1200, outputTokens: 30, totalTokens: 1230 } };
+        yield { text: "done" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+
+  const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "list" }] });
+
+  assert.equal(result.usage?.inputTokens, 2200);
+  const usageUpdates = conn.updates
+    .map((entry) => entry["update"] as { sessionUpdate: string; used?: number; size?: number })
+    .filter((update) => update.sessionUpdate === "usage_update");
+  assert.deepEqual(usageUpdates, [
+    { sessionUpdate: "usage_update", used: 1050, size: 128_000 },
+    { sessionUpdate: "usage_update", used: 1230, size: 128_000 },
+  ]);
+});
+
+test("does not report context usage when the provider returns none", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  assert.equal(
+    conn.updates.some((entry) => (entry["update"] as { sessionUpdate: string }).sessionUpdate === "usage_update"),
+    false
+  );
+});
+
 test("cancelled multi-tool turns persist the full assistant call list and completed results", async () => {
   const { store, cleanup } = makeTempStore();
   const dir = makeTempCwd({ "one.txt": "one", "two.txt": "two" });

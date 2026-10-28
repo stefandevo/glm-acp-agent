@@ -42,7 +42,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Configurable permissions** – `write_file`, `run_command`, `web_reader`, and non-local `image_analysis` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
-- **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
+- **Token usage reporting** – aggregated usage is returned on the `session/prompt` response; after each model request the agent also sends a `usage_update` (`used` = that request's prompt + completion tokens, `size` = the model's context window) so clients can show how full the context is
 - **Coding Plan quota** – built-in `/usage` reports account allowance and reset times without a model call; clients can query the advertised `_glm/usage` extension
 
 ---
