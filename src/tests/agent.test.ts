@@ -2205,6 +2205,32 @@ test("reports context usage after each model request, not the summed turn total"
   ]);
 });
 
+test("cancelling during the usage_update keeps the streamed reply and response usage", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([
+    [
+      { text: "partial answer" },
+      { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+      { done: true, stopReason: "stop" },
+    ],
+  ]);
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const deliver = conn.sessionUpdate.bind(conn);
+  conn.sessionUpdate = async (params) => {
+    await deliver(params);
+    if ((params["update"] as { sessionUpdate: string }).sessionUpdate === "usage_update") {
+      await agent.cancel({ sessionId });
+    }
+  };
+
+  const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  assert.equal(result.stopReason, "cancelled");
+  assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+});
+
 test("does not report context usage when the provider returns none", async () => {
   const conn = createConnectionStub();
   const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
