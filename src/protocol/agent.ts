@@ -2268,9 +2268,10 @@ export class GlmAcpAgent implements Agent {
       }
 
       commitTurnUsage();
-      if (turnUsage && ownsPrompt() && !signal.aborted) {
+      if (turnUsage && turnUsage.inputTokens > 0 && ownsPrompt() && !signal.aborted) {
         // Context now held for the next request: its prompt plus the reply just generated.
         // Unlike the summed `usage` on the prompt response, this does not re-count history.
+        // Skipped without a prompt count (partial usage), which would under-report `used`.
         // Best-effort: a cancel during delivery must not skip recording the streamed reply.
         await safeSessionUpdate(promptConnection, {
           sessionId,

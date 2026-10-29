@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
-import type { GlmStreamChunk } from "../llm/glm-client.js";
+import { getContextWindow, type GlmStreamChunk } from "../llm/glm-client.js";
 import { SessionStore, SESSION_SCHEMA_VERSION } from "../protocol/session-store.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
@@ -2200,35 +2200,63 @@ test("reports context usage after each model request, not the summed turn total"
     .map((entry) => entry["update"] as { sessionUpdate: string; used?: number; size?: number })
     .filter((update) => update.sessionUpdate === "usage_update");
   assert.deepEqual(usageUpdates, [
-    { sessionUpdate: "usage_update", used: 1050, size: 128_000 },
-    { sessionUpdate: "usage_update", used: 1230, size: 128_000 },
+    { sessionUpdate: "usage_update", used: 1050, size: getContextWindow("glm-5-turbo") },
+    { sessionUpdate: "usage_update", used: 1230, size: getContextWindow("glm-5-turbo") },
   ]);
 });
 
 test("cancelling during the usage_update keeps the streamed reply and response usage", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const glm = makeStreamingGlm([
+      [
+        { text: "partial answer" },
+        { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+        { done: true, stopReason: "stop" },
+      ],
+    ]);
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    const deliver = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async (params) => {
+      await deliver(params);
+      if ((params["update"] as { sessionUpdate: string }).sessionUpdate === "usage_update") {
+        await agent.cancel({ sessionId });
+      }
+    };
+
+    const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.equal(result.stopReason, "cancelled");
+    assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+    const assistant = store.load(sessionId)?.messages.find((message) => message.role === "assistant");
+    assert.equal(assistant?.content, "partial answer");
+  } finally {
+    cleanup();
+  }
+});
+
+test("does not report context usage when the provider omits the prompt token count", async () => {
   const conn = createConnectionStub();
   const glm = makeStreamingGlm([
     [
-      { text: "partial answer" },
-      { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+      { text: "ok" },
+      { usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 } },
       { done: true, stopReason: "stop" },
     ],
   ]);
   const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-  const deliver = conn.sessionUpdate.bind(conn);
-  conn.sessionUpdate = async (params) => {
-    await deliver(params);
-    if ((params["update"] as { sessionUpdate: string }).sessionUpdate === "usage_update") {
-      await agent.cancel({ sessionId });
-    }
-  };
 
-  const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
 
-  assert.equal(result.stopReason, "cancelled");
-  assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+  assert.equal(
+    conn.updates.some((entry) => (entry["update"] as { sessionUpdate: string }).sessionUpdate === "usage_update"),
+    false
+  );
 });
 
 test("does not report context usage when the provider returns none", async () => {
