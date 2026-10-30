@@ -1543,9 +1543,10 @@ export class ToolExecutor {
     format: (message: string) => string,
   ): Promise<ToolResult> {
     const message = err instanceof Error ? err.message : String(err);
-    // A real tool error that lands after cancel is a known outcome. Only the
-    // abort error itself means the operation was killed in flight.
-    if (this.signal?.aborted && message === ABORTED_MESSAGE) {
+    // Fetch and MCP abort with "This operation was aborted" or AbortError, not
+    // only Node's "The operation was aborted". Any failure while the turn is
+    // already aborted is the same unknown in-flight outcome.
+    if (this.signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
       try {
         await this.markFailed(toolCallId, "Cancelled by turn.");
       } catch (cause) {

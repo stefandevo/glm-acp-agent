@@ -412,14 +412,16 @@ for (const outcome of ["completed", "failed"] as const) {
       assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
       const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string; rawOutput?: unknown })
         .filter(update => update.toolCallId === "write-admitted");
-      assert.deepEqual(cards.map(card => card.status), ["pending", "in_progress", outcome]);
+      assert.deepEqual(cards.map(card => card.status), ["pending", "in_progress", outcome === "completed" ? "completed" : "failed"]);
       assert.deepEqual(cards[2].rawOutput, outcome === "completed"
-        ? { success: true } : { error: "editor refused the admitted write" });
+        ? { success: true } : { error: "Cancelled by turn." });
       const messages = new SessionStore(storeRoot).load(sessionId)?.messages;
       const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-admitted");
       assert.equal(result?.content, outcome === "completed"
-        ? "File written successfully: written.txt" : "Error writing file: editor refused the admitted write",
-      "the known editor outcome must be durable before close");
+        ? "File written successfully: written.txt" : INTERRUPTED_TOOL_RESULT,
+      outcome === "completed"
+        ? "a write that finishes after cancel keeps its known result"
+        : "an error thrown after the turn aborted is an interrupted outcome");
       const skipped = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-stale");
       assert.equal(skipped, undefined, "a call that never started is omitted");
       const batch = messages?.find(message => message.role === "assistant" && message.tool_calls?.length);

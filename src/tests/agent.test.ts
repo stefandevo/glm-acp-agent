@@ -2750,6 +2750,65 @@ test("cancel during run_command keeps partial output and an interrupted marker",
   }
 });
 
+test("aborted web_search is interrupted instead of an ordinary fetch error", async () => {
+  const previousKey = process.env["Z_AI_API_KEY"];
+  process.env["Z_AI_API_KEY"] = "test-key";
+  const originalFetch = globalThis.fetch;
+  let markFetch!: () => void;
+  const fetchStarted = new Promise<void>((resolve) => { markFetch = resolve; });
+  globalThis.fetch = ((_input: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+    markFetch();
+    const fail = () => {
+      const err = new Error("This operation was aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    const signal = init?.signal;
+    if (!signal || signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
+  })) as typeof fetch;
+  const conn = createConnectionStub();
+  const dir = makeTempCwd();
+  const { store, cleanup } = makeTempStore();
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield {
+        toolCall: {
+          id: "search-1",
+          name: "web_search",
+          arguments: JSON.stringify({ query: "glm coding plan" }),
+        },
+      };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "search" }] });
+  try {
+    await fetchStarted;
+    await agent.cancel({ sessionId });
+    assert.equal((await prompt).stopReason, "cancelled");
+    const messages = (store.load(sessionId)?.messages ?? []) as ToolHistoryMessage[];
+    assertPairedToolHistory(messages);
+    const result = messages.find((message) => message.tool_call_id === "search-1");
+    assert.equal(result?.content, INTERRUPTED_TOOL_RESULT);
+    assert.doesNotMatch(String(result?.content), /This operation was aborted|Error performing web search/);
+    const cards = conn.updates
+      .map((entry) => entry.update as { toolCallId?: string; status?: string })
+      .filter((update) => update.toolCallId === "search-1");
+    assert.equal(cards.at(-1)?.status, "failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = previousKey;
+    await Promise.allSettled([prompt]);
+    dir.cleanup();
+    cleanup();
+  }
+});
+
 test("prompt converts resource_link and embedded resource blocks", async () => {
   const conn = createConnectionStub();
   let captured = "";
