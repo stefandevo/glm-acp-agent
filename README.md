@@ -42,7 +42,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Configurable permissions** – `write_file`, `run_command`, `web_reader`, and non-local `image_analysis` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
-- **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
+- **Token usage reporting** – aggregated usage is returned on the `session/prompt` response; after each model request the agent also sends a `usage_update` (`used` = that request's prompt + completion tokens, `size` = the model's context window) so clients can show how full the context is
 - **Coding Plan quota** – built-in `/usage` reports account allowance and reset times without a model call; clients can query the advertised `_glm/usage` extension
 
 ---
@@ -349,6 +349,8 @@ The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 
 Only models the Coding Plan endpoint serves **under their own name** are advertised. Several ids that used to be listed are now aliases: a request for `glm-5.2` or `glm-5.1` comes back with `"model": "glm-5.3"`, and `glm-4.5-air` comes back as `glm-4.7`. They still work, but advertising them would report a model you are not actually talking to. Z.AI's Coding Plan overview currently also claims `glm-5-turbo` and `glm-4.7` requests are routed to GLM-5.3-Flash; that has not been confirmed by a live probe here, so both ids stay in the picker. `glm-5v-turbo` is no longer on the Coding Plan allowlist — selecting it fails with business code `1311` ("subscription plan does not yet include access").
 
+The `usage_update` context size comes from a built-in per-model table; ids outside it (for example custom `ACP_GLM_AVAILABLE_MODELS` entries) report a 128K window, so the size can be wrong for them.
+
 `ACP_GLM_AVAILABLE_MODELS` lets you advertise any id you like, including the ones above. Custom ids sit outside the supported Coding Plan list — the endpoint rejects any model code Z.AI hasn't whitelisted (business code `1211`). The native-vision path is unchanged, so if your plan does include `glm-5v-turbo`, add it back with `ACP_GLM_AVAILABLE_MODELS` and image blocks still reach it as native `image_url` content parts.
 
 Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. `glm-5.3-flash` is the built-in native-vision Coding Plan model (`image_url` content parts). Default `glm-5.3`, `glm-5-turbo`, and `glm-4.7` still use the [Vision MCP](#vision-mcp) path. `glm-5v-turbo`, when re-added via the override above, keeps native `image_url` handling as an opt-in exception.
@@ -599,6 +601,7 @@ The test suite covers:
 - Prompt loop streaming, tool-call assembly, max-turn cap, cancellation, stop-reason mapping (`stop` → `end_turn`, `length` → `max_tokens`, `content_filter` → `refusal`, `tool_calls` exhausted → `max_turn_requests`)
 - Content-block conversion (`text`, `resource_link`, embedded `resource`)
 - Token usage reporting on the `PromptResponse`
+- Per-request `usage_update` context usage, including skipped updates and cancellation during delivery
 - Coding Plan quota parsing, cache and stale behavior, bounded failures, `/usage` cancellation, and extension requests over the real ACP transport
 - Tool call lifecycle (`pending` → `in_progress` → `completed` / `failed`)
 - Agent-owned local file and shell tools that work without ACP `fs` / `terminal` client capabilities
