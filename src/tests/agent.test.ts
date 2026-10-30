@@ -1054,9 +1054,8 @@ test("shutdown persists partial streamed assistant text without late UI updates"
         _messages: ReadonlyArray<{ role: string }>,
         signal?: AbortSignal,
       ): AsyncGenerator<GlmStreamChunk> {
-        // Record a tool call before the partial text so the shutdown checkpoint
-        // must include both the assistant call and its synthetic cancellation
-        // result, keeping the next resumed turn protocol-valid.
+        // A tool call yielded before shutdown is still streaming. The checkpoint
+        // keeps the text and drops the unexecuted tool call.
         yield {
           toolCall: {
             id: "shutdown-tool",
@@ -1094,27 +1093,19 @@ test("shutdown persists partial streamed assistant text without late UI updates"
     assert.ok(persisted, "shutdown must checkpoint the in-flight session");
     assert.deepEqual(
       persisted?.messages.map((message) => message.role),
-      ["system", "user", "assistant", "tool"],
-      "the partial turn and cancelled tool call must remain valid history",
+      ["system", "user", "assistant"],
+      "a tool call that never started must not be persisted",
     );
     const persistedAssistant = persisted?.messages[2];
     assert.equal(persistedAssistant?.content, "partial answer", "shutdown must preserve text received before the abort");
-    assert.deepEqual(
-      (persistedAssistant as { tool_calls?: Array<{ id: string }> } | undefined)?.tool_calls?.map(
-        (toolCall) => toolCall.id,
-      ),
-      ["shutdown-tool"],
-      "the assistant tool call must be retained with the partial text",
+    assert.equal(
+      (persistedAssistant as { tool_calls?: unknown } | undefined)?.tool_calls,
+      undefined,
+      "cancel during streaming must not persist tool_calls",
     );
     assert.equal(
-      (persisted?.messages[3] as { tool_call_id?: string } | undefined)?.tool_call_id,
-      "shutdown-tool",
-      "the interrupted tool call needs a matching synthetic result",
-    );
-    assert.match(
-      String(persisted?.messages[3]?.content),
-      /cancel/i,
-      "the interrupted tool call must be resumable",
+      persisted?.messages.some((message) => message.role === "tool"),
+      false,
     );
     assert.equal(
       conn.updates.some((update) =>
@@ -2042,6 +2033,49 @@ test("prompt loop returns max_turn_requests after exhausting tool turns", async 
   assert.equal(notice, true);
 });
 
+test("turn cap executes every last-turn tool call and saves real results", async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd({ "a.txt": "alpha", "b.txt": "beta" });
+  const { store, cleanup } = makeTempStore();
+  try {
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        for (const id of ["list-1", "list-2", "list-3", "list-4", "list-5"]) {
+          yield { toolCall: { id, name: "list_files", arguments: JSON.stringify({ path: "." }) } };
+        }
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, maxTurns: 1, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+    const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "list them" }] });
+    assert.equal(result.stopReason, "max_turn_requests");
+    const notice = conn.updates.some((update) =>
+      (update.update as { content?: { text?: string } } | undefined)?.content?.text?.includes(
+        "the last turn's tool results were saved"
+      )
+    );
+    assert.equal(notice, true);
+    const messages = store.load(sessionId)?.messages ?? [];
+    const assistant = messages.find((message) => message.role === "assistant" && message.tool_calls?.length);
+    assert.deepEqual(assistant?.role === "assistant" ? assistant.tool_calls?.map((call) => call.id) : undefined, [
+      "list-1", "list-2", "list-3", "list-4", "list-5",
+    ]);
+    const tools = messages.filter((message) => message.role === "tool");
+    assert.deepEqual(tools.map((message) => message.role === "tool" ? message.tool_call_id : ""), [
+      "list-1", "list-2", "list-3", "list-4", "list-5",
+    ]);
+    for (const tool of tools) {
+      assert.match(String(tool.content), /a\.txt/);
+      assert.doesNotMatch(String(tool.content), /cancelled before execution|Interrupted:/);
+    }
+  } finally {
+    dir.cleanup();
+    cleanup();
+  }
+});
+
 test("prompt cancellation returns cancelled stop reason", async () => {
   const conn = createConnectionStub();
   // Latches that make the cancel point deterministic: the test waits until
@@ -2274,7 +2308,7 @@ test("does not report context usage when the provider returns none", async () =>
   );
 });
 
-test("cancelled multi-tool turns persist the full assistant call list and completed results", async () => {
+test("cancelled multi-tool turns omit calls that never started", async () => {
   const { store, cleanup } = makeTempStore();
   const dir = makeTempCwd({ "one.txt": "one", "two.txt": "two" });
   try {
@@ -2327,44 +2361,279 @@ test("cancelled multi-tool turns persist the full assistant call list and comple
 
     const persisted = store.load(sessionId);
     assert.ok(persisted, "cancelled prompts must still persist their history");
-    const persistedAssistant = persisted?.messages.find((message) => {
-      if (message.role !== "assistant") return false;
-      return (message as { tool_calls?: Array<{ id: string }> }).tool_calls?.length === 2;
-    });
-    assert.deepEqual(
-      (persistedAssistant as { tool_calls?: Array<{ id: string }> } | undefined)?.tool_calls?.map(
-        (toolCall) => toolCall.id
-      ),
-      ["a", "b"]
-    );
-    const persistedTools = persisted?.messages.filter((message) => message.role === "tool") ?? [];
-    assert.deepEqual(
-      persistedTools.map((message) => (message as { tool_call_id?: string }).tool_call_id),
-      ["a", "b"]
-    );
-    assert.match(
-      String(persistedTools[1]?.content),
-      /cancel/i,
-      "the pending call needs a synthetic result so the next request is valid"
+    assert.equal(
+      persisted?.messages.some((message) => message.role === "tool" || (message.role === "assistant" && message.tool_calls?.length)),
+      false,
+      "calls cancelled before execution are omitted instead of stored as placeholders",
     );
 
     await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
-    assert.deepEqual(
-      followUpMessages.slice(-4).map((message) => message.role),
-      ["assistant", "tool", "tool", "user"]
+    assert.equal(
+      followUpMessages.some((message) => message.role === "tool" || message.tool_calls?.length),
+      false,
+      "the next request must not replay unstarted tool calls",
     );
     assert.deepEqual(
-      followUpMessages[followUpMessages.length - 4]?.tool_calls?.map((toolCall) => toolCall.id),
-      ["a", "b"]
-    );
-    assert.deepEqual(
-      followUpMessages
-        .slice(-4, -1)
-        .filter((message) => message.role === "tool")
-        .map((message) => message.tool_call_id),
-      ["a", "b"]
+      followUpMessages.filter((message) => message.role === "user").map((message) => message.content),
+      ["list", "continue"],
     );
   } finally {
+    dir.cleanup();
+    cleanup();
+  }
+});
+
+const INTERRUPTED_TOOL_RESULT =
+  "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.";
+
+type ToolHistoryMessage = {
+  role: string;
+  content?: unknown;
+  tool_call_id?: string;
+  reasoning_content?: string;
+  tool_calls?: Array<{ id: string }>;
+};
+
+function assertPairedToolHistory(messages: readonly ToolHistoryMessage[]): void {
+  let pending: string[] | null = null;
+  for (const message of messages) {
+    if (pending) {
+      assert.equal(message.role, "tool");
+      assert.equal(message.tool_call_id, pending.shift());
+      if (pending.length === 0) pending = null;
+      continue;
+    }
+    assert.notEqual(message.role, "tool");
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      pending = message.tool_calls.map((call) => call.id);
+    }
+  }
+  assert.equal(pending, null);
+}
+
+for (const via of ["cancel", "prompt", "connection"] as const) {
+  test(`abort via ${via} inside the 2nd of 5 calls keeps only the calls that started`, async () => {
+    const conn = createConnectionStub();
+    const connectionAbort = new AbortController();
+    (conn as ConnectionStub & { signal: AbortSignal }).signal = connectionAbort.signal;
+    const dir = makeTempCwd();
+    const { store, cleanup } = makeTempStore();
+    let releaseRead = (): void => {};
+    const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let markSecondRead!: () => void;
+    const secondReadStarted = new Promise<void>((resolve) => { markSecondRead = resolve; });
+    let reads = 0;
+    conn.readTextFile = async ({ path }) => {
+      reads += 1;
+      if (reads === 2) {
+        markSecondRead();
+        await readHeld;
+      }
+      return { content: `alpha-${path}` };
+    };
+    let followUp: ToolHistoryMessage[] | undefined;
+    const glm = {
+      async *streamChat(messages: ToolHistoryMessage[]): AsyncGenerator<GlmStreamChunk> {
+        if (messages.some((message) => message.role === "tool")) {
+          followUp = structuredClone(messages);
+          yield { text: "continued" };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        yield { thinking: "read all five" };
+        for (let index = 1; index <= 5; index += 1) {
+          yield {
+            toolCall: {
+              id: `call-${index}`,
+              name: "read_file",
+              arguments: JSON.stringify({ path: `f${index}.txt` }),
+            },
+          };
+        }
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: true } },
+    });
+    const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read five" }] });
+    let second: Promise<{ stopReason: string }> | undefined;
+    try {
+      await secondReadStarted;
+      if (via === "cancel") await agent.cancel({ sessionId });
+      if (via === "connection") connectionAbort.abort();
+      if (via === "prompt") {
+        second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+      }
+      assert.equal((await first).stopReason, "cancelled");
+      const messages = (store.load(sessionId)?.messages ?? []) as ToolHistoryMessage[];
+      assertPairedToolHistory(messages);
+      const assistant = messages.find((message) => message.role === "assistant" && message.tool_calls?.length);
+      assert.deepEqual(assistant?.tool_calls?.map((call) => call.id), ["call-1", "call-2"]);
+      assert.equal(assistant?.reasoning_content, undefined);
+      const tools = messages.filter((message) => message.role === "tool");
+      assert.deepEqual(tools.map((message) => message.tool_call_id), ["call-1", "call-2"]);
+      assert.match(String(tools[0]?.content), /alpha-.*f1\.txt/);
+      assert.equal(tools[1]?.content, INTERRUPTED_TOOL_RESULT);
+      assert.equal(messages.some((message) => String(message.content).includes("cancelled before execution")), false);
+      assert.equal(messages.some((message) => message.tool_call_id === "call-3"), false);
+      if (second) {
+        assert.equal((await second).stopReason, "end_turn");
+        assert.ok(followUp);
+        assertPairedToolHistory(followUp!);
+        const replayed = followUp!.find((message) => message.role === "assistant" && message.tool_calls?.length);
+        assert.deepEqual(replayed?.tool_calls?.map((call) => call.id), ["call-1", "call-2"]);
+        assert.equal(
+          followUp!.find((message) => message.tool_call_id === "call-2")?.content,
+          INTERRUPTED_TOOL_RESULT,
+        );
+      }
+    } finally {
+      releaseRead();
+      await Promise.allSettled([first, second]);
+      dir.cleanup();
+      cleanup();
+    }
+  });
+}
+
+test("session/load replays a trimmed cancelled batch and the next request stays paired", async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd();
+  const { store, cleanup } = makeTempStore();
+  let releaseRead = (): void => {};
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  let markSecondRead!: () => void;
+  const secondReadStarted = new Promise<void>((resolve) => { markSecondRead = resolve; });
+  let reads = 0;
+  conn.readTextFile = async ({ path }) => {
+    reads += 1;
+    if (reads === 2) {
+      markSecondRead();
+      await readHeld;
+    }
+    return { content: `alpha-${path}` };
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "partial note", thinking: "why these files" };
+      for (let index = 1; index <= 5; index += 1) {
+        yield {
+          toolCall: {
+            id: `call-${index}`,
+            name: "read_file",
+            arguments: JSON.stringify({ path: `f${index}.txt` }),
+          },
+        };
+      }
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({
+    protocolVersion: PROTOCOL_VERSION,
+    clientCapabilities: { fs: { readTextFile: true } },
+  });
+  const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+  const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read five" }] });
+  try {
+    await secondReadStarted;
+    await agent.cancel({ sessionId });
+    assert.equal((await first).stopReason, "cancelled");
+    await agent.closeSession({ sessionId });
+
+    let followUp: ToolHistoryMessage[] | undefined;
+    const replayed: string[] = [];
+    const loadedConn = createConnectionStub();
+    loadedConn.sessionUpdate = async (params) => {
+      loadedConn.updates.push(params);
+      const update = params.update as { sessionUpdate?: string; content?: { text?: string } };
+      if (update.sessionUpdate === "user_message_chunk" || update.sessionUpdate === "agent_message_chunk") {
+        replayed.push(update.content?.text ?? "");
+      }
+    };
+    const loaded = new GlmAcpAgent(loadedConn as never, {
+      sessionStore: store,
+      glm: {
+        async *streamChat(messages: ToolHistoryMessage[]): AsyncGenerator<GlmStreamChunk> {
+          followUp = structuredClone(messages);
+          yield { text: "continued" };
+          yield { done: true, stopReason: "stop" };
+        },
+      },
+    });
+    await loaded.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: true } },
+    });
+    await loaded.loadSession({ sessionId, cwd: dir.cwd, mcpServers: [] });
+    assert.ok(replayed.some((text) => text.includes("read five")));
+    assert.ok(replayed.some((text) => text.includes("partial note")));
+    assert.equal((await loaded.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "continue" }],
+    })).stopReason, "end_turn");
+    assert.ok(followUp);
+    assertPairedToolHistory(followUp!);
+    const assistant = followUp!.find((message) => message.role === "assistant" && message.tool_calls?.length);
+    assert.deepEqual(assistant?.tool_calls?.map((call) => call.id), ["call-1", "call-2"]);
+    assert.equal(assistant?.content, "partial note");
+    assert.equal(assistant?.reasoning_content, undefined);
+    assert.equal(followUp!.find((message) => message.tool_call_id === "call-2")?.content, INTERRUPTED_TOOL_RESULT);
+    assert.equal(followUp!.some((message) => message.tool_call_id === "call-5"), false);
+    await loaded.closeSession({ sessionId });
+  } finally {
+    releaseRead();
+    await Promise.allSettled([first]);
+    dir.cleanup();
+    cleanup();
+  }
+});
+
+test("cancel during streaming persists assistant text and no tool calls", async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd();
+  const { store, cleanup } = makeTempStore();
+  let releaseStream = (): void => {};
+  const streamHeld = new Promise<void>((resolve) => { releaseStream = resolve; });
+  let markText!: () => void;
+  const textSeen = new Promise<void>((resolve) => { markText = resolve; });
+  const glm = {
+    async *streamChat(_messages: unknown, signal?: AbortSignal): AsyncGenerator<GlmStreamChunk> {
+      yield { thinking: "unfinished plan" };
+      yield { text: "kept while streaming" };
+      yield { toolCall: { id: "streamed-call", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+      markText();
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await streamHeld;
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+  try {
+    await textSeen;
+    await agent.cancel({ sessionId });
+    releaseStream();
+    assert.equal((await prompt).stopReason, "cancelled");
+    const messages = (store.load(sessionId)?.messages ?? []) as ToolHistoryMessage[];
+    assertPairedToolHistory(messages);
+    const assistant = messages.find((message) => message.role === "assistant");
+    assert.equal(assistant?.content, "kept while streaming");
+    assert.equal(assistant?.tool_calls, undefined);
+    assert.equal(assistant?.reasoning_content, undefined);
+    assert.equal(messages.some((message) => message.role === "tool"), false);
+  } finally {
+    releaseStream();
+    await Promise.allSettled([prompt]);
     dir.cleanup();
     cleanup();
   }

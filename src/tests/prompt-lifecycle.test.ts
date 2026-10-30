@@ -274,14 +274,20 @@ for (const status of ["pending", "in_progress", "completed", "failed"] as const)
       assert.equal(existsSync(join(cwd, "stale.txt")), false, "the next write must not run");
       const history = store.load(sessionId)?.messages;
       const result = history?.find(message => message.role === "tool" && message.tool_call_id === "write-held");
-      assert.ok(result && result.role === "tool");
-      if (status === "completed") {
-        assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "completed side effect");
-        assert.equal(result.content, "File written successfully: written.txt");
-      } else {
+      assert.equal(history?.some(message => message.role === "tool" && message.tool_call_id === "write-stale"), false);
+      if (status === "pending" || status === "in_progress") {
+        assert.equal(result, undefined, "a write cancelled before it starts is omitted");
         assert.equal(existsSync(join(cwd, "written.txt")), false);
+      } else {
+        assert.ok(result && result.role === "tool");
+        if (status === "completed") {
+          assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "completed side effect");
+          assert.equal(result.content, "File written successfully: written.txt");
+        } else {
+          assert.equal(existsSync(join(cwd, "written.txt")), false);
+        }
+        if (status === "failed") assert.match(String(result.content), /tool arguments must be a JSON object/i);
       }
-      if (status === "failed") assert.match(String(result.content), /tool arguments must be a JSON object/i);
       const updateCount = conn.updates.length;
       const permissionCount = conn.permissionRequests.length;
       held.resolve();
@@ -409,7 +415,9 @@ for (const outcome of ["completed", "failed"] as const) {
         ? "File written successfully: written.txt" : "Error writing file: editor refused the admitted write",
       "the known editor outcome must be durable before close");
       const skipped = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-stale");
-      assert.equal(skipped?.content, "Tool call cancelled before execution.");
+      assert.equal(skipped, undefined, "a call that never started is omitted");
+      const batch = messages?.find(message => message.role === "assistant" && message.tool_calls?.length);
+      assert.deepEqual(batch?.role === "assistant" ? batch.tool_calls?.map(call => call.id) : undefined, ["write-admitted"]);
       assert.equal(writes, 1);
       assert.equal(modelCalls, 1);
       assert.equal(conn.permissionRequests.length, 1);
@@ -484,8 +492,13 @@ for (const { toolName, status, args, statuses, permissionCount } of [
       const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string })
         .filter(update => update.toolCallId === "announcement-held");
       assert.deepEqual(cards.map(card => card.status), statuses);
-      const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announcement-held");
-      assert.equal(result?.content, "Tool call cancelled before execution.", "an interrupted announcement must not imply an unknown side effect");
+      const messages = new SessionStore(storeRoot).load(sessionId)?.messages;
+      const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "announcement-held");
+      assert.equal(result, undefined, "an interrupted announcement must not imply an unknown side effect");
+      assert.equal(
+        messages?.some(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "announcement-held")),
+        false,
+      );
       assert.equal(startedOperations, 0);
       assert.equal(existsSync(join(cwd, "written.txt")), false, "cancelled command/write must not mutate the filesystem");
       assert.equal(conn.permissionRequests.length, permissionCount);
@@ -638,8 +651,13 @@ for (const { toolName, transfer } of [
         if (transfer === "fork") forkedSessionId = transferred.sessionId;
       }
       assert.equal(startedOperations, 0, "cancel must not dispatch editor/MCP operations after announcement");
-      const result = store.load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announced");
-      assert.equal(result?.content, "Tool call cancelled before execution.");
+      const messages = store.load(sessionId)?.messages;
+      const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "announced");
+      assert.equal(result, undefined, "a call cancelled before its operation starts is omitted");
+      assert.equal(
+        messages?.some(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "announced")),
+        false,
+      );
     } finally {
       await agent.closeSession({ sessionId });
       if (forkedSessionId) await agent.closeSession({ sessionId: forkedSessionId });
@@ -1751,7 +1769,7 @@ test("close persists an in-flight tool result without late tool updates", async 
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "read-close" &&
-        message.content === "Error reading file: The operation was aborted"
+        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
     ));
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1821,7 +1839,7 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
       (message) => message.role === "tool" && message.tool_call_id === "fork-read"
     );
     assert.ok(assistant);
-    assert.equal(result?.content, "Error reading file: The operation was aborted");
+    assert.equal(result?.content, "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.");
     assert.equal(connections, 2);
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1886,7 +1904,7 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "second-read" &&
-        message.content === "Error reading file: The operation was aborted"
+        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {
@@ -1950,7 +1968,7 @@ test("fork checkpoints a settled parent after configuration persists during drai
     assert.equal(persisted?.mode, "bypass_permissions");
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "racing-read" &&
-        message.content === "Error reading file: The operation was aborted"
+        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {
@@ -2179,8 +2197,12 @@ test("restore completes a streamed tool batch with cancelled tool results", asyn
     await resume;
     await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
     const toolResults = restoredHistory.filter((message) => message.role === "tool");
-    assert.deepEqual(toolResults.map((message) => message.tool_call_id), ["read-1", "read-2"]);
-    assert.ok(toolResults.every((message) => String(message.content).includes("cancelled before execution")));
+    assert.deepEqual(toolResults, []);
+    assert.equal(
+      restoredHistory.some((message) => message.role === "assistant" && Array.isArray((message as { tool_calls?: unknown }).tool_calls)),
+      false,
+      "a tool batch aborted while streaming is not persisted",
+    );
   } finally {
     releaseStream();
     await rm(storeRoot, { recursive: true, force: true });
