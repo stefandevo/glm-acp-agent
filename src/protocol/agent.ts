@@ -53,7 +53,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { ToolExecutor, type TodoItem } from "../tools/executor.js";
+import { ToolExecutor, INTERRUPTED_TOOL_RESULT, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { readLocalTextPrefix } from "../tools/file-reader.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
@@ -291,20 +291,9 @@ export interface GlmAcpAgentOptions {
 // ACP_GLM_MAX_TURNS.
 export const DEFAULT_MAX_TURNS = 100;
 
-/** Executor result for a call whose operation never started. */
-const CANCELLED_BEFORE_EXECUTION = "Tool call cancelled before execution.";
-
-/**
- * History marker for the single call that was already running when the user
- * aborted the turn. Distinct from an I/O failure and from a call that never
- * started.
- */
-const INTERRUPTED_TOOL_RESULT =
-  "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.";
-
-/** Tool error text produced when an in-flight operation observes the turn abort. */
-function isUnknownAbortResult(content: string): boolean {
-  return content.startsWith("Error") && content.includes("The operation was aborted");
+function interruptedToolHistory(partial: string): string {
+  if (partial.length === 0) return INTERRUPTED_TOOL_RESULT;
+  return `${partial}\n\n${INTERRUPTED_TOOL_RESULT}`;
 }
 
 /**
@@ -2362,7 +2351,7 @@ export class GlmAcpAgent implements Agent {
           continue;
         }
 
-        let result: { content: string };
+        let result: { content: string; outcome: ToolExecutionOutcome };
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
         } catch (cause) {
@@ -2373,6 +2362,7 @@ export class GlmAcpAgent implements Agent {
           }
           result = {
             content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+            outcome: "completed",
           };
           // An executor can fail after an operation has started (for example,
           // while publishing a client notification). Do not replay it; give
@@ -2380,24 +2370,23 @@ export class GlmAcpAgent implements Agent {
           // uncertain so the provider history remains structurally valid.
           toolFailure = new Error(result.content, { cause });
         }
-        debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
+        debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} outcome=${result.outcome} contentLength=${result.content.length}`);
 
         if (!keepHistory()) {
           cancellationObserved = true;
           continue;
         }
-        // The executor proved this operation never started. Drop it instead of
-        // storing a placeholder the model can mistake for tool output.
-        if (result.content === CANCELLED_BEFORE_EXECUTION) {
+        // not_started: the executor already published a failed tool card when
+        // the client had seen the call. Omit it from history.
+        if (result.outcome === "not_started") {
           cancellationObserved = true;
           continue;
         }
-        let content = result.content;
-        if ((signal.aborted || !ownsPrompt()) && isUnknownAbortResult(content)) {
-          content = INTERRUPTED_TOOL_RESULT;
-        }
+        const content = result.outcome === "interrupted"
+          ? interruptedToolHistory(result.content)
+          : result.content;
         keepCall(tc, content);
-        if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
+        if (signal.aborted || !ownsPrompt() || result.outcome === "interrupted") cancellationObserved = true;
       }
 
       if (keepHistory()) {

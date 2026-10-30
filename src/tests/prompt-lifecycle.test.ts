@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
+import { INTERRUPTED_TOOL_RESULT } from "../tools/executor.js";
 import { preprocessImageBlocks } from "../protocol/image-preprocessor.js";
 import { SessionStore } from "../protocol/session-store.js";
 import { SessionMcpTools } from "../tools/session-mcp-client.js";
@@ -344,8 +345,13 @@ test("cancelled pending permission publishes a failed card without waiting for i
       .filter(update => update.toolCallId === "permission-held");
     assert.deepEqual(cards.map(card => card.status), ["pending", "failed"]);
     assert.deepEqual(cards[1].rawOutput, { error: "Cancelled by turn." });
-    const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "permission-held");
-    assert.equal(result?.content, "Write cancelled by turn.", "the cancelled result must be durable before close");
+    const messages = new SessionStore(storeRoot).load(sessionId)?.messages;
+    const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "permission-held");
+    assert.equal(result, undefined, "a write aborted during permission never ran");
+    assert.equal(
+      messages?.some(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "permission-held")),
+      false,
+    );
     assert.equal(writes, 0);
     assert.equal(modelCalls, 1);
     const updateCount = conn.updates.length;
@@ -1769,7 +1775,7 @@ test("close persists an in-flight tool result without late tool updates", async 
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "read-close" &&
-        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
+        message.content === INTERRUPTED_TOOL_RESULT
     ));
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1839,7 +1845,7 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
       (message) => message.role === "tool" && message.tool_call_id === "fork-read"
     );
     assert.ok(assistant);
-    assert.equal(result?.content, "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.");
+    assert.equal(result?.content, INTERRUPTED_TOOL_RESULT);
     assert.equal(connections, 2);
     assert.equal(updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
@@ -1904,7 +1910,7 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
     const persisted = store.load(sessionId);
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "second-read" &&
-        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
+        message.content === INTERRUPTED_TOOL_RESULT
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {
@@ -1968,7 +1974,7 @@ test("fork checkpoints a settled parent after configuration persists during drai
     assert.equal(persisted?.mode, "bypass_permissions");
     assert.ok(persisted?.messages.some(
       (message) => message.role === "tool" && message.tool_call_id === "racing-read" &&
-        message.content === "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it."
+        message.content === INTERRUPTED_TOOL_RESULT
     ));
 
     const restarted = new GlmAcpAgent(connection() as never, {

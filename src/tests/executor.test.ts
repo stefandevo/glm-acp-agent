@@ -616,7 +616,8 @@ for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
       controller.abort();
       held.resolve();
       const result = await withinReadDeadline(pending);
-      assert.match(result.content, /The operation was aborted/);
+      assert.equal(result.outcome, "interrupted");
+      assert.equal(result.content, "");
       assert.equal(conn.readTextFileCalls.length, 0);
       const statuses = conn.updates.map(update => (update.update as { status?: string }).status);
       assert.deepEqual(statuses, ["in_progress", "failed"]);
@@ -645,7 +646,8 @@ for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
       const result = await withinReadDeadline(exec.execute("read-abort-page", "read_file", JSON.stringify({
         path: "buffer.txt", offset: 2, limit: 2,
       })));
-      assert.match(result.content, /The operation was aborted/);
+      assert.equal(result.outcome, "interrupted");
+      assert.equal(result.content, "");
       assert.deepEqual(requestedLines, [2]);
       assert.equal(getEventListeners(controller.signal, "abort").length, 0);
       const statuses = conn.updates.map(update => (update.update as { status?: string }).status);
@@ -678,7 +680,8 @@ for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
         await withinReadDeadline(started.promise);
         controller.abort();
         const result = await withinReadDeadline(pending);
-        assert.equal(result.content, "Error reading file: The operation was aborted");
+        assert.equal(result.outcome, "interrupted");
+        assert.equal(result.content, "");
         assert.equal(conn.readTextFileCalls.length, 1, "the already-admitted RPC is not undone");
         assert.equal(getEventListeners(controller.signal, "abort").length, 0);
         const statuses = conn.updates.map(update => (update.update as { status?: string }).status);

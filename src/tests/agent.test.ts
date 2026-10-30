@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
+import { CANCELLED_BEFORE_EXECUTION, INTERRUPTED_TOOL_RESULT } from "../tools/executor.js";
 import { getContextWindow, type GlmStreamChunk } from "../llm/glm-client.js";
 import { SessionStore, SESSION_SCHEMA_VERSION } from "../protocol/session-store.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -2383,9 +2384,6 @@ test("cancelled multi-tool turns omit calls that never started", async () => {
   }
 });
 
-const INTERRUPTED_TOOL_RESULT =
-  "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.";
-
 type ToolHistoryMessage = {
   role: string;
   content?: unknown;
@@ -2478,7 +2476,7 @@ for (const via of ["cancel", "prompt", "connection"] as const) {
       assert.deepEqual(tools.map((message) => message.tool_call_id), ["call-1", "call-2"]);
       assert.match(String(tools[0]?.content), /alpha-.*f1\.txt/);
       assert.equal(tools[1]?.content, INTERRUPTED_TOOL_RESULT);
-      assert.equal(messages.some((message) => String(message.content).includes("cancelled before execution")), false);
+      assert.equal(messages.some((message) => String(message.content).includes(CANCELLED_BEFORE_EXECUTION)), false);
       assert.equal(messages.some((message) => message.tool_call_id === "call-3"), false);
       if (second) {
         assert.equal((await second).stopReason, "end_turn");
@@ -2633,6 +2631,119 @@ test("cancel during streaming persists assistant text and no tool calls", async 
     assert.equal(messages.some((message) => message.role === "tool"), false);
   } finally {
     releaseStream();
+    await Promise.allSettled([prompt]);
+    dir.cleanup();
+    cleanup();
+  }
+});
+
+test("cancel during a permission wait omits the call and fails its card", async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd();
+  const { store, cleanup } = makeTempStore();
+  let releasePermission = (): void => {};
+  const permissionHeld = new Promise<void>((resolve) => { releasePermission = resolve; });
+  let markPermission!: () => void;
+  const permissionStarted = new Promise<void>((resolve) => { markPermission = resolve; });
+  conn.requestPermission = async (params) => {
+    conn.permissionRequests.push(params);
+    markPermission();
+    await permissionHeld;
+    return { outcome: { outcome: "selected", optionId: "allow" } };
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield {
+        toolCall: {
+          id: "write-wait",
+          name: "write_file",
+          arguments: JSON.stringify({ path: "out.txt", content: "should-not-write" }),
+        },
+      };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({
+    protocolVersion: PROTOCOL_VERSION,
+    clientCapabilities: { fs: { writeTextFile: true } },
+  });
+  const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+  try {
+    await permissionStarted;
+    await agent.cancel({ sessionId });
+    assert.equal((await prompt).stopReason, "cancelled");
+    const messages = (store.load(sessionId)?.messages ?? []) as ToolHistoryMessage[];
+    assert.equal(messages.some((message) => message.role === "tool" || message.tool_calls?.length), false);
+    assert.equal(existsSync(pathJoin(dir.cwd, "out.txt")), false);
+    const cards = conn.updates
+      .map((entry) => entry.update as { toolCallId?: string; status?: string })
+      .filter((update) => update.toolCallId === "write-wait");
+    assert.deepEqual(cards.map((card) => card.status), ["pending", "failed"]);
+  } finally {
+    releasePermission();
+    await Promise.allSettled([prompt]);
+    dir.cleanup();
+    cleanup();
+  }
+});
+
+test("cancel during run_command keeps partial output and an interrupted marker", { timeout: 15_000 }, async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd();
+  const { store, cleanup } = makeTempStore();
+  const ready = pathJoin(dir.cwd, "ready.txt");
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield {
+        toolCall: {
+          id: "cmd-1",
+          name: "run_command",
+          arguments: JSON.stringify({
+            command: "printf 'partial-out\\n'; printf x > ready.txt; sleep 60",
+          }),
+        },
+      };
+      yield {
+        toolCall: {
+          id: "cmd-2",
+          name: "read_file",
+          arguments: JSON.stringify({ path: "ready.txt" }),
+        },
+      };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "run" }] });
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(existsSync(ready), true, "the command must be running before cancel");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await agent.cancel({ sessionId });
+    assert.equal((await prompt).stopReason, "cancelled");
+    const messages = (store.load(sessionId)?.messages ?? []) as ToolHistoryMessage[];
+    assertPairedToolHistory(messages);
+    const assistant = messages.find((message) => message.role === "assistant" && message.tool_calls?.length);
+    assert.deepEqual(assistant?.tool_calls?.map((call) => call.id), ["cmd-1"]);
+    const output = String(messages.find((message) => message.tool_call_id === "cmd-1")?.content);
+    assert.match(output, /partial-out/);
+    assert.match(output, /Exit code:/);
+    assert.ok(output.endsWith(INTERRUPTED_TOOL_RESULT));
+    assert.equal(messages.some((message) => message.tool_call_id === "cmd-2"), false);
+    const cards = conn.updates
+      .map((entry) => entry.update as { toolCallId?: string; status?: string })
+      .filter((update) => update.toolCallId === "cmd-1");
+    assert.equal(cards.at(-1)?.status, "failed");
+    assert.equal(cards.some((card) => card.status === "completed"), false);
+  } finally {
+    await agent.cancel({ sessionId }).catch(() => undefined);
     await Promise.allSettled([prompt]);
     dir.cleanup();
     cleanup();
