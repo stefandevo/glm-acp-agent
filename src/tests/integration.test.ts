@@ -323,12 +323,15 @@ test("end-to-end cancellation while permission is pending leaves valid history f
       prompt: [{ type: "text", text: "continue" }],
     });
     assert.equal(continued.stopReason, "end_turn");
-    assert.deepEqual(followUpMessages.slice(-3).map((message) => message.role), [
-      "assistant",
-      "tool",
-      "user",
-    ]);
-    assert.equal(followUpMessages[followUpMessages.length - 2]?.tool_call_id, "write-1");
+    assert.equal(
+      followUpMessages.some((message) => message.role === "tool" || message.tool_calls?.length),
+      false,
+      "a write aborted during permission is omitted from the next request",
+    );
+    assert.deepEqual(
+      followUpMessages.filter((message) => message.role === "user").map((message) => message.content),
+      ["write", "continue"],
+    );
   } finally {
     releasePermission();
     rmSync(cwd, { recursive: true, force: true });

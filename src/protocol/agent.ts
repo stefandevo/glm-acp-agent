@@ -53,7 +53,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { ToolExecutor, type TodoItem } from "../tools/executor.js";
+import { ToolExecutor, INTERRUPTED_TOOL_RESULT, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { readLocalTextPrefix } from "../tools/file-reader.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
@@ -286,8 +286,15 @@ export interface GlmAcpAgentOptions {
  */
 // 20 turns is a handful of tool calls; real editing sessions routinely need
 // more, and hitting the cap mid-task surfaces as Zed's "reached the turn
-// limit — send a message to continue". Still overridable via ACP_GLM_MAX_TURNS.
+// limit — send a message to continue". The cap does not cancel the final
+// turn's tools; their real results are saved. Still overridable via
+// ACP_GLM_MAX_TURNS.
 export const DEFAULT_MAX_TURNS = 100;
+
+function interruptedToolHistory(partial: string): string {
+  if (partial.length === 0) return INTERRUPTED_TOOL_RESULT;
+  return `${partial}\n\n${INTERRUPTED_TOOL_RESULT}`;
+}
 
 /**
  * Resolve the fallback maxTurns from `$ACP_GLM_MAX_TURNS` when the caller did
@@ -2129,14 +2136,6 @@ export class GlmAcpAgent implements Agent {
       }
     };
 
-    const cancelledToolResult = (toolCallId: string): GlmMessage => {
-      return {
-        role: "tool",
-        tool_call_id: toolCallId,
-        content: "Tool call cancelled before execution.",
-      };
-    };
-
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
       const compatibility = checkModelTransition(session.messages, session.model);
@@ -2314,9 +2313,13 @@ export class GlmAcpAgent implements Agent {
         session.messages.push({ role: "assistant", content: assistantText || null, ...reasoning });
       }
 
+      // Abort before any call runs: never persist the assistant tool_calls
+      // message. Text already delivered stays as a plain assistant message.
+      // Reasoning from a cancelled stream is not a completed chain, and
+      // dropping every tool call also drops reasoning_content.
       if (cancelledDuringStream || signal.aborted) {
-        if (assistantToolMessage && (ownsPrompt() || retainDrainedHistory)) {
-          session.messages.push(assistantToolMessage, ...toolCalls.map((tc) => cancelledToolResult(tc.id)));
+        if (assistantToolMessage && (ownsPrompt() || retainDrainedHistory) && assistantText.length > 0) {
+          session.messages.push({ role: "assistant", content: assistantText });
         }
         return { stopReason: "cancelled", usage: totalUsage };
       }
@@ -2327,60 +2330,85 @@ export class GlmAcpAgent implements Agent {
       }
 
       // Execute tool calls in declaration order and feed each result back.
+      // A user abort keeps only calls that started, in their original order.
+      // The same rule applies while load/resume/close is draining this prompt.
       let cancellationObserved = false;
+      const startedCalls: typeof toolCalls = [];
       const toolResults: GlmMessage[] = [];
       let toolFailure: Error | undefined;
+      const keepHistory = (): boolean => ownsPrompt() || preservesDrainingHistory();
+      const keepCall = (tc: (typeof toolCalls)[number], content: string): void => {
+        startedCalls.push(tc);
+        toolResults.push({ role: "tool", tool_call_id: tc.id, content });
+      };
       for (const tc of toolCalls) {
         if (toolFailure) {
-          toolResults.push({ role: "tool", tool_call_id: tc.id,
-            content: "Tool call not started because an earlier tool's outcome is unknown." });
+          keepCall(tc, "Tool call not started because an earlier tool's outcome is unknown.");
           continue;
         }
         if (signal.aborted || !ownsPrompt()) {
-          if (ownsPrompt() || preservesDrainingHistory()) {
-            toolResults.push(cancelledToolResult(tc.id));
-          }
           cancellationObserved = true;
           continue;
         }
 
-        let result: { content: string };
+        let result: { content: string; outcome: ToolExecutionOutcome };
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
         } catch (cause) {
-          result = {
-            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
-          };
           if (signal.aborted || !ownsPrompt()) {
-            if (ownsPrompt() || preservesDrainingHistory()) {
-              toolResults.push({ role: "tool", tool_call_id: tc.id, content: result.content });
-            }
+            if (keepHistory()) keepCall(tc, INTERRUPTED_TOOL_RESULT);
             cancellationObserved = true;
             continue;
           }
+          result = {
+            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+            outcome: "completed",
+          };
           // An executor can fail after an operation has started (for example,
           // while publishing a client notification). Do not replay it; give
           // the model one terminal result and state that its side effect is
           // uncertain so the provider history remains structurally valid.
           toolFailure = new Error(result.content, { cause });
         }
-        debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
+        debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} outcome=${result.outcome} contentLength=${result.content.length}`);
 
-        const retainToolResult = preservesDrainingHistory();
-        if (!ownsPrompt() && !retainToolResult) {
+        if (!keepHistory()) {
           cancellationObserved = true;
           continue;
         }
-        toolResults.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: result.content,
-        });
-        if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
+        // not_started: the executor already published a failed tool card when
+        // the client had seen the call. Omit it from history.
+        if (result.outcome === "not_started") {
+          cancellationObserved = true;
+          continue;
+        }
+        const content = result.outcome === "interrupted"
+          ? interruptedToolHistory(result.content)
+          : result.content;
+        keepCall(tc, content);
+        if (signal.aborted || !ownsPrompt() || result.outcome === "interrupted") cancellationObserved = true;
       }
 
-      if (ownsPrompt() || preservesDrainingHistory()) {
-        session.messages.push(assistantToolMessage!, ...toolResults);
+      if (keepHistory()) {
+        if (startedCalls.length === 0) {
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
+        } else if (startedCalls.length === toolCalls.length) {
+          session.messages.push(assistantToolMessage!, ...toolResults);
+        } else {
+          // Trimming tool_calls drops reasoning_content so a partial batch is
+          // not replayed as the completed reasoning chain for the calls removed.
+          session.messages.push({
+            role: "assistant",
+            content: assistantText.length > 0 ? assistantText : null,
+            tool_calls: startedCalls.map((tc) => ({
+              id: tc.id,
+              type: "function" as const,
+              function: { name: tc.name, arguments: tc.arguments },
+            })),
+          }, ...toolResults);
+        }
         // Complete and uncertain effects must survive a failure of the next
         // provider request. Incomplete text streams keep their prior checkpoint.
         await this.persistSession(sessionId, session, undefined, true);
@@ -2405,7 +2433,7 @@ export class GlmAcpAgent implements Agent {
           sessionUpdate: "agent_message_chunk",
           content: {
             type: "text",
-            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue (the last turn's tool results were saved)]`,
           },
         },
       });

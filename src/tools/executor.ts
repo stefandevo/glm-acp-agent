@@ -26,10 +26,31 @@ import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./fi
 import { validateToolArguments } from "./argument-validation.js";
 
 /**
+ * A call that was announced, or was waiting on permission, but whose operation
+ * never ran. History must omit it. The text is the card/result the executor
+ * used before the prompt loop drops the call.
+ */
+export const CANCELLED_BEFORE_EXECUTION = "Tool call cancelled before execution.";
+
+/**
+ * Marker appended when a call was already running at abort. Partial command
+ * output, when any was captured, is kept ahead of this marker.
+ */
+export const INTERRUPTED_TOOL_RESULT =
+  "Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.";
+
+/** How far a tool call got before it returned to the prompt loop. */
+export type ToolExecutionOutcome = "not_started" | "interrupted" | "completed";
+
+/**
  * Result returned after executing a tool call against the ACP client.
+ *
+ * `outcome` is optional on internal returns and means `completed` when absent.
+ * `execute()` always sets it.
  */
 export interface ToolResult {
   content: string;
+  outcome?: ToolExecutionOutcome;
 }
 
 /**
@@ -236,7 +257,7 @@ type PermissionDecision =
 /** Only raised at a notification boundary before an operation is dispatched. */
 class ToolCallCancelledBeforeExecutionError extends Error {
   constructor() {
-    super("Tool call cancelled before execution.");
+    super(CANCELLED_BEFORE_EXECUTION);
   }
 }
 
@@ -264,12 +285,12 @@ export class ToolExecutor {
     toolCallId: string,
     toolName: string,
     rawArguments: string
-  ): Promise<ToolResult> {
+  ): Promise<ToolResult & { outcome: ToolExecutionOutcome }> {
     const validation = validateToolArguments(toolName, rawArguments);
     if (!validation.ok) {
       const message = `Error: ${validation.message}`;
       await this.failedToolCall(toolCallId, toolName, {}, message);
-      return { content: boundToolResult(message, this.resourceLimits.toolResultBytes) };
+      return { content: boundToolResult(message, this.resourceLimits.toolResultBytes), outcome: "completed" };
     }
     const args = validation.value;
 
@@ -302,12 +323,14 @@ export class ToolExecutor {
       }
     }} )().catch(async (cause: unknown): Promise<ToolResult> => {
       if (!(cause instanceof ToolCallCancelledBeforeExecutionError)) throw cause;
-      await this.markFailed(toolCallId, cause.message);
-      return { content: cause.message };
+      return this.notStarted(toolCallId, cause.message, cause.message);
     });
     // This is the sole boundary before a result becomes a model-history tool
     // message. Permission arguments and write payloads never cross this path.
-    return { content: boundToolResult(result.content, this.resourceLimits.toolResultBytes) };
+    return {
+      content: boundToolResult(result.content, this.resourceLimits.toolResultBytes),
+      outcome: result.outcome ?? "completed",
+    };
   }
 
   /** An interrupted announcement proves its following operation never started. */
@@ -421,9 +444,7 @@ export class ToolExecutor {
 
       return { content };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error reading file: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error reading file: ${message}`);
     }
   }
 
@@ -568,9 +589,7 @@ export class ToolExecutor {
 
       return { content: `File written successfully: ${path}` };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error writing file: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error writing file: ${message}`);
     }
   }
 
@@ -721,9 +740,7 @@ export class ToolExecutor {
     try {
       current = await this.performRead(absolutePath);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error editing file: cannot read ${path}: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error editing file: cannot read ${path}: ${message}`);
     }
 
     const occurrences = countNonOverlappingMatches(current, oldText);
@@ -779,9 +796,7 @@ export class ToolExecutor {
     try {
       latest = await this.performRead(absolutePath);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error editing file: cannot re-read ${path}: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error editing file: cannot re-read ${path}: ${message}`);
     }
     const latestOccurrences = countNonOverlappingMatches(latest, oldText);
     if (latestOccurrences !== 1) {
@@ -813,9 +828,7 @@ export class ToolExecutor {
 
       return { content: `File edited successfully: ${path}` };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error editing file: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error editing file: ${message}`);
     }
   }
 
@@ -893,9 +906,7 @@ export class ToolExecutor {
 
       return { content: output };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error listing files: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error listing files: ${message}`);
     }
   }
 
@@ -960,8 +971,7 @@ export class ToolExecutor {
     });
 
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Command cancelled by turn." };
+      return this.notStarted(toolCallId, "Command cancelled by turn.");
     }
 
     try {
@@ -974,6 +984,24 @@ export class ToolExecutor {
         this.processSupervisor
       );
       const output = formatCommandOutput(result, limits);
+
+      if (result.aborted) {
+        try {
+          await this.connection.sessionUpdate({
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: "failed",
+              content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
+              rawOutput: elideForPreview({ ...result, interrupted: true }),
+            },
+          });
+        } catch (err) {
+          if (!this.signal?.aborted) throw err;
+        }
+        return { content: output, outcome: "interrupted" };
+      }
 
       if (result.timedOut) {
         await this.connection.sessionUpdate({
@@ -1002,9 +1030,10 @@ export class ToolExecutor {
 
       return { content: output };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error running command: ${message}` };
+      if (this.signal?.aborted && (err instanceof Error ? err.message : String(err)) === ABORTED_MESSAGE) {
+        return this.notStarted(toolCallId, "Command cancelled by turn.");
+      }
+      return this.operationFailure(toolCallId, err, (message) => `Error running command: ${message}`);
     }
   }
 
@@ -1120,9 +1149,7 @@ export class ToolExecutor {
 
       return { content: output };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error performing web search: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error performing web search: ${message}`);
     }
   }
 
@@ -1210,9 +1237,7 @@ export class ToolExecutor {
 
       return { content: output };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error reading URL: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error reading URL: ${message}`);
     }
   }
 
@@ -1310,9 +1335,7 @@ export class ToolExecutor {
       });
       return { content: text };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error analyzing image: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error analyzing image: ${message}`);
     }
   }
 
@@ -1350,9 +1373,7 @@ export class ToolExecutor {
       });
       return { content: text };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error calling MCP tool ${toolName}: ${message}` };
+      return this.operationFailure(toolCallId, err, (message) => `Error calling MCP tool ${toolName}: ${message}`);
     }
   }
 
@@ -1471,8 +1492,7 @@ export class ToolExecutor {
         await this.markFailed(toolCallId, "Cancelled by user.");
         return { content: `${action} cancelled by user.` };
       case "aborted":
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: `${action} cancelled by turn.` };
+        return this.notStarted(toolCallId, `${action} cancelled by turn.`);
       case "reject":
       default:
         await this.markFailed(toolCallId, "Rejected by user.");
@@ -1499,8 +1519,43 @@ export class ToolExecutor {
    * `this.signal?.aborted` so the check itself stays inline.
    */
   private async cancelledEditOutcome(toolCallId: string, content: string): Promise<ToolResult> {
-    await this.markFailed(toolCallId, "Cancelled by turn.");
-    return { content };
+    return this.notStarted(toolCallId, content);
+  }
+
+  /**
+   * A card the client may already be showing must end failed. A turn abort
+   * can reject that update; the not-started outcome still has to win so the
+   * prompt loop can drop the call.
+   */
+  private async notStarted(toolCallId: string, content: string, cardMessage = "Cancelled by turn."): Promise<ToolResult> {
+    try {
+      await this.markFailed(toolCallId, cardMessage);
+    } catch (cause) {
+      if (!this.signal?.aborted) throw cause;
+    }
+    return { content, outcome: "not_started" };
+  }
+
+  /** An in-flight operation aborted by the turn. Content stays empty so history uses the interrupted marker instead of an I/O error. */
+  private async operationFailure(
+    toolCallId: string,
+    err: unknown,
+    format: (message: string) => string,
+  ): Promise<ToolResult> {
+    const message = err instanceof Error ? err.message : String(err);
+    // Fetch and MCP abort with "This operation was aborted" or AbortError, not
+    // only Node's "The operation was aborted". Any failure while the turn is
+    // already aborted is the same unknown in-flight outcome.
+    if (this.signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+      try {
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+      } catch (cause) {
+        if (!this.signal?.aborted) throw cause;
+      }
+      return { content: "", outcome: "interrupted" };
+    }
+    await this.markFailed(toolCallId, message);
+    return { content: format(message) };
   }
 
   /**
@@ -1785,6 +1840,7 @@ function runShellCommand(
         signal: closeSignal,
         outputTruncated,
         timedOut,
+        aborted: abortRequested,
       });
     });
   });
@@ -1814,6 +1870,7 @@ interface ShellCommandResult {
   signal: NodeJS.Signals | null;
   outputTruncated: boolean;
   timedOut: boolean;
+  aborted: boolean;
 }
 
 function terminateProcessTree(child: ReturnType<typeof spawn>, force = false): void {

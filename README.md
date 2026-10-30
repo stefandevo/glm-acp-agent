@@ -30,7 +30,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 
 - **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`, and pushes `session_info_update`, `config_option_update`, `current_mode_update`, and `available_commands_update` notifications
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
-- **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 100; see `ACP_GLM_MAX_TURNS` / `--max-turns`)
+- **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 100; see `ACP_GLM_MAX_TURNS` / `--max-turns`). Reaching the cap finishes the turn's tool calls and saves their real results. A user abort keeps only calls that had started.
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
@@ -306,7 +306,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
-| `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
+| `ACP_GLM_MAX_TURNS` | No | `100` | Max model turns per prompt (also settable via `--max-turns`). The final turn's tool calls still run and their results are saved |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_TOOL_RESULT_LIMIT_BYTES` | No | `262144` | Inclusive UTF-8 byte limit for every model-facing tool result. It preserves a prefix and suffix with an omitted-bytes marker; values below 128 fall back with a stderr warning. |
@@ -364,6 +364,10 @@ A dropped network connection is handled separately from a stall. Each provider c
 A socket reset after response bytes have started is not retried. That turn still ends with `stopReason: "cancelled"` and a connection-lost notice, and the text or tool result already in the session stays there. The idle-stream watchdog and an incomplete tool-call stream still fail the turn with an error and leave the previous checkpoint in place.
 
 Cancelling a turn keeps the user's prompt whether or not the history was compacted for that request. When compaction already ran and the cancelled turn produced no reply, the pre-compaction messages are restored and the prompt stays, so the saved checkpoint still contains the earlier exchange. A connection drop with no reply is the path that removes the unsent prompt.
+
+`ACP_GLM_MAX_TURNS` (default 100, also `--max-turns`) counts model turns, not tool calls. Reaching it does not cancel the turn in progress. Every tool call the model already issued in that final turn runs to completion, its real result is saved, and the prompt stops with `max_turn_requests`. The client notice is `[stopped: reached the N-turn limit — send a message to continue (the last turn's tool results were saved)]`.
+
+A user abort is a different path: `session/cancel`, a new `session/prompt` on the same session, the connection closing, or `session/load` / `session/resume` / `session/close` while a prompt is still draining. The executor reports each call as not started, interrupted, or completed. History keeps only calls that actually started, in their original order. A call that never ran — including one aborted while it was waiting for permission — is removed from the assistant message, and its tool card is marked failed if the client already showed it. The transcript does not gain `Tool call cancelled before execution.` or `cancelled by turn` placeholders for those calls. A call that was running when the abort arrived is saved with an explicit result: `Interrupted: the user cancelled this turn while this tool was running. Its outcome is unknown and may be partial; inspect state before relying on or repeating it.` A command killed mid-run keeps the output captured so far and then that marker. Every remaining `tool_call` has a matching tool message. If that list is shorter than the model requested, `reasoning_content` on that assistant message is dropped. If the abort arrives while the model is still streaming, the assistant `tool_calls` message is not saved; assistant text already received is kept as a plain assistant message. A tool that fails on its own, before any abort, still records `Tool call not started because an earlier tool's outcome is unknown.` for the calls after it.
 
 #### Thought level (reasoning effort)
 
