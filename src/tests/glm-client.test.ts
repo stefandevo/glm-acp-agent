@@ -883,3 +883,63 @@ test("HTTP 408, 409, 429, and 5xx use the same retry budget and 400 does not", a
     await server.close();
   }
 });
+
+test("request max_tokens follows the model's documented output limit", async () => {
+  delete process.env["ACP_GLM_MAX_TOKENS"];
+  try {
+    const bodies: Array<Record<string, unknown>> = [];
+    const c = makeClientWithCreate((body) => {
+      bodies.push(body);
+      return Promise.resolve(
+        fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }])
+      );
+    });
+    for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3-flash" })) {
+      void chunk;
+    }
+    assert.equal(bodies[0]!["max_tokens"], 131_072);
+  } finally {
+    delete process.env["Z_AI_API_KEY"];
+  }
+});
+
+test("ACP_GLM_MAX_TOKENS still overrides the per-model default", async () => {
+  const saved = process.env["ACP_GLM_MAX_TOKENS"];
+  process.env["ACP_GLM_MAX_TOKENS"] = "4096";
+  try {
+    const bodies: Array<Record<string, unknown>> = [];
+    const c = makeClientWithCreate((body) => {
+      bodies.push(body);
+      return Promise.resolve(
+        fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }])
+      );
+    });
+    for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3" })) {
+      void chunk;
+    }
+    assert.equal(bodies[0]!["max_tokens"], 4096);
+  } finally {
+    if (saved === undefined) delete process.env["ACP_GLM_MAX_TOKENS"];
+    else process.env["ACP_GLM_MAX_TOKENS"] = saved;
+    delete process.env["Z_AI_API_KEY"];
+  }
+});
+
+test("uncatalogued models keep the flat 32768 default", async () => {
+  delete process.env["ACP_GLM_MAX_TOKENS"];
+  try {
+    const bodies: Array<Record<string, unknown>> = [];
+    const c = makeClientWithCreate((body) => {
+      bodies.push(body);
+      return Promise.resolve(
+        fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }])
+      );
+    });
+    for await (const chunk of c.streamChat([], undefined, { model: "glm-not-in-catalog" })) {
+      void chunk;
+    }
+    assert.equal(bodies[0]!["max_tokens"], 32_768);
+  } finally {
+    delete process.env["Z_AI_API_KEY"];
+  }
+});

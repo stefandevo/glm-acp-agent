@@ -48,7 +48,7 @@ if (args.includes("--setup")) {
       "  ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES  Combined run_command stdout/stderr limit in bytes (default 65536)",
       "  ACP_GLM_AVAILABLE_MODELS       Comma-separated list of advertised models",
       "  ACP_GLM_BASE_URL               Override the Z.AI API base URL",
-      "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default 32768)",
+      "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default: the model's documented limit, 32768 fallback)",
       "  ACP_GLM_THINKING               Force thinking mode (true / false)",
       "  ACP_GLM_STREAM_THINKING        Forward reasoning to the client as thought chunks (default true)",
       "  ACP_GLM_STREAM_IDLE_TIMEOUT_MS Model stream idle deadline in milliseconds (default 300000)",

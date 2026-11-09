@@ -305,7 +305,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
-| `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_MAX_TOKENS` | No | model default | Cap on `max_tokens` for each completion. Defaults to each model's documented maximum output length (131072 for glm-5.3 / glm-5.3-flash, 32768 otherwise); an explicit value overrides every model. Invalid values fall back to the per-model default with a stderr warning. |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model turns per prompt (also settable via `--max-turns`). The final turn's tool calls still run and their results are saved |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |

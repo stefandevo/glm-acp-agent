@@ -246,7 +246,7 @@ export interface GlmAcpAgentOptions {
       signal?: AbortSignal,
       options?: StreamChatOptions
     ) => AsyncIterable<GlmStreamChunk>;
-    getMaxOutputTokens?: () => number;
+    getMaxOutputTokens?: (model?: string) => number;
   };
   /**
    * Maximum number of model/tool turns per single prompt. Default 100,
@@ -2326,6 +2326,32 @@ export class GlmAcpAgent implements Agent {
 
       // No tool calls => model is done.
       if (toolCalls.length === 0) {
+        if (lastStopReason === "length") {
+          // A truncation must be distinguishable from a normal end: without a
+          // notice the client shows a clean completion and the user never
+          // learns why the turn stopped mid-task.
+          try {
+            await promptConnection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: {
+                  type: "text",
+                  text: "\n[stopped: the model hit its output-token limit mid-turn — send a message to continue from here]",
+                },
+              },
+            });
+          } catch (err) {
+            // Keep the truncation terminal; only an abort turns it into a cancel.
+            if (signal.aborted || !ownsPrompt()) {
+              return { stopReason: "cancelled", usage: totalUsage };
+            }
+            throw err;
+          }
+          if (signal.aborted || !ownsPrompt()) {
+            return { stopReason: "cancelled", usage: totalUsage };
+          }
+        }
         return { stopReason: this.mapStopReason(lastStopReason), usage: totalUsage };
       }
 
@@ -2466,7 +2492,7 @@ export class GlmAcpAgent implements Agent {
   /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
   private contextBudget(session: SessionState): ContextBudget {
     const contextWindow = getContextWindow(session.model);
-    const maxOutputTokens = this.glm.getMaxOutputTokens?.() ?? 32_768;
+    const maxOutputTokens = this.glm.getMaxOutputTokens?.(session.model) ?? 32_768;
     // Session catalogs are immutable after assembly; a replacement catalog has a new identity.
     const toolSchemaTokens = this.toolSchemaTokenCache.get(session.toolDefinitions);
     return {
@@ -2518,7 +2544,7 @@ export class GlmAcpAgent implements Agent {
     return Buffer.byteLength(JSON.stringify({
       messages: session.messages,
       tools: session.toolDefinitions,
-      max_tokens: this.glm.getMaxOutputTokens?.() ?? 32_768,
+      max_tokens: this.glm.getMaxOutputTokens?.(session.model) ?? 32_768,
     }), "utf8");
   }
 

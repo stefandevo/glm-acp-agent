@@ -313,9 +313,12 @@ export const ERR_CONTEXT_OVERFLOW = 1261;
  * accurate window, and they report the window of the model that actually
  * answers them rather than their own historical spec.
  */
-const MODEL_METADATA: Record<string, { contextWindow: number }> = {
-  "glm-5.3": { contextWindow: 1_000_000 },
-  "glm-5.3-flash": { contextWindow: 1_000_000 },
+const MODEL_METADATA: Record<string, { contextWindow: number; maxOutputTokens?: number }> = {
+  // GLM-5.3 and GLM-5.3-flash document a 128K-token maximum output length
+  // (docs.z.ai model overviews), and neither model can disable reasoning, so
+  // every completion spends its output budget on reasoning plus content.
+  "glm-5.3": { contextWindow: 1_000_000, maxOutputTokens: 131_072 },
+  "glm-5.3-flash": { contextWindow: 1_000_000, maxOutputTokens: 131_072 },
   "glm-5-turbo": { contextWindow: 128_000 },
   "glm-4.7": { contextWindow: 200_000 },
   // Routed to glm-5.3 by the Coding Plan endpoint.
@@ -340,6 +343,20 @@ export function isVisionNativeModel(modelId: string): boolean {
  */
 export function getContextWindow(modelId: string): number {
   return MODEL_METADATA[modelId]?.contextWindow ?? 128_000;
+}
+
+/**
+ * Fallback output reservation for models without a documented maximum output
+ * length. Matches the historical flat default.
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
+
+/**
+ * The documented maximum output length for a model ID, falling back to 32,768
+ * for uncatalogued models.
+ */
+export function getModelMaxOutputTokens(modelId: string): number {
+  return MODEL_METADATA[modelId]?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 /**
@@ -388,16 +405,22 @@ export class GlmClient {
   private readonly pools = new Map<Dispatcher, ProviderPool>();
   private readonly baseURL: string;
   private maxTokens: number;
+  /** Explicit ACP_GLM_MAX_TOKENS override; undefined lets each model's documented limit apply. */
+  private readonly explicitMaxTokens: number | undefined;
   /** Resolved once at construction; later env changes cannot affect a running client. */
   private readonly streamIdleTimeoutMs: number;
 
   constructor() {
     this.baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
-    // 32768 leaves room for whole-file writes and GLM thinking tokens in the
-    // same turn; reasoning counts against this cap, so a small value starves
-    // the actual content and trips finish_reason=length ("output limit
-    // reached"). Override with ACP_GLM_MAX_TOKENS.
-    this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 32_768);
+    // GLM-5.3-family completions spend reasoning tokens from the same
+    // max_tokens budget (reasoning cannot be disabled), so a small value
+    // starves the actual content and trips finish_reason=length ("output
+    // limit reached"). The default follows each model's documented maximum
+    // output length (see getModelMaxOutputTokens); an explicit
+    // ACP_GLM_MAX_TOKENS still overrides every model.
+    const envMaxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 0);
+    this.explicitMaxTokens = envMaxTokens > 0 ? envMaxTokens : undefined;
+    this.maxTokens = this.explicitMaxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     // Default silence bound for one provider stream item (see
     // StreamChatOptions.idleTimeoutMs). Resolved once at construction so
     // env re-reads cannot change behaviour mid-session.
@@ -539,9 +562,20 @@ export class GlmClient {
     }
   }
 
-  /** The same resolved reservation used in the outgoing `max_tokens` field. */
-  getMaxOutputTokens(): number {
-    return this.maxTokens;
+  /**
+   * The reservation used for context accounting. With a model ID it matches
+   * the outgoing `max_tokens`; without one it returns the legacy flat default.
+   */
+  getMaxOutputTokens(model?: string): number {
+    return model === undefined ? this.maxTokens : this.maxOutputTokensFor(model);
+  }
+
+  /**
+   * The `max_tokens` sent for `model`. An explicit ACP_GLM_MAX_TOKENS wins;
+   * otherwise the model's documented maximum output applies.
+   */
+  private maxOutputTokensFor(model: string): number {
+    return this.explicitMaxTokens ?? getModelMaxOutputTokens(model);
   }
 
   /**
@@ -590,7 +624,7 @@ export class GlmClient {
           stream: true,
           // Always ask the API to include final usage in the streaming response.
           stream_options: { include_usage: true },
-          max_tokens: this.maxTokens,
+          max_tokens: this.maxOutputTokensFor(model),
           ...extraBody,
         },
         { signal }
