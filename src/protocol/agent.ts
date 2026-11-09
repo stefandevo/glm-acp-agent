@@ -207,8 +207,9 @@ interface SessionState {
   displayText: WeakMap<GlmMessage, string>;
   /**
    * Message list from before this prompt's compaction. Restored when a
-   * cancelled or dropped turn produced no reply, so the shortened transcript
-   * is not saved. Not persisted.
+   * cancelled or dropped turn produced no assistant or tool output, so the
+   * shortened transcript is not saved. The user prompt stays in that list.
+   * Not persisted.
    */
   messagesBeforeCompaction?: GlmMessage[];
   /** Synchronous gate for replacement and close transitions. */
@@ -315,6 +316,19 @@ function envMaxTurns(): number | undefined {
   }
   return Math.floor(parsed);
 }
+
+/**
+ * ACP StopReason has no value for a dropped provider connection. These
+ * sentences are the user-facing reason. The no-reply sentence is also stored
+ * as assistant text when the turn produced nothing, so a later load or fork
+ * shows the same fact. Padding newlines are added only on the live update.
+ * The stored note is not a retry id: a later prompt with the same text is a
+ * new user turn.
+ */
+const CONNECTION_LOST_NO_REPLY =
+  "Connection lost before a reply was saved. Your message is still in the session. Send another message to continue.";
+const CONNECTION_LOST_KEEP_WORK =
+  "Connection lost. Send a message to continue.";
 
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
@@ -988,7 +1002,7 @@ export class GlmAcpAgent implements Agent {
       // the checkpoint with the shortened transcript. Restoring keeps the
       // prompt, matching a cancel that never compacted.
       const turnCancelled = abortController.signal.aborted || stopReason === "cancelled";
-      const restoredHistory = turnCancelled ? this.restoreCompactedHistory(session, false) : "none";
+      const restoredHistory = turnCancelled ? this.restoreCompactedHistory(session) : "none";
       if (!ownsPrompt()) {
         if (restoredHistory === "restored") {
           session.updatedAt = new Date().toISOString();
@@ -1034,7 +1048,7 @@ export class GlmAcpAgent implements Agent {
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
-        if (this.restoreCompactedHistory(session, false) === "restored") {
+        if (this.restoreCompactedHistory(session) === "restored") {
           session.updatedAt = new Date().toISOString();
           await this.persistSession(params.sessionId, session);
         }
@@ -1043,22 +1057,30 @@ export class GlmAcpAgent implements Agent {
       // A dropped provider connection must not fail the JSON-RPC prompt.
       // Paseo and other clients turn a thrown error into -32603 and then keep
       // sending later prompts through the same dead HTTP client. End the turn
-      // as cancelled, keep any text or tool result already in history, and
-      // leave the session idle so the next message opens a new connection.
+      // as cancelled, keep the user prompt and any text or tool result already
+      // in history, and leave the session idle so the next message opens a
+      // new connection.
+      //
+      // ACP StopReason has no transport-failure value. `refusal` would tell
+      // the client to drop this prompt from the next turn. `cancelled` is the
+      // incomplete-turn reason already returned for a client cancel; the
+      // notice below is what says this one was a dropped connection. The
+      // echoed userMessageId, when the client sent one, confirms the prompt
+      // was recorded.
       if (isRecoverableTransportError(err) && userMessage) {
         // Compaction replaces the live user message with a new object before
-        // the provider call, so identity lookup misses the turn that just ran.
-        const rollback = this.restoreCompactedHistory(session, true);
-        let keptWork = rollback === "kept";
-        if (rollback === "none") {
-          const start = lastUserIndex(session.messages);
-          const currentTurn = start >= 0 ? session.messages[start] : undefined;
-          keptWork = currentTurn !== undefined && session.messages.slice(start + 1)
-            .some((message) => message.role === "assistant" || message.role === "tool");
-          if (currentTurn && !keptWork) {
-            session.messages.splice(start, 1);
-            session.displayText.delete(currentTurn);
-          }
+        // the provider call. Roll the shortened transcript back when this
+        // turn produced no assistant or tool output. The prompt stays.
+        this.restoreCompactedHistory(session);
+        const keptWork = turnHasProviderOutput(session.messages);
+        if (!keptWork) {
+          // Durable copy of the live notice, and the assistant turn the next
+          // request needs so the kept prompt is not a dangling user message.
+          // No tool_calls and no reasoning_content: nothing ran, and a
+          // fabricated reasoning block would be replayed as preserved thinking.
+          // This note does not identify a retry. A later prompt with the same
+          // text is another user turn.
+          session.messages.push({ role: "assistant", content: CONNECTION_LOST_NO_REPLY });
         }
         session.updatedAt = new Date().toISOString();
         await this.persistSession(params.sessionId, session);
@@ -1067,16 +1089,12 @@ export class GlmAcpAgent implements Agent {
         if (abortController.signal.aborted || !ownsPrompt()) {
           return cancelledResponse();
         }
+        const notice = keptWork ? CONNECTION_LOST_KEEP_WORK : CONNECTION_LOST_NO_REPLY;
         await safeSessionUpdate(promptConnection, {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: {
-              type: "text",
-              text: keptWork
-                ? "\n\nConnection lost. Send a message to continue.\n"
-                : "\n\nConnection lost. Send the message again when you are back online.\n",
-            },
+            content: { type: "text", text: `\n\n${notice}\n` },
           },
         });
         return cancelledResponse();
@@ -1847,28 +1865,17 @@ export class GlmAcpAgent implements Agent {
 
   /**
    * A cancelled or dropped prompt can leave the shortened transcript in
-   * memory. Put the pre-compaction messages back before any save. A
-   * connection drop with no reply also removes the unsent prompt. A cancel
-   * keeps that prompt, which is what a cancel does when compaction did not run.
+   * memory. Put the pre-compaction messages back before any save when the
+   * turn produced no assistant or tool output. The user prompt stays, which
+   * is also what a cancel does when compaction did not run. Output that
+   * already arrived was generated against the compacted transcript, so that
+   * shortened list is the one that stays.
    */
-  private restoreCompactedHistory(
-    session: SessionState,
-    dropUnsentPrompt: boolean,
-  ): "restored" | "kept" | "none" {
+  private restoreCompactedHistory(session: SessionState): "restored" | "kept" | "none" {
     const prior = session.messagesBeforeCompaction;
     if (!prior) return "none";
-    const start = lastUserIndex(session.messages);
-    const keptWork = start >= 0 && session.messages.slice(start + 1)
-      .some((message) => message.role === "assistant" || message.role === "tool");
-    if (keptWork) return "kept";
+    if (turnHasProviderOutput(session.messages)) return "kept";
     session.messages = prior.slice();
-    if (!dropUnsentPrompt) return "restored";
-    const unsent = lastUserIndex(session.messages);
-    const currentTurn = unsent >= 0 ? session.messages[unsent] : undefined;
-    if (currentTurn) {
-      session.messages.splice(unsent, 1);
-      session.displayText.delete(currentTurn);
-    }
     return "restored";
   }
 
@@ -2747,11 +2754,18 @@ function deserializeRestoredDisplayText(
   return deserializeDisplayText(restoredMessages, shifted);
 }
 
-function lastUserIndex(messages: GlmMessage[]): number {
+function lastUserIndex(messages: readonly GlmMessage[]): number {
   for (let index = messages.length - 1; index >= 0; index--) {
     if (messages[index]?.role === "user") return index;
   }
   return -1;
+}
+
+function turnHasProviderOutput(messages: readonly GlmMessage[]): boolean {
+  const start = lastUserIndex(messages);
+  return start >= 0 && messages.slice(start + 1).some(
+    (message) => message.role === "assistant" || message.role === "tool"
+  );
 }
 
 /** Flatten the `content` of a user message into a plain string for replay. */
