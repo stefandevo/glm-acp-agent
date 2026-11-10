@@ -2005,6 +2005,50 @@ test("prompt maps length stop reason to max_tokens", async () => {
   assert.equal(result.stopReason, "max_tokens");
 });
 
+test("length-truncated turns emit a visible stop notice", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([
+    [{ text: "partial" }, { done: true, stopReason: "length" }],
+  ]);
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "keep going" }],
+  });
+  assert.equal(result.stopReason, "max_tokens");
+  const notice = conn.updates.some(
+    (u) =>
+      (u as { update?: { content?: { text?: string } } }).update?.content?.text?.includes(
+        "output-token limit"
+      )
+  );
+  assert.equal(notice, true);
+});
+
+test("a normal end_turn emits no stop notice", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([[{ text: "Done." }, { done: true, stopReason: "stop" }]]);
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.prompt({
+    sessionId,
+    prompt: [{ type: "text", text: "hi" }],
+  });
+  assert.equal(result.stopReason, "end_turn");
+  const notice = conn.updates.some(
+    (u) =>
+      (u as { update?: { content?: { text?: string } } }).update?.content?.text?.includes(
+        "[stopped:"
+      )
+  );
+  assert.equal(notice, false);
+});
+
 test("prompt loop returns max_turn_requests after exhausting tool turns", async () => {
   const conn = createConnectionStub();
   // Each turn produces a tool call; we'll stub maxTurns=2 so we hit the limit fast.
