@@ -15,12 +15,14 @@
  *   <cwd>/.claude/skills/<name>/SKILL.md → `/name`
  *
  * plus the same two directories under `~/.claude` for user-level commands.
+ * Symlinked commands and skills are followed, so a tree managed as links into
+ * a shared checkout stays visible.
  * Project definitions win over user-level ones with the same name.
  *
  * All I/O errors are swallowed: having no commands at all is the common case,
  * and a broken command file should never fail `session/new`.
  */
-import { closeSync, openSync, readSync, readdirSync, type Dirent } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -108,11 +110,11 @@ function collectCommandFiles(
   for (const entry of readDirSafe(dir)) {
     if (found.size >= MAX_COMMANDS) return;
     const path = pathJoin(dir, entry.name);
-    if (entry.isDirectory()) {
+    if (entryKind(dir, entry) === "directory") {
       collectCommandFiles(path, [...prefix, entry.name], found);
       continue;
     }
-    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+    if (entryKind(dir, entry) !== "file" || !entry.name.endsWith(".md")) continue;
     addCommand(found, [...prefix, entry.name.slice(0, -".md".length)].join(":"), path);
   }
 }
@@ -122,7 +124,7 @@ function collectSkillFiles(dir: string, found: Map<string, SlashCommand>): void 
   if (found.size >= MAX_COMMANDS) return;
   for (const entry of readDirSafe(dir)) {
     if (found.size >= MAX_COMMANDS) return;
-    if (!entry.isDirectory()) continue;
+    if (entryKind(dir, entry) !== "directory") continue;
     addCommand(found, entry.name, pathJoin(dir, entry.name, "SKILL.md"));
   }
 }
@@ -132,6 +134,24 @@ function readDirSafe(dir: string): Dirent<string>[] {
     return readdirSync(dir, { withFileTypes: true });
   } catch {
     return [];
+  }
+}
+
+/**
+ * What an entry points at, following symlinks. Skill homes are routinely
+ * managed as directories of links into a shared checkout, and Claude Code
+ * itself follows them — so a plain `isDirectory()` filter would drop every
+ * linked skill. A link that points nowhere resolves to `undefined` and is
+ * skipped like any other unreadable entry.
+ */
+function entryKind(dir: string, entry: Dirent): "file" | "directory" | undefined {
+  if (entry.isDirectory()) return "directory";
+  if (entry.isFile()) return "file";
+  if (!entry.isSymbolicLink()) return undefined;
+  try {
+    return statSync(pathJoin(dir, entry.name)).isDirectory() ? "directory" : "file";
+  } catch {
+    return undefined;
   }
 }
 
