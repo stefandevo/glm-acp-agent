@@ -302,6 +302,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
+| `ACP_GLM_GLOBAL_CONTEXT_FILE` | No | `$XDG_CONFIG_HOME/glm-acp-agent/AGENTS.md` (`~/.config/...` when unset) | User-level instructions added to every session's system prompt (first 16,384 characters), ahead of the project `AGENTS.md`, framed as instructions to follow. Must be an absolute path or start with `~/`; relative values are ignored with a warning. `none` or an empty value disables it. A missing default file is silent; a missing or unreadable explicit file logs a warning. Writes to this file and to the agent's config directory always prompt, except in `bypass_permissions` mode (and `run_command` is not covered). |
 | `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |

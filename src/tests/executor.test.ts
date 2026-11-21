@@ -2936,6 +2936,47 @@ test("write_file skips permission prompt in accept_edits mode", async () => {
   }
 });
 
+test("write_file and edit_file still prompt in accept_edits mode for the global context file and config dir", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "glm-executor-protected-ws-"));
+  const config = mkdtempSync(join(tmpdir(), "glm-executor-protected-cfg-"));
+  const globalFile = join(config, "rules", "AGENTS.md");
+  mkdirSync(join(config, "rules"), { recursive: true });
+  writeFileSync(globalFile, "original");
+  const previous = { global: process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"], xdg: process.env["XDG_CONFIG_HOME"] };
+  process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"] = globalFile;
+  process.env["XDG_CONFIG_HOME"] = join(config, "xdg");
+  mkdirSync(join(config, "xdg", "glm-acp-agent"), { recursive: true });
+  try {
+    const targets = [globalFile, join(config, "xdg", "glm-acp-agent", "credentials.json")];
+    for (const target of targets) {
+      const conn = createConnectionStub({ permission: "reject" });
+      const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, workspace, () => "accept_edits");
+      const written = await exec.execute("tc1", "write_file", JSON.stringify({ path: target, content: "pwned" }));
+      assert.equal(written.content, "Write rejected by user.", target);
+      assert.equal(conn.permissionRequests.length, 1, target);
+    }
+    assert.equal(readFileSync(globalFile, "utf8"), "original");
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, workspace, () => "accept_edits");
+    await exec.execute("tc2", "edit_file", JSON.stringify({ path: globalFile, old_text: "original", new_text: "pwned" }));
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(readFileSync(globalFile, "utf8"), "original");
+
+    // Ordinary workspace files keep the accept_edits fast path.
+    const okConn = createConnectionStub();
+    const okExec = new ToolExecutor(okConn as never, "s1", FULL_CAPS, undefined, null, null, workspace, () => "accept_edits");
+    await okExec.execute("tc3", "write_file", JSON.stringify({ path: join(workspace, "ok.txt"), content: "fine" }));
+    assert.equal(okConn.permissionRequests.length, 0);
+  } finally {
+    if (previous.global === undefined) delete process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"];
+    else process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"] = previous.global;
+    if (previous.xdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = previous.xdg;
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(config, { recursive: true, force: true });
+  }
+});
+
 test("write_file skips permission prompt in bypass_permissions mode", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-bypass-"));
   const path = join(dir, "out.txt");

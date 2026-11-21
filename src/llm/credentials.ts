@@ -8,7 +8,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { agentConfigDir } from "./config-paths.js";
 import { join, dirname } from "node:path";
 import { debug, maskSecret } from "./logger.js";
 
@@ -32,9 +32,7 @@ interface CredentialsFile {
 
 /** Path to the credentials JSON file. Honours `$XDG_CONFIG_HOME`. */
 export function credentialsPath(): string {
-  const xdg = process.env["XDG_CONFIG_HOME"];
-  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
-  return join(base, "glm-acp-agent", "credentials.json");
+  return join(agentConfigDir(), "credentials.json");
 }
 
 /** Read the API key from the credentials file, returning undefined if absent. */

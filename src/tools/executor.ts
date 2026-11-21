@@ -2,6 +2,7 @@ import type {
   AgentSideConnection,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
+import { isProtectedConfigPath } from "../llm/config-paths.js";
 import { spawn } from "node:child_process";
 import type { Dirent } from "node:fs";
 import { lstat, opendir, realpath, writeFile } from "node:fs/promises";
@@ -550,6 +551,7 @@ export class ToolExecutor {
       rawInput: args,
       title: `Write file: ${path}`,
       locations: [{ path }],
+      protectedPath: await isProtectedConfigPath(absolutePath),
     });
 
     // Fail closed: every outcome that is not an explicit allow (including any
@@ -765,6 +767,7 @@ export class ToolExecutor {
       rawInput: args,
       title: `Edit file: ${path}`,
       locations: [{ path }],
+      protectedPath: await isProtectedConfigPath(absolutePath),
     });
 
     // Fail closed: every outcome that is not an explicit allow (including any
@@ -1393,6 +1396,8 @@ export class ToolExecutor {
     rawInput: unknown;
     title: string;
     locations?: Array<{ path: string }>;
+    /** Target is agent configuration (global instructions, credentials): never auto-approved. */
+    protectedPath?: boolean;
   }): Promise<PermissionDecision> {
     const mode = this.getMode();
 
@@ -1406,7 +1411,7 @@ export class ToolExecutor {
     }
 
     // accept_edits: allow writes without prompting, still prompt for commands
-    if (mode === "accept_edits" && args.kind === "write") {
+    if (mode === "accept_edits" && args.kind === "write" && !args.protectedPath) {
       return { type: "allow" };
     }
 
