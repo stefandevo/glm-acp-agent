@@ -255,3 +255,50 @@ test("fork refreshes B context without mutating the A parent or its display mapp
     rmSync(storeDir, { recursive: true, force: true });
   }
 });
+
+test("fork and load rebuild the prompt with the current global context file", async () => {
+  const storeDir = mkdtempSync(join(tmpdir(), "glm-context-store-"));
+  const store = new SessionStore(storeDir);
+  const a = workspace("alpha", true);
+  const b = workspace("beta");
+  const globalDir = mkdtempSync(join(tmpdir(), "glm-context-global-"));
+  const globalFile = join(globalDir, "AGENTS.md");
+  const captured = { messages: [] as GlmMessage[], tools: [] as string[] };
+  const restoreFetch = installMcpFetch();
+  const previous = process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"];
+  process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"] = globalFile;
+  try {
+    writeFileSync(globalFile, "GLOBAL_V1");
+    const seeded = await seedSession(store, a.cwd, captured);
+    assert.match(systemContent(store.load(seeded.sessionId)?.messages ?? []), /GLOBAL_V1/);
+
+    writeFileSync(globalFile, "GLOBAL_V2");
+    const fork = await seeded.agent.unstable_forkSession({
+      sessionId: seeded.sessionId,
+      cwd: b.cwd,
+      mcpServers: [mcpServer("beta")],
+    });
+    const forkedPrompt = systemContent(store.load(fork.sessionId)?.messages ?? []);
+    assert.match(forkedPrompt, /GLOBAL_V2/);
+    assert.doesNotMatch(forkedPrompt, /GLOBAL_V1/);
+
+    writeFileSync(globalFile, "GLOBAL_V3");
+    const restored = new GlmAcpAgent(createConnectionStub() as never, {
+      glm: makeStreamingGlm(captured),
+      sessionStore: store,
+    });
+    await restored.loadSession({ sessionId: seeded.sessionId, cwd: b.cwd, mcpServers: [mcpServer("beta")] });
+    await restored.prompt({ sessionId: seeded.sessionId, prompt: [{ type: "text", text: "continue" }] });
+    const loadedPrompt = systemContent(captured.messages);
+    assert.match(loadedPrompt, /GLOBAL_V3/);
+    assert.doesNotMatch(loadedPrompt, /GLOBAL_V1/);
+  } finally {
+    if (previous === undefined) delete process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"];
+    else process.env["ACP_GLM_GLOBAL_CONTEXT_FILE"] = previous;
+    restoreFetch();
+    a.cleanup();
+    b.cleanup();
+    rmSync(globalDir, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});

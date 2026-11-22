@@ -18,6 +18,8 @@ if (testFiles.length === 0) {
 const child = spawn(process.execPath, ["--test", ...testFiles], {
   cwd: repositoryRoot,
   stdio: "inherit",
+  // Keep tests independent of any global context file in the developer's home.
+  env: { ...process.env, ACP_GLM_GLOBAL_CONTEXT_FILE: "none" },
 });
 
 child.on("error", (error) => {
