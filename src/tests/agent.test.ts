@@ -664,7 +664,7 @@ test("global context expands a leading ~/ against the home directory", async () 
   const home = makeOutsideDir({ "rules/AGENTS.md": "TILDE_MARKER" });
   const project = makeTempCwd();
   try {
-    await withEnv({ HOME: home.dir, ACP_GLM_GLOBAL_CONTEXT_FILE: "~/rules/AGENTS.md" }, async () => {
+    await withEnv({ HOME: home.dir, USERPROFILE: home.dir, ACP_GLM_GLOBAL_CONTEXT_FILE: "~/rules/AGENTS.md" }, async () => {
       assert.ok((await systemPromptFor(project.cwd)).includes("TILDE_MARKER"));
     });
   } finally {
