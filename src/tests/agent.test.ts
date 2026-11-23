@@ -3218,13 +3218,10 @@ test("prompt with unsupported image MIME on vision-native model emits an inline 
     ],
   });
 
-  assert.ok(Array.isArray(capturedUser));
-  const text = capturedUser
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-  assert.match(text, /<image_unsupported_format index="1" mime="image\/webp">/);
-  assert.match(text, /image\/jpeg, image\/jpg, image\/png/);
+  // No image part survives, so the prompt goes out as one plain string.
+  assert.equal(typeof capturedUser, "string");
+  assert.match(capturedUser as string, /^Describe\n<image_unsupported_format index="1" mime="image\/webp">/);
+  assert.match(capturedUser as string, /image\/jpeg, image\/jpg, image\/png/);
 });
 
 test("prompt with image block but no vision client falls back to a text annotation", async () => {
@@ -3310,6 +3307,33 @@ test("prompt without image blocks keeps content as a plain string", async () => 
   assert.equal(typeof captured, "string");
   assert.equal(captured, "hello");
 });
+
+for (const visionModel of ["glm-5.3-flash", "glm-5v-turbo"] as const) {
+  test(`prompt without image blocks keeps content as a plain string on ${visionModel}`, async () => {
+    const conn = createConnectionStub();
+    let captured: unknown;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        const userMsg = messages.find((m) => m.role === "user");
+        captured = userMsg?.content;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.unstable_setSessionModel({ sessionId, modelId: visionModel });
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+
+    // A native-vision model only needs content parts when an image is present.
+    assert.equal(typeof captured, "string");
+    assert.equal(captured, "hello");
+  });
+}
 
 test("invalid maxTurns falls back to the default", async () => {
   const conn = createConnectionStub();
