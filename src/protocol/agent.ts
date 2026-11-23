@@ -515,9 +515,9 @@ export class GlmAcpAgent implements Agent {
     };
 
     const model = getDefaultModel();
-    // Default to the model's own default effort ("max" on the 5.3 family,
-    // "on" otherwise) so out-of-the-box behaviour matches the pre-thought-level
-    // default (thinking on, no explicit reasoning_effort).
+    // Default to the model's own default effort ("max" on GLM-5.4 and the 5.3
+    // family, "on" otherwise) so out-of-the-box behaviour matches the
+    // pre-thought-level default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
     const lifecycle = new SessionLifecycle();

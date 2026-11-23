@@ -43,6 +43,17 @@ function imagePrompt() {
   return [{ type: "image" as const, data: "AAAA", mimeType: "image/png" }];
 }
 
+/**
+ * Open a session that sends `imagePrompt()` through Vision MCP. The default
+ * model accepts images natively and never reaches that path, so the session is
+ * put on the text-only glm-5.3.
+ */
+async function newVisionMcpSession(agent: GlmAcpAgent) {
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3" });
+  return { sessionId };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -755,7 +766,7 @@ test("cancelled delayed vision preprocessing settles without starting the model"
     sessionStore: null,
     glm: textGlm(() => { modelCalls += 1; }),
   });
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await newVisionMcpSession(agent);
   const prompt = agent.prompt({ sessionId, prompt: imagePrompt(), messageId: "cancelled-1" });
   await started;
   assert.equal(existsSync(sourcePath), true);
@@ -792,7 +803,7 @@ test("cancelled vision request defers materialized-image cleanup until it settle
     sessionStore: null,
     glm: textGlm(),
   });
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await newVisionMcpSession(agent);
   const prompt = agent.prompt({ sessionId, prompt: imagePrompt(), messageId: "defer-cleanup-1" });
   await started;
   await agent.cancel({ sessionId });
@@ -960,7 +971,7 @@ test("close waits for preprocessing cleanup before persisting and removing the s
     sessionStore,
     glm: textGlm(),
   });
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await newVisionMcpSession(agent);
   const prompt = agent.prompt({ sessionId, prompt: imagePrompt() });
   await prepStarted;
   const closing = agent.closeSession({ sessionId });
@@ -997,7 +1008,7 @@ test("a follow-up prompt starts after the cancelled image turn has fully unwound
     sessionStore: null,
     glm: textGlm(() => { modelCalls += 1; }),
   });
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await newVisionMcpSession(agent);
   const cancelled = agent.prompt({ sessionId, prompt: imagePrompt(), messageId: "first" });
   await new Promise((resolve) => setImmediate(resolve));
   await agent.cancel({ sessionId });

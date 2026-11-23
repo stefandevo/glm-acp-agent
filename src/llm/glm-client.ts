@@ -270,7 +270,7 @@ const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 /** Default GLM model when neither client nor user has chosen one. */
-export const DEFAULT_MODEL = "glm-5.3";
+export const DEFAULT_MODEL = "glm-5.4";
 
 /**
  * Curated list of GLM models the agent advertises to ACP clients via
@@ -288,19 +288,19 @@ export const DEFAULT_MODEL = "glm-5.3";
  * All of them remain selectable via `ACP_GLM_AVAILABLE_MODELS`.
  *
  * `glm-5.4` is served under its own name. A probe on 2026-11-23 confirmed that
- * the response echoes `"model": "glm-5.4"`. `glm-5.3` stays first and remains
- * the default. Newer models are listed after it.
+ * the response echoes `"model": "glm-5.4"`. It is the default and comes
+ * first, followed by the rest newest first.
  */
 const BUILTIN_AVAILABLE_MODELS: ModelInfo[] = [
-  {
-    modelId: "glm-5.3",
-    name: "GLM-5.3",
-    description: "1M-context coding model with thinking mode",
-  },
   {
     modelId: "glm-5.4",
     name: "GLM-5.4",
     description: "Newest flagship: native-vision 1M-context model with thinking mode",
+  },
+  {
+    modelId: "glm-5.3",
+    name: "GLM-5.3",
+    description: "1M-context coding model with thinking mode",
   },
   {
     modelId: "glm-5.3-flash",

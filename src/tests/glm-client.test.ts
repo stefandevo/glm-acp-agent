@@ -289,8 +289,8 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    // glm-5.4 sits after the default: the endpoint serves it under its own name.
-    assert.deepEqual(ids, ["glm-5.3", "glm-5.4", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]);
+    // glm-5.4 is the default and comes first; the rest follow newest first.
+    assert.deepEqual(ids, ["glm-5.4", "glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
@@ -307,11 +307,11 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   }
 });
 
-test("getDefaultModel returns glm-5.3 without an env override", () => {
+test("getDefaultModel returns glm-5.4 without an env override", () => {
   const old = process.env["ACP_GLM_MODEL"];
   delete process.env["ACP_GLM_MODEL"];
   try {
-    assert.equal(getDefaultModel(), "glm-5.3");
+    assert.equal(getDefaultModel(), "glm-5.4");
   } finally {
     if (old !== undefined) process.env["ACP_GLM_MODEL"] = old;
   }
