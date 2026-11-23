@@ -1466,7 +1466,7 @@ test("newSession advertises the model as a config option next to thought_level a
   const options = (model as { options: Array<{ value: string; name: string }> }).options;
   assert.deepEqual(
     options.map((o) => o.value),
-    ["glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]
+    ["glm-5.3", "glm-5.4", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]
   );
   // Names must match the models state so both surfaces read the same.
   assert.deepEqual(
@@ -1748,6 +1748,38 @@ test("thoughtLevel is forwarded to streamChat as reasoningEffort", async () => {
   await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
 
   assert.equal(seenEffort, "high");
+});
+
+test("switching to glm-5.4 keeps the effort ladder and the selected thought level", async () => {
+  const conn = createConnectionStub();
+  const seen: Array<{ model?: string; reasoningEffort?: string }> = [];
+  const glm = {
+    async *streamChat(
+      _messages: ReadonlyArray<{ role: string }>,
+      _signal?: AbortSignal,
+      options?: { model?: string; reasoningEffort?: string }
+    ): AsyncGenerator<GlmStreamChunk> {
+      seen.push({ model: options?.model, reasoningEffort: options?.reasoningEffort });
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" });
+
+  const result = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "glm-5.4" });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  const thoughtLevel = result.configOptions.find((o) => o.id === "thought_level")!;
+  assert.equal(thoughtLevel.currentValue, "medium");
+  assert.deepEqual(
+    (thoughtLevel as { options: Array<{ value: string }> }).options.map((o) => o.value),
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
+  );
+  assert.equal(result.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.4");
+  assert.deepEqual(seen, [{ model: "glm-5.4", reasoningEffort: "medium" }]);
 });
 
 test("thoughtLevel round-trips through fork via persistence", async () => {
@@ -2237,6 +2269,32 @@ test("reports context usage after each model request, not the summed turn total"
   assert.deepEqual(usageUpdates, [
     { sessionUpdate: "usage_update", used: 1050, size: getContextWindow("glm-5-turbo") },
     { sessionUpdate: "usage_update", used: 1230, size: getContextWindow("glm-5-turbo") },
+  ]);
+});
+
+test("usage_update reports the 1M context window on glm-5.4", async () => {
+  const conn = createConnectionStub();
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { usage: { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 } };
+      yield { text: "done" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.4" });
+
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  const usageUpdates = conn.updates
+    .map((entry) => entry["update"] as { sessionUpdate: string; used?: number; size?: number })
+    .filter((update) => update.sessionUpdate === "usage_update");
+  // A literal, not getContextWindow(): before glm-5.4 was catalogued this
+  // reported the 128K fallback.
+  assert.deepEqual(usageUpdates, [
+    { sessionUpdate: "usage_update", used: 1050, size: 1_000_000 },
   ]);
 });
 
@@ -3056,7 +3114,7 @@ test("prompt with image block runs Vision MCP preprocessing and feeds text into 
   assert.match(capturedUser as string, /<image_analysis index="1">[\s\S]*It is a kitten\.[\s\S]*<\/image_analysis>/);
 });
 
-for (const visionModel of ["glm-5v-turbo", "glm-5.3-flash"] as const) {
+for (const visionModel of ["glm-5v-turbo", "glm-5.3-flash", "glm-5.4"] as const) {
   test(`prompt with image block on ${visionModel} sends native image_url content`, async () => {
     const conn = createConnectionStub();
     let capturedUser: unknown;

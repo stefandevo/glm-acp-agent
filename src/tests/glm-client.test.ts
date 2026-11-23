@@ -289,7 +289,8 @@ test("getAvailableModels returns the Coding Plan allowlist by default", () => {
   delete process.env["ACP_GLM_AVAILABLE_MODELS"];
   try {
     const ids = getAvailableModels().map((m) => m.modelId);
-    assert.deepEqual(ids, ["glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]);
+    // glm-5.4 sits after the default: the endpoint serves it under its own name.
+    assert.deepEqual(ids, ["glm-5.3", "glm-5.4", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]);
     assert.ok(!ids.includes("glm-4v-plus"), "glm-4v-plus must not be advertised");
     assert.ok(!ids.includes("glm-4.6"), "glm-4.6 must not be advertised");
     assert.ok(!ids.includes("glm-4.5"), "glm-4.5 must not be advertised");
@@ -322,6 +323,11 @@ test("getContextWindow reports the 1M window for glm-5.3", () => {
 
 test("getContextWindow reports the 1M window for glm-5.3-flash", () => {
   assert.equal(getContextWindow("glm-5.3-flash"), 1_000_000);
+});
+
+test("getContextWindow reports the 1M window for glm-5.4", () => {
+  // Without this entry the usage_update size fell back to the 128K default.
+  assert.equal(getContextWindow("glm-5.4"), 1_000_000);
 });
 
 test("getContextWindow reports the 1M window for glm-5.2", () => {
@@ -379,6 +385,25 @@ test("streamChat sends reasoning_effort when level is set on glm-5.3", async () 
       void chunk;
     }
 
+    assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
+    assert.equal(requestBody?.["reasoning_effort"], effort);
+  }
+});
+
+test("streamChat sends reasoning_effort when level is set on glm-5.4", async () => {
+  const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  for (const effort of ["max", "medium", "minimal", "xhigh"] as const) {
+    for await (const chunk of c.streamChat([], undefined, { model: "glm-5.4", reasoningEffort: effort })) {
+      void chunk;
+    }
+
+    assert.equal(requestBody?.["model"], "glm-5.4");
     assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
     assert.equal(requestBody?.["reasoning_effort"], effort);
   }
@@ -459,6 +484,10 @@ test("getThoughtLevels omits none for reasoning-effort models", () => {
   // — including the fact that "Off" would not actually turn thinking off.
   assert.deepEqual(getThoughtLevels("glm-5.2"), ladder);
   assert.deepEqual(getThoughtLevels("glm-5.1"), ladder);
+  // glm-5.4 is its own model and answers the ladder the same way as glm-5.3:
+  // `disabled` and `reasoning_effort: "none"` both leave it reasoning.
+  assert.deepEqual(getThoughtLevels("glm-5.4"), ladder);
+  assert.deepEqual(getThoughtLevels("GLM-5.4"), ladder);
 });
 
 test("getThoughtLevels advertises only low/high/max for glm-5.3-flash", () => {
@@ -482,14 +511,17 @@ test("resolveThoughtLevel clamps invalid levels to the model default", () => {
   assert.equal(resolveThoughtLevel("glm-5.3", "high"), "high");
   assert.equal(resolveThoughtLevel("glm-5.3", "minimal"), "minimal");
   assert.equal(resolveThoughtLevel("glm-5.3", "xhigh"), "xhigh");
+  assert.equal(resolveThoughtLevel("glm-5.4", "high"), "high");
   assert.equal(resolveThoughtLevel("glm-4.7", "none"), "none");
 });
 
-test("resolveThoughtLevel clamps a persisted none up to max on glm-5.3", () => {
+test("resolveThoughtLevel clamps a persisted none up to max on glm-5.3 and glm-5.4", () => {
   // A session saved on a model where "Off" was valid must still load cleanly
   // when switched to glm-5.3, which has no "none" level.
   assert.equal(resolveThoughtLevel("glm-5.3", "none"), "max");
   assert.equal(resolveThoughtLevel("glm-5.3", "on"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.4", "none"), "max");
+  assert.equal(resolveThoughtLevel("glm-5.4", "on"), "max");
 });
 
 test("resolveThoughtLevel maps the 5.3 ladder onto Flash's three levels", () => {
@@ -555,6 +587,27 @@ test("buildThinkingParams attaches reasoning_effort on glm-5.3", () => {
   }
 });
 
+test("buildThinkingParams attaches reasoning_effort on glm-5.4", () => {
+  const old = process.env["ACP_GLM_THINKING"];
+  delete process.env["ACP_GLM_THINKING"];
+  try {
+    // No level: thinking is enabled and the model default (max) applies.
+    assert.deepEqual(buildThinkingParams("glm-5.4"), { thinking: { type: "enabled" } });
+    for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+      assert.deepEqual(buildThinkingParams("glm-5.4", level), {
+        thinking: { type: "enabled" },
+        reasoning_effort: level,
+      });
+    }
+    assert.deepEqual(buildThinkingParams("glm-5.4", "on"), { thinking: { type: "enabled" } });
+    // glm-5.4 keeps reasoning at about its low level when asked to stop, so
+    // a persisted `none` must not turn into `thinking.type: "disabled"`.
+    assert.deepEqual(buildThinkingParams("glm-5.4", "none"), { thinking: { type: "enabled" } });
+  } finally {
+    if (old !== undefined) process.env["ACP_GLM_THINKING"] = old;
+  }
+});
+
 test("buildThinkingParams never emits reasoning_effort='none' when thinking is force-enabled", () => {
   const old = process.env["ACP_GLM_THINKING"];
   process.env["ACP_GLM_THINKING"] = "true";
@@ -613,7 +666,8 @@ test("buildThinkingParams does not send thinking.type=disabled on GLM-5.3 family
   process.env["ACP_GLM_THINKING"] = "false";
   try {
     // Latest Z.AI docs: thinking.type: "disabled" errors on GLM-5.3 / Flash.
-    for (const model of ["glm-5.3", "glm-5.3-flash"]) {
+    // GLM-5.4 accepts it but keeps reasoning, so it must not be sent there.
+    for (const model of ["glm-5.3", "glm-5.3-flash", "glm-5.4"]) {
       const params = buildThinkingParams(model, "max");
       assert.notDeepEqual(
         params["thinking"],
@@ -629,7 +683,9 @@ test("buildThinkingParams does not send thinking.type=disabled on GLM-5.3 family
   }
 });
 
-test("isVisionNativeModel is true for Flash and glm-5v-turbo only", () => {
+test("isVisionNativeModel is true for glm-5.4, Flash and glm-5v-turbo only", () => {
+  assert.equal(isVisionNativeModel("glm-5.4"), true);
+  assert.equal(isVisionNativeModel("GLM-5.4"), true);
   assert.equal(isVisionNativeModel("glm-5.3-flash"), true);
   assert.equal(isVisionNativeModel("GLM-5.3-Flash"), true);
   assert.equal(isVisionNativeModel("glm-5v-turbo"), true);
