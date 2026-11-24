@@ -15,6 +15,8 @@ const SUPPORTED_SCHEMA_KEYWORDS = new Set([
   "maximum",
   "items",
   "description",
+  "minItems",
+  "maxItems",
 ]);
 
 const BUILTIN_SCHEMAS = new Map(
@@ -32,7 +34,7 @@ function unsupportedKeyword(schema: unknown, path: string): string | undefined {
   }
   if (
     schema["type"] !== undefined &&
-    !["object", "array", "string", "number", "integer"].includes(schema["type"] as string)
+    !["object", "array", "string", "number", "integer", "boolean"].includes(schema["type"] as string)
   ) {
     return `${path} uses unsupported schema type \`${String(schema["type"])}\`.`;
   }
@@ -76,7 +78,8 @@ function validateSchema(value: unknown, schema: unknown, path: string): string |
       (type === "array" && Array.isArray(value)) ||
       (type === "string" && typeof value === "string") ||
       (type === "number" && typeof value === "number" && Number.isFinite(value)) ||
-      (type === "integer" && typeof value === "number" && Number.isFinite(value) && Number.isInteger(value));
+      (type === "integer" && typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)) ||
+      (type === "boolean" && typeof value === "boolean");
     if (!valid) return typeError(path, String(type));
   }
 
@@ -88,6 +91,12 @@ function validateSchema(value: unknown, schema: unknown, path: string): string |
   }
   if (typeof schema["maximum"] === "number" && typeof value === "number" && value > schema["maximum"]) {
     return `${path} must be at most ${schema["maximum"]}.`;
+  }
+  if (typeof schema["minItems"] === "number" && Array.isArray(value) && value.length < schema["minItems"]) {
+    return `${path} must have at least ${schema["minItems"]} items.`;
+  }
+  if (typeof schema["maxItems"] === "number" && Array.isArray(value) && value.length > schema["maxItems"]) {
+    return `${path} must have at most ${schema["maxItems"]} items.`;
   }
 
   if (isRecord(value) && isRecord(schema["properties"])) {

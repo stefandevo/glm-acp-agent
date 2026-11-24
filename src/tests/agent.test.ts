@@ -3396,7 +3396,7 @@ test("advertised tool definitions include edit_file alongside the core tools", a
   )
     .availableToolDefinitions()
     .map((tool) => tool.function.name);
-  for (const expected of ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command"]) {
+  for (const expected of ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "ask_user_question"]) {
     assert.ok(names.includes(expected), `expected advertised tool ${expected}`);
   }
 });

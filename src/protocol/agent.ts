@@ -2531,7 +2531,7 @@ export class GlmAcpAgent implements Agent {
   }
 
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
-    const names = ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "web_search", "web_reader"];
+    const names = ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "web_search", "web_reader", "ask_user_question"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
       names.push("image_analysis");
     }
