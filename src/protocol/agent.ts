@@ -515,9 +515,9 @@ export class GlmAcpAgent implements Agent {
     };
 
     const model = getDefaultModel();
-    // Default to the model's own default effort ("max" on the 5.3 family,
-    // "on" otherwise) so out-of-the-box behaviour matches the pre-thought-level
-    // default (thinking on, no explicit reasoning_effort).
+    // Default to the model's own default effort ("max" on GLM-5.4 and the 5.3
+    // family, "on" otherwise) so out-of-the-box behaviour matches the
+    // pre-thought-level default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
     const lifecycle = new SessionLifecycle();
@@ -953,7 +953,8 @@ export class GlmAcpAgent implements Agent {
 
       // Convert ACP content blocks into a GLM user message. Most models receive
       // plain text, with images preprocessed through Vision MCP. Native vision
-      // models receive OpenAI-style multimodal content parts directly.
+      // models receive OpenAI-style multimodal content parts when the prompt
+      // carries a supported image, and the same plain text otherwise.
       if (isDebugEnabled()) {
         for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
           debug(line);
@@ -2613,9 +2614,18 @@ function renderPromptBlocks(blocks: ReadonlyArray<PromptRequest["prompt"][number
   return { content: plainText, plainText };
 }
 
+/**
+ * Render a list of ACP content blocks for a native-vision model.
+ *
+ * A supported image becomes an `image_url` part next to the text. That is the
+ * only case that needs multimodal content. A prompt without one is returned as
+ * the same plain string that `renderPromptBlocks` gives every other model, so
+ * a text-only request keeps its shape when a session moves between a text-only
+ * and a native-vision model, or when the default model changes.
+ */
 function renderVisionNativePromptBlocks(
   blocks: ReadonlyArray<PromptRequest["prompt"][number]>
-): ChatCompletionContentPart[] {
+): ChatCompletionContentPart[] | string {
   const content: ChatCompletionContentPart[] = [];
   let imageIndex = 0;
 
@@ -2661,6 +2671,12 @@ function renderVisionNativePromptBlocks(
     }
   }
 
+  if (!content.some((part) => part.type === "image_url")) {
+    // Every remaining part is a text part (see pushText above).
+    return content
+      .map((part) => (part as Extract<ChatCompletionContentPart, { type: "text" }>).text)
+      .join("\n");
+  }
   return content;
 }
 

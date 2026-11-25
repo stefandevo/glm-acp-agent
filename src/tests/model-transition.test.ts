@@ -37,8 +37,11 @@ for (const entry of ["legacy", "config"]) {
       await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
       assert.equal(requests.at(-1)?.model, "glm-5.3-flash");
       assert.ok(requests.at(-1)?.messages.some(message => message.role === "user" && Array.isArray(message.content) && message.content.some(part => part.type === "image_url")));
-      await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5v-turbo" });
-      assert.equal(store.load(sessionId)?.model, "glm-5v-turbo");
+      // glm-5.4 accepts images too, so the retained native images may move to it.
+      for (const nativeModel of ["glm-5v-turbo", "glm-5.4"]) {
+        await agent.unstable_setSessionModel({ sessionId, modelId: nativeModel });
+        assert.equal(store.load(sessionId)?.model, nativeModel);
+      }
     } finally {
       await agent.closeSession({ sessionId });
       rmSync(cwd, { recursive: true, force: true });

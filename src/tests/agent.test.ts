@@ -1340,8 +1340,8 @@ test("newSession returns configOptions with thought_level selector for default m
   const tl = result.configOptions!.find((o) => o.category === "thought_level");
   assert.ok(tl, "thought_level option should exist");
   assert.equal(tl!.type, "select");
-  // Default model is glm-5.3 → the full effort ladder, defaulting to max.
-  // There is no "Off" level because thinking cannot be disabled on 5.3.
+  // Default model is glm-5.4 → the full effort ladder, defaulting to max.
+  // There is no "Off" level because thinking cannot be disabled on 5.4.
   assert.equal(tl!.currentValue, "max");
   const options = (tl as { options: Array<{ value: string; name: string }> }).options;
   assert.deepEqual(
@@ -1413,7 +1413,7 @@ test("setSessionConfigOption rejects values that aren't a known thought level", 
     agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "ultra" }),
     /Invalid thought_level value/
   );
-  // A mid-ladder value is valid on the default glm-5.3 and sticks.
+  // A mid-ladder value is valid on the default glm-5.4 and sticks.
   const ok = await agent.setSessionConfigOption({
     sessionId,
     configId: "thought_level",
@@ -1428,7 +1428,7 @@ test("switching model updates thought_level options via config_option_update", a
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-  // Start with glm-5.3 (default) → max, options = the full effort ladder.
+  // Start on glm-5.4 (default) → max, options = the full effort ladder.
   // Switch to glm-4.7 → thoughtLevel should resolve to "on".
   await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
@@ -1461,12 +1461,12 @@ test("newSession advertises the model as a config option next to thought_level a
   assert.equal(model!.category, "model");
   assert.equal(model!.type, "select");
   assert.equal(model!.name, "Model");
-  // Default model is glm-5.3.
-  assert.equal(model!.currentValue, "glm-5.3");
+  // Default model is glm-5.4.
+  assert.equal(model!.currentValue, "glm-5.4");
   const options = (model as { options: Array<{ value: string; name: string }> }).options;
   assert.deepEqual(
     options.map((o) => o.value),
-    ["glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]
+    ["glm-5.4", "glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"]
   );
   // Names must match the models state so both surfaces read the same.
   assert.deepEqual(
@@ -1530,7 +1530,7 @@ test("setSessionConfigOption rejects values that aren't a model id at all", asyn
     configId: "thought_level",
     value: "high",
   });
-  assert.equal(after.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.3");
+  assert.equal(after.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.4");
 });
 
 test("a model set via session/set_model shows up in the next configOptions payload", async () => {
@@ -1750,6 +1750,43 @@ test("thoughtLevel is forwarded to streamChat as reasoningEffort", async () => {
   assert.equal(seenEffort, "high");
 });
 
+test("switching between glm-5.3 and glm-5.4 keeps the effort ladder and the selected thought level", async () => {
+  const conn = createConnectionStub();
+  const seen: Array<{ model?: string; reasoningEffort?: string }> = [];
+  const glm = {
+    async *streamChat(
+      _messages: ReadonlyArray<{ role: string }>,
+      _signal?: AbortSignal,
+      options?: { model?: string; reasoningEffort?: string }
+    ): AsyncGenerator<GlmStreamChunk> {
+      seen.push({ model: options?.model, reasoningEffort: options?.reasoningEffort });
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.setSessionConfigOption({ sessionId, configId: "thought_level", value: "medium" });
+
+  // Both models offer the same six-level ladder, so the level survives the
+  // round trip instead of being clamped.
+  const onGlm53 = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "glm-5.3" });
+  const backOnGlm54 = await agent.setSessionConfigOption({ sessionId, configId: "model", value: "glm-5.4" });
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  for (const result of [onGlm53, backOnGlm54]) {
+    const thoughtLevel = result.configOptions.find((o) => o.id === "thought_level")!;
+    assert.equal(thoughtLevel.currentValue, "medium");
+    assert.deepEqual(
+      (thoughtLevel as { options: Array<{ value: string }> }).options.map((o) => o.value),
+      ["minimal", "low", "medium", "high", "xhigh", "max"]
+    );
+  }
+  assert.equal(backOnGlm54.configOptions.find((o) => o.id === "model")!.currentValue, "glm-5.4");
+  assert.deepEqual(seen, [{ model: "glm-5.4", reasoningEffort: "medium" }]);
+});
+
 test("thoughtLevel round-trips through fork via persistence", async () => {
   const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-thoughtlevel-"));
   try {
@@ -1784,7 +1821,7 @@ test("model switch persists model + clamped thoughtLevel before any prompt (fork
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
     const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
-    // Switch model with no prompt in between: glm-5.3/max → glm-4.7, which
+    // Switch model with no prompt in between: glm-5.4/max → glm-4.7, which
     // clamps the level to "on". Both must survive a fork that reads from disk.
     await agent.unstable_setSessionModel({ sessionId, modelId: "glm-4.7" });
 
@@ -2237,6 +2274,32 @@ test("reports context usage after each model request, not the summed turn total"
   assert.deepEqual(usageUpdates, [
     { sessionUpdate: "usage_update", used: 1050, size: getContextWindow("glm-5-turbo") },
     { sessionUpdate: "usage_update", used: 1230, size: getContextWindow("glm-5-turbo") },
+  ]);
+});
+
+test("usage_update reports the 1M context window on glm-5.4", async () => {
+  const conn = createConnectionStub();
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { usage: { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 } };
+      yield { text: "done" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  // glm-5.4 is the default, so a new session already runs on it.
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+  const usageUpdates = conn.updates
+    .map((entry) => entry["update"] as { sessionUpdate: string; used?: number; size?: number })
+    .filter((update) => update.sessionUpdate === "usage_update");
+  // A literal, not getContextWindow(): before glm-5.4 was catalogued this
+  // reported the 128K fallback.
+  assert.deepEqual(usageUpdates, [
+    { sessionUpdate: "usage_update", used: 1050, size: 1_000_000 },
   ]);
 });
 
@@ -3039,6 +3102,8 @@ test("prompt with image block runs Vision MCP preprocessing and feeds text into 
   const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  // Vision MCP is the path for text-only models. The default takes images natively.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3" });
 
   await agent.prompt({
     sessionId,
@@ -3056,7 +3121,7 @@ test("prompt with image block runs Vision MCP preprocessing and feeds text into 
   assert.match(capturedUser as string, /<image_analysis index="1">[\s\S]*It is a kitten\.[\s\S]*<\/image_analysis>/);
 });
 
-for (const visionModel of ["glm-5v-turbo", "glm-5.3-flash"] as const) {
+for (const visionModel of ["glm-5v-turbo", "glm-5.3-flash", "glm-5.4"] as const) {
   test(`prompt with image block on ${visionModel} sends native image_url content`, async () => {
     const conn = createConnectionStub();
     let capturedUser: unknown;
@@ -3160,13 +3225,10 @@ test("prompt with unsupported image MIME on vision-native model emits an inline 
     ],
   });
 
-  assert.ok(Array.isArray(capturedUser));
-  const text = capturedUser
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-  assert.match(text, /<image_unsupported_format index="1" mime="image\/webp">/);
-  assert.match(text, /image\/jpeg, image\/jpg, image\/png/);
+  // No image part survives, so the prompt goes out as one plain string.
+  assert.equal(typeof capturedUser, "string");
+  assert.match(capturedUser as string, /^Describe\n<image_unsupported_format index="1" mime="image\/webp">/);
+  assert.match(capturedUser as string, /image\/jpeg, image\/jpg, image\/png/);
 });
 
 test("prompt with image block but no vision client falls back to a text annotation", async () => {
@@ -3185,6 +3247,8 @@ test("prompt with image block but no vision client falls back to a text annotati
   const agent = new GlmAcpAgent(conn as never, { glm, visionClient: null, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  // Vision MCP is the path for text-only models. The default takes images natively.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3" });
 
   await agent.prompt({
     sessionId,
@@ -3217,6 +3281,8 @@ test("Vision MCP failures degrade gracefully without aborting the prompt", async
   const agent = new GlmAcpAgent(conn as never, { glm, visionClient, sessionStore: null });
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  // Vision MCP is the path for text-only models. The default takes images natively.
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3" });
 
   const result = await agent.prompt({
     sessionId,
@@ -3252,6 +3318,33 @@ test("prompt without image blocks keeps content as a plain string", async () => 
   assert.equal(typeof captured, "string");
   assert.equal(captured, "hello");
 });
+
+for (const visionModel of ["glm-5.3-flash", "glm-5v-turbo"] as const) {
+  test(`prompt without image blocks keeps content as a plain string on ${visionModel}`, async () => {
+    const conn = createConnectionStub();
+    let captured: unknown;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        const userMsg = messages.find((m) => m.role === "user");
+        captured = userMsg?.content;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.unstable_setSessionModel({ sessionId, modelId: visionModel });
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+
+    // A native-vision model only needs content parts when an image is present.
+    assert.equal(typeof captured, "string");
+    assert.equal(captured, "hello");
+  });
+}
 
 test("invalid maxTurns falls back to the default", async () => {
   const conn = createConnectionStub();
@@ -4150,6 +4243,8 @@ test("prompt expands a /command that follows a non-text block", async () => {
       visionClient: null,
     });
     const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    // Vision MCP is the path for text-only models. The default takes images natively.
+    await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3" });
 
     // A client may put a pasted image ahead of the typed text; the command is
     // still what the user wrote.
@@ -4163,6 +4258,46 @@ test("prompt expands a /command that follows a non-text block", async () => {
 
     assert.match(ref.value, /The user invoked the \/deploy command/);
     assert.match(ref.value, /Run the deploy playbook\./);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a /command after an image block also expands on the default native-vision model", async () => {
+  const { cwd, cleanup } = makeTempCwd(COMMAND_FIXTURE);
+  try {
+    const conn = createConnectionStub();
+    let capturedUser: unknown;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        const userMsg = [...messages].reverse().find((m) => m.role === "user");
+        capturedUser = userMsg?.content;
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null, visionClient: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    await agent.prompt({
+      sessionId,
+      prompt: [
+        { type: "image", mimeType: "image/png", data: "aGk=" },
+        { type: "text", text: "/deploy staging" },
+      ],
+    });
+
+    // The image travels as a native part and the command still expands.
+    assert.ok(Array.isArray(capturedUser));
+    assert.ok(capturedUser.some((part) => part.type === "image_url"));
+    const text = capturedUser
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    assert.match(text, /The user invoked the \/deploy command/);
+    assert.match(text, /Run the deploy playbook\./);
   } finally {
     cleanup();
   }

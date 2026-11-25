@@ -1,6 +1,6 @@
 # glm-acp-agent
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.3, GLM-5.3 Flash, GLM-5 Turbo, GLM-4.7) as its reasoning core.
+An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written in TypeScript that uses the **Z.AI / Zhipu AI GLM** model family (GLM-5.4, GLM-5.3, GLM-5.3 Flash, GLM-5 Turbo, GLM-4.7) as its reasoning core.
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
@@ -35,7 +35,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
-- **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.3-flash` sends supported pasted ACP image blocks directly as native `image_url` content parts, while the other advertised coding models (including default `glm-5.3`) route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
+- **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.4` and `glm-5.3-flash` send supported pasted ACP image blocks directly as native `image_url` content parts, while `glm-5.3`, `glm-5-turbo` and `glm-4.7` route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Nine built-in tools** (see below)
 - **Self-sufficient local tools** – directory listings and shell commands always run in the agent process; file tools fall back to local filesystem access when ACP client `fs` capabilities are unavailable
@@ -302,7 +302,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
-| `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
+| `ACP_GLM_MODEL` | No | `glm-5.4` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
@@ -342,10 +342,15 @@ The agent advertises only the models on the current Z.AI Coding Plan allowlist:
 
 | Model | Notes |
 |-------|-------|
-| `glm-5.3` | **Default.** Newest 1M-context coding model; thinking mode always on; text-only (images go through Vision MCP) |
+| `glm-5.4` | **Default.** Newest flagship. Native-vision 1M-context model; thinking mode always on; 128K maximum output |
+| `glm-5.3` | Previous default. 1M-context coding model; thinking mode always on; text-only (images go through Vision MCP) |
 | `glm-5.3-flash` | Native-vision 1M-context model; cheaper Coding Plan quota |
 | `glm-5-turbo` | Faster Coding Plan reasoning model; 128K context |
 | `glm-4.7` | 200K-context reasoning model |
+
+New sessions start on `glm-5.4`. Set `ACP_GLM_MODEL=glm-5.3` to start them on the previous default. A loaded or resumed session keeps the model it was saved with.
+
+The Coding Plan endpoint serves `glm-5.4` under its own name. A request for it comes back with `"model": "glm-5.4"`. Its 1M context, 128K maximum output and image input come from Z.AI's [GLM-5.4 model page](https://docs.z.ai/guides/llm/glm-5.4). Use the plain id in `ACP_GLM_MODEL` and `ACP_GLM_AVAILABLE_MODELS`. Z.AI's Claude Code guide writes the model as `glm-5.4[1m]`, but the OpenAI-compatible Coding Plan endpoint rejects that form with business code `1211` ("Unknown Model").
 
 Only models the Coding Plan endpoint serves **under their own name** are advertised. Several ids that used to be listed are now aliases: a request for `glm-5.2` or `glm-5.1` comes back with `"model": "glm-5.3"`, and `glm-4.5-air` comes back as `glm-4.7`. They still work, but advertising them would report a model you are not actually talking to. Z.AI's Coding Plan overview currently also claims `glm-5-turbo` and `glm-4.7` requests are routed to GLM-5.3-Flash; that has not been confirmed by a live probe here, so both ids stay in the picker. `glm-5v-turbo` is no longer on the Coding Plan allowlist — selecting it fails with business code `1311` ("subscription plan does not yet include access").
 
@@ -353,9 +358,9 @@ The `usage_update` context size comes from a built-in per-model table; ids outsi
 
 `ACP_GLM_AVAILABLE_MODELS` lets you advertise any id you like, including the ones above. Custom ids sit outside the supported Coding Plan list — the endpoint rejects any model code Z.AI hasn't whitelisted (business code `1211`). The native-vision path is unchanged, so if your plan does include `glm-5v-turbo`, add it back with `ACP_GLM_AVAILABLE_MODELS` and image blocks still reach it as native `image_url` content parts.
 
-Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. `glm-5.3-flash` is the built-in native-vision Coding Plan model (`image_url` content parts). Default `glm-5.3`, `glm-5-turbo`, and `glm-4.7` still use the [Vision MCP](#vision-mcp) path. `glm-5v-turbo`, when re-added via the override above, keeps native `image_url` handling as an opt-in exception.
+Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. `glm-5.4` and `glm-5.3-flash` are the built-in native-vision Coding Plan models (`image_url` content parts). `glm-5.3`, `glm-5-turbo`, and `glm-4.7` still use the [Vision MCP](#vision-mcp) path. `glm-5v-turbo`, when re-added via the override above, keeps native `image_url` handling as an opt-in exception.
 
-When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5.3-flash` and `glm-5v-turbo`. `ACP_GLM_THINKING=false` asks for plain completions on models that still accept `thinking.type: "disabled"` (GLM-4.7, GLM-5 Turbo). On GLM-5.3 and GLM-5.3-Flash the flag is a no-op: those models reject `disabled`, so the agent leaves thinking enabled rather than sending it (see [Thought level](#thought-level-reasoning-effort) below).
+When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5.3-flash` and `glm-5v-turbo`. `ACP_GLM_THINKING=false` asks for plain completions on models that still accept `thinking.type: "disabled"` (GLM-4.7, GLM-5 Turbo). On GLM-5.4, GLM-5.3 and GLM-5.3-Flash the flag is a no-op: GLM-5.3 and Flash reject `disabled`, and GLM-5.4 accepts it but keeps reasoning, so the agent leaves thinking enabled rather than sending it (see [Thought level](#thought-level-reasoning-effort) below).
 
 The provider stream itself is guarded against stalls. The Z.AI SDK's HTTP timeout only covers waiting for response headers — a response whose body stops mid-stream would otherwise hang the turn forever. The agent therefore aborts a provider stream read that produces no data for `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` milliseconds (default `300000`; invalid values for the variable fall back to the default with a stderr warning). On timeout, whatever partial output already reached the user is kept, an `[error]` message is appended as an agent message, the turn ends, and the last valid on-disk session checkpoint is preserved. A slow ACP client back-pressuring chunks it already received does not trip the watchdog — only silence from the provider between reads does.
 
@@ -376,14 +381,17 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 | Model | Levels | Mapping to the Z.AI request |
 |-------|--------|-----------------------------|
 | `glm-5.3` (and `glm-5.2` / `glm-5.1`, which route to 5.3) | `Minimal` / `Low` / `Medium` / `High` / `X-High` / `Max` | `thinking: { type: "enabled" }` + `reasoning_effort` set to the matching value |
+| `glm-5.4` | `Minimal` / `Low` / `Medium` / `High` / `X-High` / `Max` | Same mapping |
 | `glm-5.3-flash` | `Low` / `High` / `Max` | Same mapping; Z.AI only documents these three levels for Flash |
 | other thinking-capable models | `Off` / `On` | `Off` → `thinking: { type: "disabled" }`; `On` → `thinking: { type: "enabled" }` |
 
-**GLM-5.3 and GLM-5.3-Flash have no `Off` level, because thinking cannot be turned off on them.** Sending `thinking: { type: "disabled" }` now errors (it is no longer a silent no-op), so `ACP_GLM_THINKING=false` leaves thinking enabled rather than sending `disabled`. Use `glm-4.7` if you need non-reasoning completions — with the caveat that if Coding Plan really routes turbo/4.7 to Flash, a session that picks `glm-4.7` + thought level `Off` may 4xx.
+**GLM-5.4, GLM-5.3 and GLM-5.3-Flash have no `Off` level, because thinking cannot be turned off on them.** On GLM-5.3 and GLM-5.3-Flash, sending `thinking: { type: "disabled" }` now errors (it is no longer a silent no-op). GLM-5.4 accepts `disabled` and `reasoning_effort: "none"` without an error, but still reasons at about its `Low` level. On all three the agent leaves thinking enabled rather than sending `disabled`, so `ACP_GLM_THINKING=false` is a no-op. Use `glm-4.7` if you need non-reasoning completions — with the caveat that if Coding Plan really routes turbo/4.7 to Flash, a session that picks `glm-4.7` + thought level `Off` may 4xx.
 
-`reasoning_effort` only takes effect on the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (an effort-ladder selection reverts to `On` when you move to GLM-4.7; an `Off` selection becomes `Max` on GLM-5.3 / Flash; switching from GLM-5.3 onto Flash maps `minimal`→`low`, `medium`→`high`, `xhigh`→`max`) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
+`reasoning_effort` takes effect on GLM-5.4 and the GLM-5.3 family; `glm-5-turbo` and `glm-4.7` accept the field without validating it and answer identically either way, so the agent omits it for them. New sessions default to `Max`, which is also Z.AI's default when the field is omitted, so out-of-the-box behaviour is unchanged. Switching models re-clamps the level (an effort-ladder selection reverts to `On` when you move to GLM-4.7; an `Off` selection becomes `Max` on GLM-5.4 / GLM-5.3 / Flash; switching from GLM-5.3 onto Flash maps `minimal`→`low`, `medium`→`high`, `xhigh`→`max`) and pushes a `config_option_update`. Clients that don't support config options simply ignore the advertised option and get the default behaviour.
 
 The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max` on GLM-5.3. GLM-5.3-Flash's documented values are only `low | high | max`, so the agent advertises that shorter ladder for Flash. `none` is never offered on either model.
+
+GLM-5.4 does not validate `reasoning_effort`. An unknown value returns HTTP 200 and runs at the default level, `max`. A probe on 2026-11-23 with 16 samples per level found that GLM-5.4 and GLM-5.3 respond to the ladder the same way: `minimal` behaved like `low`, `xhigh` like `max`, and `low`, `medium` and `high` each produced a distinct reasoning budget. The agent therefore advertises the full ladder for GLM-5.4 too.
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 
@@ -391,9 +399,9 @@ Switching to a text-only model is rejected while retained conversation history c
 
 ### Vision MCP
 
-For `glm-5.3-flash` (built-in) and `glm-5v-turbo` (opt-in via `ACP_GLM_AVAILABLE_MODELS`), pasted ACP image blocks with `image/jpeg`, `image/jpg`, or `image/png` are sent directly to chat completions as `image_url` content parts. HTTPS image URLs are forwarded as URLs; inline base64 data is sent as a `data:<mime>;base64,...` URI. Unsupported image MIME types are rejected client-side with an inline `<image_unsupported_format>` annotation so the prompt can continue without a provider 4xx.
+For `glm-5.4` and `glm-5.3-flash` (built-in) and `glm-5v-turbo` (opt-in via `ACP_GLM_AVAILABLE_MODELS`), pasted ACP image blocks with `image/jpeg`, `image/jpg`, or `image/png` are sent directly to chat completions as `image_url` content parts. A prompt without a supported image is sent as plain text, the same as on every other model. HTTPS image URLs are forwarded as URLs; inline base64 data is sent as a `data:<mime>;base64,...` URI. Unsupported image MIME types are rejected client-side with an inline `<image_unsupported_format>` annotation so the prompt can continue without a provider 4xx.
 
-For non-native models (including default `glm-5.3`), pasted ACP image blocks are not sent to the chat-completions endpoint. Instead, the agent boots `@z_ai/mcp-server` over stdio (via `npx -y @z_ai/mcp-server@latest`) and calls its `image_analysis` tool. The text result is spliced into the user message as `<image_analysis index="N">…</image_analysis>` so the regular Coding Plan model can reason about it.
+For non-native models (`glm-5.3`, `glm-5-turbo` and `glm-4.7`), pasted ACP image blocks are not sent to the chat-completions endpoint. Instead, the agent boots `@z_ai/mcp-server` over stdio (via `npx -y @z_ai/mcp-server@latest`) and calls its `image_analysis` tool. The text result is spliced into the user message as `<image_analysis index="N">…</image_analysis>` so the regular Coding Plan model can reason about it.
 
 Prerequisites:
 
