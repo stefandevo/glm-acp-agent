@@ -131,6 +131,10 @@ test("buildAskElicitation renders one question as a titled enum", () => {
   assert.equal(oneOf[0]["description"], "The de facto standard.");
   const custom = properties["question_0_custom"];
   assert.equal(custom["title"], "Other");
+  // the marker the claude-agent-acp adapter sets, so clients recognize the box
+  assert.deepEqual(custom["_meta"], {
+    _askUserQuestionCustomAnswer: { questionId: "question_0", isCustomAnswer: true },
+  });
   assert.equal(schema["required"], undefined);
 });
 
@@ -243,7 +247,7 @@ test("without elicitation a single question becomes permission buttons", async (
   assert.equal(options.at(-1)?.["name"], "None of these");
 });
 
-test("the permission fallback reads a decline or dismissal as skipped", async () => {
+test("the permission fallback reads a decline or dismissal as dismissed", async () => {
   for (const response of [
     { outcome: { outcome: "selected", optionId: ASK_DECLINE_OPTION_ID } },
     { outcome: { outcome: "cancelled" } },
@@ -252,7 +256,10 @@ test("the permission fallback reads a decline or dismissal as skipped", async ()
     const exec = new ToolExecutor(conn as never, "s1", {});
     const result = await exec.execute("t1", "ask_user_question", JSON.stringify(SINGLE_ARGS));
     assert.equal(result.outcome, "completed");
-    assert.deepEqual(JSON.parse(result.content), { answers: {} });
+    assert.deepEqual(JSON.parse(result.content), {
+      answers: {},
+      annotations: { [QUESTION_TEXT]: { unanswered: "dismissed" } },
+    });
   }
 });
 
@@ -262,6 +269,25 @@ test("without elicitation a multi-select tells the model to ask in text", async 
   const result = await exec.execute("t1", "ask_user_question", JSON.stringify(MULTI_ARGS));
   assert.equal(conn.permissionRequests.length, 0);
   assert.match(result.content, /cannot show questions interactively/);
-  const last = conn.updates.at(-1) as { update: Record<string, unknown> };
-  assert.equal(last.update["status"], "failed");
+  // the pending card was announced, so the failure closes it instead of
+  // emitting a second tool_call for the same id
+  const updates = conn.updates.map((update) => update["update"] as Record<string, unknown>);
+  assert.deepEqual(
+    updates.map((update) => `${update["sessionUpdate"]}:${update["status"]}`),
+    ["tool_call:pending", "tool_call_update:failed"]
+  );
+});
+
+test("a transport failure closes the announced card", async () => {
+  const conn = askConnection(() => {
+    throw new Error("connection reset");
+  });
+  const exec = new ToolExecutor(conn as never, "s1", FORM_CAPS);
+  const result = await exec.execute("t1", "ask_user_question", JSON.stringify(SINGLE_ARGS));
+  assert.match(result.content, /could not present the question to the user: connection reset/);
+  const updates = conn.updates.map((update) => update["update"] as Record<string, unknown>);
+  assert.deepEqual(
+    updates.map((update) => `${update["sessionUpdate"]}:${update["status"]}`),
+    ["tool_call:pending", "tool_call_update:failed"]
+  );
 });

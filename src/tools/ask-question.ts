@@ -80,6 +80,15 @@ export function parseAskQuestions(args: Record<string, unknown>): AskQuestion[] 
 type TitledOption = EnumOption & { description?: string };
 
 /**
+ * The custom-answer field carries the same `_meta` marker the current
+ * claude-agent-acp adapter sets, so a client can recognize the Other box
+ * across agents.
+ */
+type CustomAnswerField = ElicitationPropertySchema & {
+  _meta?: Record<string, unknown>;
+};
+
+/**
  * The `elicitation/create` params for the questions.
  *
  * Each question is one field keyed `question_<n>` — single-select a titled
@@ -109,13 +118,17 @@ export function buildAskElicitation(
     properties[`question_${index}`] = question.multiSelect
       ? { type: "array", title, description, items: { anyOf: options } }
       : { type: "string", title, description, oneOf: options };
-    properties[`question_${index}_custom`] = {
+    const custom: CustomAnswerField = {
       type: "string",
       title: "Other",
       description: question.multiSelect
         ? "Type your own answer to add to your selection above (optional)."
         : "Type your own answer, or add a note to the option you chose above (optional).",
+      _meta: {
+        _askUserQuestionCustomAnswer: { questionId: `question_${index}`, isCustomAnswer: true },
+      },
     };
+    properties[`question_${index}_custom`] = custom;
   });
   return {
     mode: "form",

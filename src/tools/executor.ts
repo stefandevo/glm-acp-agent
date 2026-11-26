@@ -575,10 +575,8 @@ export class ToolExecutor {
       folded = foldAskResponse(outcome.response, questions);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return this.failAndReturn(
+      return this.announcedFailure(
         toolCallId,
-        "ask_user_question",
-        args,
         `Error: could not present the question to the user: ${message}`
       );
     }
@@ -594,8 +592,9 @@ export class ToolExecutor {
   /**
    * Clients without form elicitation: the options render as permission
    * buttons, one single-select question only. A question is user input, not
-   * an operation, so the session mode never bypasses it. A dismissed prompt
-   * reads as skipped rather than aborting the turn.
+   * an operation, so the session mode never bypasses it. A declined button
+   * or dismissed prompt completes the call with empty answers and a
+   * "dismissed" annotation, like the form's Decline.
    */
   private async askViaPermissionButtons(
     toolCallId: string,
@@ -604,10 +603,8 @@ export class ToolExecutor {
   ): Promise<ToolResult> {
     const question = questions[0];
     if (questions.length !== 1 || question.multiSelect) {
-      return this.failAndReturn(
+      return this.announcedFailure(
         toolCallId,
-        "ask_user_question",
-        args,
         "Error: this client cannot show questions interactively; ask the user in plain text and end the turn."
       );
     }
@@ -639,13 +636,14 @@ export class ToolExecutor {
       if (decision.outcome === "selected" && decision.optionId !== ASK_DECLINE_OPTION_ID) {
         return this.completeAsk(toolCallId, { [question.question]: String(decision.optionId) }, {});
       }
-      return this.completeAsk(toolCallId, {}, {});
+      // "None of these" or a dismissed prompt: the user declined to pick.
+      return this.completeAsk(toolCallId, {}, {
+        [question.question]: { unanswered: "dismissed" },
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return this.failAndReturn(
+      return this.announcedFailure(
         toolCallId,
-        "ask_user_question",
-        args,
         `Error: could not present the question to the user: ${message}`
       );
     }
@@ -1682,6 +1680,16 @@ export class ToolExecutor {
   }
 
   /** Mark an in-progress tool call as failed. */
+  /**
+   * A failure after the pending card was announced: close that card (a second
+   * `tool_call` for the same id would leave the client two cards to
+   * reconcile) and return the error text for the model.
+   */
+  private async announcedFailure(toolCallId: string, message: string): Promise<ToolResult> {
+    await this.markFailed(toolCallId, message);
+    return { content: message };
+  }
+
   private async markFailed(toolCallId: string, message: string): Promise<void> {
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,

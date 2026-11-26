@@ -239,7 +239,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "ask_user_question",
       description:
-        "Ask the user a question to gather additional information or clarify context. Use this tool to gather user preferences or requirements, clarify ambiguous instructions, get decisions on implementation choices as you work, or offer choices to the user about what direction to take. Each option must be a distinct, mutually exclusive choice unless multiSelect is enabled. The interface adds an automatic \"Other\" free-text answer, so never include an \"Other\" option yourself. Use multiSelect to allow multiple answers to a single question.",
+        "Ask the user a question to gather additional information or clarify context. Use this tool to gather user preferences or requirements, clarify ambiguous instructions, get decisions on implementation choices as you work, or offer choices to the user about what direction to take. Each option must be a distinct, mutually exclusive choice unless multiSelect is enabled. The interface adds an automatic \"Other\" free-text answer, so never include an \"Other\" option yourself. Use multiSelect to allow multiple answers to a single question. Clients without form-elicitation support can only show one single-select question; on those, anything richer fails with a hint to ask in plain text instead.",
       parameters: {
         type: "object",
         properties: {

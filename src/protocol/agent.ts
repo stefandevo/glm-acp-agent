@@ -2341,6 +2341,11 @@ export class GlmAcpAgent implements Agent {
       // A user abort keeps only calls that started, in their original order.
       // The same rule applies while load/resume/close is draining this prompt.
       let cancellationObserved = false;
+      // A call that never started means the user pulled the plug on this turn:
+      // an abort, or a dismissed question form. Later calls in the same batch
+      // must not run either; the partial-batch trim below drops them from
+      // history alongside the unstarted call.
+      let stoppedByUnstartedCall = false;
       const startedCalls: typeof toolCalls = [];
       const toolResults: GlmMessage[] = [];
       let toolFailure: Error | undefined;
@@ -2354,7 +2359,7 @@ export class GlmAcpAgent implements Agent {
           keepCall(tc, "Tool call not started because an earlier tool's outcome is unknown.");
           continue;
         }
-        if (signal.aborted || !ownsPrompt()) {
+        if (signal.aborted || !ownsPrompt() || stoppedByUnstartedCall) {
           cancellationObserved = true;
           continue;
         }
@@ -2388,6 +2393,7 @@ export class GlmAcpAgent implements Agent {
         // the client had seen the call. Omit it from history.
         if (result.outcome === "not_started") {
           cancellationObserved = true;
+          stoppedByUnstartedCall = true;
           continue;
         }
         const content = result.outcome === "interrupted"
