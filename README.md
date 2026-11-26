@@ -181,8 +181,24 @@ This does not change model endpoint configuration.
 #### Team-seat API keys
 
 A key issued for a Z.AI **team seat** has no personal Coding Plan, so the default
-lookup fails (the provider reports that the user has no coding plan). To read
-the team seat's quota, configure the team's organization ID and project ID:
+lookup fails (the provider reports that the user has no coding plan). When that
+happens, the agent discovers the team seat automatically with the same key: it
+calls `GET /api/biz/customer/getCustomerInfo` on the same origin, picks the
+account's single active project with `"projectType": 2`, and retries with
+`GET /api/monitor/usage/quota/limit?type=2` plus
+`bigmodel-organization: <organization ID>` and `bigmodel-project: <project ID>`,
+matching Z.AI's own desktop client. All three requests share the refresh's
+deadline and response cap. A discovered seat is remembered in memory until the
+key or origin changes or a lookup with it fails, so later refreshes make one
+request. Personal keys still make exactly one request, and authentication,
+HTTP, network, or malformed-response failures never trigger discovery. Only the
+two IDs are read from the account reply; names, contact details, and IDs are
+never included in errors. If discovery fails or finds no team project, the
+original "no coding plan" error is reported.
+
+If the account belongs to more than one active team project, the agent does not
+guess: quota is reported as `requestFailed` and asks you to choose the seat.
+Set the team's organization ID and project ID explicitly to override discovery:
 
 ```bash
 export Z_AI_ORGANIZATION_ID=org-xxxxxxxxxxxxxxxx
@@ -192,20 +208,10 @@ export Z_AI_PROJECT_ID=proj-xxxxxxxxxxxxxxxx
 …or enter both when `glm-acp-agent --setup` asks for them (stored as
 `z_ai_organization_id` / `z_ai_project_id` in `credentials.json`). When either
 environment variable is set, the environment pair wins over the file as a unit.
-With both set, the lookup becomes
-`GET /api/monitor/usage/quota/limit?type=2` with the same `Authorization` header
-plus `bigmodel-organization: <organization ID>` and
-`bigmodel-project: <project ID>`, matching Z.AI's own desktop client. With
-neither set, the request is unchanged. If only one is set, or a value contains
-whitespace or control characters, quota is reported as `missingCredentials`
-and no request is sent. IDs are never included in errors.
-
-To find the IDs, sign in to the Z.AI web console, open the browser's developer
-tools (Network tab), and find the `GET /api/biz/customer/getCustomerInfo`
-request the console makes with your login token. In its response, the team's
-project is the entry with `"projectType": 2`; use that entry's organization ID
-and project ID. The agent does not perform this lookup itself. These settings only
-affect quota lookup; model requests are unchanged.
+With both set, discovery is skipped and the lookup goes straight to `?type=2`
+with those IDs. If only one is set, or a value contains whitespace or control
+characters, quota is reported as `missingCredentials` and no request is sent.
+These settings only affect quota lookup; model requests are unchanged.
 
 Results are cached in memory for 60 seconds and concurrent lookups share one
 request per account. Failed attempts are also cached for 60 seconds. A refresh
@@ -335,8 +341,8 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
-| `Z_AI_ORGANIZATION_ID` | No | — | Team-seat organization ID, used only for quota lookup. Set together with `Z_AI_PROJECT_ID`; see [Team-seat API keys](#team-seat-api-keys). Falls back to the credentials file. |
-| `Z_AI_PROJECT_ID` | No | — | Team-seat project ID (`projectType: 2`), used only for quota lookup. Set together with `Z_AI_ORGANIZATION_ID`. |
+| `Z_AI_ORGANIZATION_ID` | No | — | Team-seat organization ID override, used only for quota lookup (team seats are normally discovered automatically). Set together with `Z_AI_PROJECT_ID`; see [Team-seat API keys](#team-seat-api-keys). Falls back to the credentials file. |
+| `Z_AI_PROJECT_ID` | No | — | Team-seat project ID override (`projectType: 2`), used only for quota lookup. Set together with `Z_AI_ORGANIZATION_ID`. |
 | `ACP_GLM_MODEL` | No | `glm-5.4` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
@@ -371,7 +377,7 @@ node dist/index.js --setup
 
 The key is written to `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json` (default: `~/.config/glm-acp-agent/credentials.json`) with `0600` permissions. The `Z_AI_API_KEY` environment variable, when set, always wins over the file.
 
-Setup then asks for an optional team-seat organization ID and project ID; leave both blank for a personal key. Entering only one aborts setup. See [Team-seat API keys](#team-seat-api-keys).
+Setup then asks for an optional team-seat organization ID and project ID; leave both blank for a personal key or to let the agent discover the team seat. Entering only one aborts setup. See [Team-seat API keys](#team-seat-api-keys).
 
 ### Supported models
 

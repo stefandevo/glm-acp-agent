@@ -35,7 +35,7 @@ export async function runSetup(
       throw new Error("No API key entered; aborting setup.");
     }
 
-    output.write("\nOptional: Z.AI team seat for /usage quota (leave both blank for a personal key).\n");
+    output.write("\nOptional: Z.AI team seat override for /usage quota (leave both blank for a personal key or to auto-detect the team seat).\n");
     const ask = async (prompt: string): Promise<string> => {
       if (lines) return (await nextLine(prompt)).trim();
       const rl = createInterface({ input, output, terminal: false });

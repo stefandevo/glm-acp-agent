@@ -325,3 +325,235 @@ test("team-seat business failures point at the seat settings without echoing IDs
   assert.match(result.unavailable!.message, /team-seat quota/);
   assert.doesNotMatch(JSON.stringify(result), /private|placeholder/);
 });
+
+const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
+const CUSTOMER_URL = "https://api.z.ai/api/biz/customer/getCustomerInfo";
+const noPlan = () => ({ code: 500, success: false, msg: "private no coding plan" });
+const project = (projectId: string, organizationId: string, projectType: number, status = "active") =>
+  ({ projectId, organizationId, projectType, status, projectName: "Private Project Name" });
+const customerInfo = (organizations: unknown[]) => ({
+  code: 200, success: true,
+  data: { email: "private-person@example.invalid", phone: "+00-private-phone", customerNumber: "private-cust-001", organizations },
+});
+const personalAndTeam = () => customerInfo([
+  { organizationId: "org-personal-placeholder", organizationName: "Private Personal Org", isDefault: true,
+    projects: [project("proj-personal-placeholder", "org-personal-placeholder", 1)] },
+  { organizationId: ORG, organizationName: "Private Team Org", isDefault: false, projects: [project(PROJECT, ORG, 2)] },
+]);
+const PRIVATE = /private|placeholder|example\.invalid/i;
+
+type Seen = { url: string; headers: Headers; init?: RequestInit };
+/** Route mocked requests by URL and record each request's URL, headers, and init. */
+function discoveryFetch(routes: { quota?: () => Response; customer?: () => Response; team?: (seen: Seen) => Response }) {
+  const seen: Seen[] = [];
+  const fetch = async (url: string | URL | Request, init?: RequestInit) => {
+    const entry = { url: String(url), headers: new Headers(init?.headers), init };
+    seen.push(entry);
+    assert.equal(init?.redirect, "error");
+    assert.equal(entry.headers.get("Authorization"), "test-key");
+    assert.equal(entry.headers.get("Accept"), "application/json");
+    if (entry.url === QUOTA_URL) return (routes.quota ?? (() => json(noPlan())))();
+    if (entry.url === CUSTOMER_URL) return (routes.customer ?? (() => json(personalAndTeam())))();
+    if (entry.url === `${QUOTA_URL}?type=2`) return (routes.team ?? (() => json(teamReply())))(entry);
+    throw new Error(`unexpected ${entry.url}`);
+  };
+  return { seen, fetch };
+}
+
+test("discovers the single active team seat when the personal lookup reports no plan", async () => {
+  let time = reset;
+  const { seen, fetch } = discoveryFetch({});
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), now: () => time, fetch });
+  const result = await client.getUsage();
+  assert.equal(result.unavailable, undefined);
+  assert.deepEqual(seen.map(s => s.url), [QUOTA_URL, CUSTOMER_URL, `${QUOTA_URL}?type=2`]);
+  assert.equal(seen[0]!.headers.get("bigmodel-organization"), null);
+  assert.equal(seen[1]!.headers.get("bigmodel-organization"), null);
+  assert.equal(seen[2]!.headers.get("bigmodel-organization"), ORG);
+  assert.equal(seen[2]!.headers.get("bigmodel-project"), PROJECT);
+  assert.ok(seen.every(s => s.init?.signal === seen[0]!.init?.signal), "one deadline covers the whole refresh");
+  assert.deepEqual(result.windows.map(w => [w.id, w.windowDurationMins, w.usedPercent]),
+    [["credit_limit-3-5", 300, 25], ["credit_limit-6-1", 10080, 75]]);
+  assert.doesNotMatch(JSON.stringify(result), PRIVATE);
+
+  await client.getUsage();
+  assert.equal(seen.length, 3); // cached within the minute
+  time += 60_000;
+  assert.equal((await client.getUsage()).unavailable, undefined);
+  assert.deepEqual(seen.slice(3).map(s => s.url), [`${QUOTA_URL}?type=2`]);
+  assert.equal(seen[3]!.headers.get("bigmodel-project"), PROJECT);
+});
+
+test("discovery uses the configured allowed origin", async () => {
+  const urls: string[] = [];
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}),
+    baseUrl: () => "https://open.bigmodel.cn/api/coding/paas/v4",
+    fetch: async url => {
+      urls.push(String(url));
+      return json(urls.length === 1 ? noPlan() : urls.length === 2 ? personalAndTeam() : teamReply());
+    },
+  });
+  assert.equal((await client.getUsage()).unavailable, undefined);
+  assert.deepEqual(urls, [
+    "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+    "https://open.bigmodel.cn/api/biz/customer/getCustomerInfo",
+    "https://open.bigmodel.cn/api/monitor/usage/quota/limit?type=2",
+  ]);
+});
+
+test("discovery skips inactive and non-team projects in favor of the single active team project", async () => {
+  const { seen, fetch } = discoveryFetch({ customer: () => json(customerInfo([
+    { organizationId: "org-old-placeholder", projects: [project("proj-old-placeholder", "org-old-placeholder", 2, "disabled")] },
+    // The project's organization ID is missing, so it comes from the organization; IDs are trimmed.
+    { organizationId: ` ${ORG} `, projects: [{ projectId: ` ${PROJECT} `, projectType: 2, status: "ACTIVE" },
+      project(PROJECT, ORG, 2), project("proj-personal-placeholder", ORG, 1), { projectId: "bad id", projectType: 2 }, null] },
+    "not-an-org",
+  ])) });
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), fetch });
+  assert.equal((await client.getUsage()).unavailable, undefined);
+  assert.equal(seen.length, 3);
+  assert.equal(seen[2]!.headers.get("bigmodel-organization"), ORG);
+  assert.equal(seen[2]!.headers.get("bigmodel-project"), PROJECT);
+});
+
+test("multiple active team projects ask for an explicit seat and send no team request", async () => {
+  const { seen, fetch } = discoveryFetch({ customer: () => json(customerInfo([
+    { organizationId: ORG, projects: [project(PROJECT, ORG, 2), project("proj-placeholder-0003", ORG, 2)] },
+  ])) });
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), fetch });
+  const result = await client.getUsage();
+  assert.deepEqual(seen.map(s => s.url), [QUOTA_URL, CUSTOMER_URL]);
+  assert.equal(result.unavailable?.reason, "requestFailed");
+  assert.match(result.unavailable!.message, /Multiple Z\.AI team projects/);
+  assert.match(result.unavailable!.message, /Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID/);
+  assert.deepEqual(result.windows, []);
+  assert.doesNotMatch(JSON.stringify(result), PRIVATE);
+});
+
+test("no team project or a failed discovery falls back to the original failure without leaking the reply", async () => {
+  for (const customer of [
+    () => json(customerInfo([{ organizationId: ORG, projects: [project("proj-personal-placeholder", ORG, 1)] }])),
+    () => json(customerInfo([])),
+    () => json({ ...personalAndTeam(), code: 500 }),
+    () => json({ ...personalAndTeam(), success: false }),
+    () => new Response(JSON.stringify(personalAndTeam()), { status: 500 }),
+    () => new Response(JSON.stringify(personalAndTeam()), { status: 401 }),
+    () => new Response("private-person@example.invalid not json"),
+    () => { throw new Error("private-person@example.invalid network"); },
+  ]) {
+    const { seen, fetch } = discoveryFetch({ customer });
+    const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), fetch });
+    const result = await client.getUsage();
+    assert.deepEqual(seen.map(s => s.url), [QUOTA_URL, CUSTOMER_URL]);
+    assert.equal(result.unavailable?.reason, "requestFailed");
+    assert.match(result.unavailable!.message, /could not return Coding Plan quota/);
+    assert.doesNotMatch(JSON.stringify(result), PRIVATE);
+  }
+});
+
+test("authentication, HTTP, and malformed personal lookups never call getCustomerInfo", async () => {
+  for (const [quota, reason] of [
+    [() => new Response("private", { status: 401 }), "authenticationFailed"],
+    [() => new Response("private", { status: 403 }), "authenticationFailed"],
+    [() => json({ code: 401, msg: "private" }), "authenticationFailed"],
+    [() => new Response("private", { status: 500 }), "requestFailed"],
+    [() => new Response("private", { status: 429 }), "requestFailed"],
+    [() => new Response("private"), "invalidResponse"],
+    [() => json(payload([])), "invalidResponse"],
+    [() => { throw new Error("private network"); }, "requestFailed"],
+  ] as const) {
+    const { seen, fetch } = discoveryFetch({ quota });
+    const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), fetch });
+    assert.equal((await client.getUsage()).unavailable?.reason, reason);
+    assert.deepEqual(seen.map(s => s.url), [QUOTA_URL]);
+  }
+});
+
+test("an explicit team seat skips discovery entirely", async () => {
+  const { seen, fetch } = discoveryFetch({ team: () => json(noPlan()) });
+  const client = new QuotaClient({ resolveKey: () => "test-key",
+    resolveTeam: () => ({ organizationId: ORG, projectId: PROJECT }), fetch });
+  const result = await client.getUsage();
+  assert.deepEqual(seen.map(s => s.url), [`${QUOTA_URL}?type=2`]);
+  assert.equal(result.unavailable?.reason, "requestFailed");
+  assert.match(result.unavailable!.message, /team-seat quota/);
+});
+
+test("a discovered seat is forgotten when the key, origin, or explicit seat changes", async () => {
+  let key = "test-key";
+  let base = "https://api.z.ai/api/coding/paas/v4";
+  let seat: { organizationId?: string; projectId?: string } = {};
+  const urls: string[] = [];
+  const client = new QuotaClient({ resolveKey: () => key, baseUrl: () => base, resolveTeam: () => seat, cacheMs: 0,
+    fetch: async (url, init) => {
+      const path = new URL(String(url));
+      const team = new Headers(init?.headers).get("bigmodel-project");
+      urls.push(`${path.host}${path.pathname}${path.search}${team ? ` ${team}` : ""}`);
+      if (path.pathname.endsWith("getCustomerInfo")) return json(personalAndTeam());
+      return json(path.search ? teamReply() : noPlan());
+    },
+  });
+  const probe = (host: string) => [`${host}/api/monitor/usage/quota/limit`, `${host}/api/biz/customer/getCustomerInfo`,
+    `${host}/api/monitor/usage/quota/limit?type=2 ${PROJECT}`];
+  await client.getUsage();
+  await client.getUsage();
+  assert.deepEqual(urls.splice(0), [...probe("api.z.ai"), `api.z.ai/api/monitor/usage/quota/limit?type=2 ${PROJECT}`]);
+  key = "other-key";
+  await client.getUsage();
+  assert.deepEqual(urls.splice(0), probe("api.z.ai"));
+  base = "https://open.bigmodel.cn/api/coding/paas/v4";
+  await client.getUsage();
+  assert.deepEqual(urls.splice(0), probe("open.bigmodel.cn"));
+  seat = { organizationId: ORG, projectId: "proj-placeholder-0003" };
+  await client.getUsage();
+  assert.deepEqual(urls.splice(0), ["open.bigmodel.cn/api/monitor/usage/quota/limit?type=2 proj-placeholder-0003"]);
+  seat = {};
+  await client.getUsage();
+  assert.deepEqual(urls.splice(0), probe("open.bigmodel.cn"));
+});
+
+test("a discovered seat that later fails is forgotten and rediscovered on the next refresh", async () => {
+  let teamStatus = 200;
+  const { seen, fetch } = discoveryFetch({
+    team: () => teamStatus === 200 ? json(teamReply()) : new Response("private", { status: teamStatus }),
+  });
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), cacheMs: 0, fetch });
+  await client.getUsage();
+  assert.equal(seen.length, 3);
+  teamStatus = 503;
+  const failed = await client.getUsage();
+  assert.deepEqual(seen.slice(3).map(s => s.url), [`${QUOTA_URL}?type=2`]);
+  assert.equal(failed.unavailable?.reason, "requestFailed");
+  assert.equal(failed.stale, true);
+  teamStatus = 200;
+  assert.equal((await client.getUsage()).unavailable, undefined);
+  assert.deepEqual(seen.slice(4).map(s => s.url), [QUOTA_URL, CUSTOMER_URL, `${QUOTA_URL}?type=2`]);
+});
+
+test("a discovered seat whose team lookup fails is not remembered", async () => {
+  let attempt = 0;
+  const { seen, fetch } = discoveryFetch({ team: () => ++attempt === 1 ? json(noPlan()) : json(teamReply()) });
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), cacheMs: 0, fetch });
+  const first = await client.getUsage();
+  assert.equal(first.unavailable?.reason, "requestFailed");
+  assert.match(first.unavailable!.message, /team-seat quota/);
+  assert.doesNotMatch(JSON.stringify(first), PRIVATE);
+  await client.getUsage();
+  assert.deepEqual(seen.slice(3).map(s => s.url), [QUOTA_URL, CUSTOMER_URL, `${QUOTA_URL}?type=2`]);
+});
+
+test("a deadline during discovery reports a timeout instead of the original failure", async () => {
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), timeoutMs: 20,
+    fetch: async (url, init) => {
+      if (String(url) === QUOTA_URL) return json(noPlan());
+      const signal = init!.signal!;
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    const result = await client.getUsage();
+    assert.equal(result.unavailable?.reason, "requestFailed");
+    assert.match(result.unavailable!.message, /timed out/);
+  } finally { clearTimeout(keepAlive); }
+});
