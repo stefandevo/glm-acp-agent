@@ -1,0 +1,449 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GlmAcpAgent, type GlmAcpAgentOptions } from "../protocol/agent.js";
+import { SessionStore } from "../protocol/session-store.js";
+import type { GlmMessage, StreamChatOptions } from "../llm/glm-client.js";
+
+const home = mkdtempSync(join(tmpdir(), "glm-goal-home-"));
+process.env.HOME = home;
+process.env.USERPROFILE = home;
+delete process.env["ACP_GLM_GOAL_JUDGE_MODEL"];
+delete process.env["ACP_GLM_GOAL_MAX_ROUNDS"];
+test.after(() => rmSync(home, { recursive: true, force: true }));
+
+type Update = { update: { sessionUpdate: string; content?: { text?: string }; availableCommands?: Array<{ name: string; description?: string; input?: { hint?: string } }> } };
+
+interface ScriptedTurn {
+  text?: string;
+  /** A read-only tool call keeps the no-progress streak at zero. */
+  toolCall?: boolean;
+}
+
+interface Script {
+  /** Main-model turns, consumed in order; later calls repeat the last one. */
+  main: ScriptedTurn[];
+  /** Evaluator replies, consumed in order; an Error is thrown by the stream. */
+  judge: Array<string | Error>;
+  /** Awaited before a main-model turn streams, so a test can interleave a prompt. */
+  beforeMain?: (index: number) => Promise<void>;
+}
+
+const NOT_MET = (reason: string) => `{"verdict":"not_met","reason":"${reason}"}`;
+const MET = (reason: string) => `{"verdict":"met","reason":"${reason}"}`;
+const GOAL_ACHIEVED = /\*\*Goal: achieved\*\*/;
+/** Token usage the fake model and the fake evaluator report per call. */
+const MAIN_USAGE = { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 };
+const JUDGE_USAGE = { inputTokens: 100, outputTokens: 20, totalTokens: 120 };
+const summedUsage = (mainCalls: number, judgeCalls: number) => ({
+  inputTokens: mainCalls * MAIN_USAGE.inputTokens + judgeCalls * JUDGE_USAGE.inputTokens,
+  outputTokens: mainCalls * MAIN_USAGE.outputTokens + judgeCalls * JUDGE_USAGE.outputTokens,
+  totalTokens: mainCalls * MAIN_USAGE.totalTokens + judgeCalls * JUDGE_USAGE.totalTokens,
+});
+
+function setup(script: Script, options: Partial<GlmAcpAgentOptions> = {}, store: SessionStore | null = null) {
+  const updates: Update[] = [];
+  const modelCalls: GlmMessage[][] = [];
+  const judgeCalls: GlmMessage[][] = [];
+  const judgeOptions: Array<StreamChatOptions | undefined> = [];
+  let mainIndex = 0;
+  let judgeIndex = 0;
+  const glm: NonNullable<GlmAcpAgentOptions["glm"]> = {
+    async *streamChat(messages, signal, options) {
+      if (options?.tools === null) {
+        judgeCalls.push(structuredClone(messages));
+        judgeOptions.push(options);
+        const reply = script.judge[judgeIndex++] ?? NOT_MET("no verdict scripted");
+        if (reply instanceof Error) throw reply;
+        yield { text: reply, usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } };
+        yield { done: true, stopReason: "stop" };
+        return;
+      }
+      const index = mainIndex++;
+      modelCalls.push(structuredClone(messages));
+      await script.beforeMain?.(index);
+      signal?.throwIfAborted();
+      const turn = script.main[Math.min(index, script.main.length - 1)] ?? { text: "done" };
+      if (turn.toolCall) {
+        yield { toolCall: { id: `call_${index}`, name: "list_files", arguments: JSON.stringify({ path: "." }) } };
+      }
+      if (turn.text) yield { text: turn.text };
+      yield { usage: { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 } };
+      yield { done: true, stopReason: turn.toolCall ? "tool_calls" : "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent({ async sessionUpdate(update: Update) { updates.push(update); } } as never, {
+    glm, visionClient: null, sessionStore: store, ...options,
+  });
+  const texts = (): string[] => updates.map(update => update.update.content?.text ?? "").filter(text => text.length > 0);
+  const lastUserText = (messages: GlmMessage[]): string => {
+    const last = [...messages].reverse().find(message => message.role === "user");
+    return typeof last?.content === "string" ? last.content : JSON.stringify(last?.content);
+  };
+  /** Run a `/goal` control word and return the agent's reply. */
+  const status = async (sessionId: string, text = "/goal"): Promise<string> => {
+    const before = updates.length;
+    const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
+    assert.equal(result.stopReason, "end_turn");
+    return updates.slice(before).map(update => update.update.content?.text ?? "").join("\n");
+  };
+  return { agent, updates, texts, modelCalls, judgeCalls, judgeOptions, lastUserText, status };
+}
+
+function tempDir(prefix: string): string {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+
+test("/goal is advertised once with an input hint and shadows a file-backed goal command", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    mkdirSync(join(cwd, ".claude", "commands"), { recursive: true });
+    writeFileSync(join(cwd, ".claude", "commands", "goal.md"), "Send this to the model");
+    const h = setup({ main: [], judge: [] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    await tick();
+    const commands = h.updates.find(update => update.update.sessionUpdate === "available_commands_update")?.update.availableCommands ?? [];
+    const goals = commands.filter(command => command.name === "goal");
+    assert.equal(goals.length, 1);
+    assert.match(goals[0]?.description ?? "", /evaluator/);
+    assert.equal(goals[0]?.input?.hint, "<condition | status | pause | resume | clear>");
+    assert.ok(commands.some(command => command.name === "usage"));
+    // A file-backed goal.md never shadows the built-in: the typed text becomes the directive, not that body.
+    const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal all tests pass" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.doesNotMatch(h.lastUserText(h.modelCalls[0]!), /Send this to the model/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("setting a goal sends the directive, keeps the typed text for replay, and loops until the evaluator says met", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    // A tool-call turn and the turn that reads its result are two model calls
+    // inside one round; the second round is the text-only "Suite is green.".
+    const h = setup({
+      main: [{ toolCall: true, text: "Running the suite." }, { text: "Still running." }, { text: "Suite is green." }],
+      judge: [NOT_MET("refresh still fails"), MET("npm test exits 0")],
+    });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const result = await h.agent.prompt({ sessionId, messageId: "m1", prompt: [{ type: "text", text: "/goal all tests in test/auth pass" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(result.userMessageId, "m1");
+    assert.deepEqual(result.usage, summedUsage(3, 2));
+
+    assert.equal(h.modelCalls.length, 3);
+    const directive = h.lastUserText(h.modelCalls[0]!);
+    assert.match(directive, /^<goal>\n/);
+    assert.match(directive, /<condition>\nall tests in test\/auth pass\n<\/condition>/);
+    assert.doesNotMatch(directive, /^\/goal/);
+    const continuation = h.lastUserText(h.modelCalls[2]!);
+    assert.match(continuation, /^<goal_continuation round="1\/20">/);
+    assert.match(continuation, /<reason>\nrefresh still fails\n<\/reason>/);
+    assert.match(continuation, /all tests in test\/auth pass/);
+
+    assert.equal(h.judgeCalls.length, 2);
+    assert.match(String(h.judgeCalls[0]?.[1]?.content), /<condition>\nall tests in test\/auth pass\n<\/condition>/);
+    assert.match(String(h.judgeCalls[0]?.[1]?.content), /Still running\./);
+    assert.match(String(h.judgeCalls[1]?.[1]?.content), /Suite is green\./);
+    assert.equal(h.judgeOptions[0]?.model, "glm-5.4");
+    assert.equal(h.judgeOptions[0]?.tools, null);
+
+    assert.match(h.texts().join("\n"), /\[goal 1\/20\] Continuing — not met yet: refresh still fails/);
+    assert.match(h.texts().at(-1) ?? "", /Goal achieved after 1 continuation round: npm test exits 0/);
+    const replay = h.updates.filter(update => update.update.sessionUpdate === "user_message_chunk").map(update => update.update.content?.text);
+    assert.deepEqual(replay, ["[goal 1/20] Continuing — not met yet: refresh still fails"]);
+    assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("the goal persists, survives session/load with its counters reset, and resumes", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  const dir = tempDir("glm-goal-store-");
+  try {
+    const store = new SessionStore(dir);
+    const first = setup({ main: [{ text: "one" }, { text: "two" }], judge: [NOT_MET("a"), NOT_MET("b")] }, { goalMaxRounds: 2 }, store);
+    const { sessionId } = await first.agent.newSession({ cwd, mcpServers: [] });
+    const result = await first.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal lint is clean" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.match(first.texts().at(-1) ?? "", /Goal paused — round budget reached \(2\/2\)/);
+    const saved = store.load(sessionId);
+    assert.equal(saved?.goal?.status, "paused");
+    assert.equal(saved?.goal?.pauseReason, "budget");
+    assert.equal(saved?.goal?.rounds, 2);
+    assert.deepEqual(saved?.goal?.tokens, summedUsage(2, 2));
+    // The directive and the one continuation before the budget paused are user turns on disk.
+    assert.equal(saved?.messages.filter(message => message.role === "user").length, 2);
+
+    // A fresh process restores the session from disk.
+    const second = setup({ main: [{ toolCall: true }, { text: "fixed" }], judge: [MET("ruff exits 0")] }, {}, store);
+    await second.agent.loadSession({ sessionId, cwd, mcpServers: [] });
+    const restored = await second.status(sessionId);
+    assert.match(restored, /\*\*Goal: paused \(budget\)\*\*/);
+    assert.match(restored, /- Rounds: 0\/2/);
+    assert.match(restored, /- Evaluator: glm-5\.4 \(session model\)/);
+    assert.match(restored, /- Tokens: 2\.4k/);
+    assert.equal(second.modelCalls.length, 0);
+
+    const resumed = await second.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.equal(resumed.stopReason, "end_turn");
+    assert.equal(second.modelCalls.length, 2);
+    assert.match(second.lastUserText(second.modelCalls[0]!), /^<goal_resumed round="0\/2">/);
+    // The resumed round satisfied the goal on its first try.
+    assert.match(second.texts().join("\n"), /Goal achieved after 0 continuation rounds: ruff exits 0/);
+    assert.match(await second.status(sessionId), GOAL_ACHIEVED);
+    assert.equal(store.load(sessionId)?.goal?.rounds, 0);
+  } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a fork carries the goal with its counters reset", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  const dir = tempDir("glm-goal-store-");
+  try {
+    const store = new SessionStore(dir);
+    const h = setup({ main: [{ text: "one" }, { text: "two" }], judge: [NOT_MET("a"), NOT_MET("b")] }, { goalMaxRounds: 2 }, store);
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal lint is clean" }] });
+    const fork = await h.agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
+    const forked = await h.status(fork.sessionId);
+    assert.match(forked, /\*\*Goal: paused \(budget\)\*\*/);
+    assert.match(forked, /- Rounds: 0\/2/);
+    // The parent keeps its own accounting.
+    assert.match(await h.status(sessionId), /- Rounds: 2\/2/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("/goal pause and /goal resume steer a running goal; status and clear never reach the model", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    let release!: () => void;
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const h = setup({
+      main: [{ toolCall: true }, { text: "working" }, { toolCall: true }, { text: "done" }],
+      judge: [MET("all green")],
+      beforeMain: async index => { if (index === 1) { started(); await gate; } },
+    });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const first = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal all tests pass" }] });
+    await running;
+    // Pause preempts the running round; the superseded round leaves the goal
+    // alone. The gated turn only observes its abort once it is released.
+    const pausing = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal pause" }] });
+    release();
+    assert.equal((await first).stopReason, "cancelled");
+    assert.equal((await pausing).stopReason, "end_turn");
+    assert.match(h.texts().at(-1) ?? "", /Goal paused: all tests pass/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(user\)\*\*/);
+    assert.equal(h.modelCalls.length, 2);
+    assert.equal(h.judgeCalls.length, 0);
+
+    assert.match(await h.status(sessionId, "/goal pause"), /Goal already paused/);
+    const resumed = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.equal(resumed.stopReason, "end_turn");
+    assert.equal(h.modelCalls.length, 4);
+    assert.equal(h.judgeCalls.length, 1);
+    // The resumed round satisfied the goal on its first try, so no continuation was needed.
+    assert.match(h.texts().join("\n"), /Goal achieved after 0 continuation rounds: all green/);
+
+    assert.match(await h.status(sessionId, "/goal pause"), /Goal is achieved; \/goal pause applies to an active goal/);
+    assert.match(await h.status(sessionId, "/goal resume"), /Goal already achieved: all tests pass/);
+    assert.match(await h.status(sessionId, "/goal clear"), /Goal cleared: all tests pass/);
+    assert.match(await h.status(sessionId), /No goal set/);
+    assert.match(await h.status(sessionId, "/goal clear"), /No goal set/);
+    assert.match(await h.status(sessionId, "/goal resume"), /No goal set\. Start one with \/goal <condition>/);
+    assert.equal(h.modelCalls.length, 4);
+    assert.equal(h.judgeCalls.length, 1);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("three answer-only rounds pause the goal; a tool call resets the streak", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "one" }, { text: "two" }, { text: "three" }], judge: [NOT_MET("a"), NOT_MET("b"), NOT_MET("c")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(h.modelCalls.length, 3);
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — 3 rounds in a row without tool calls/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(no progress\)\*\*/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+
+  const cwd2 = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({
+      main: [{ text: "one" }, { toolCall: true }, { text: "three" }, { text: "four" }, { text: "five" }],
+      judge: [NOT_MET("a"), NOT_MET("b"), NOT_MET("c"), NOT_MET("d"), NOT_MET("e")],
+    });
+    const { sessionId } = await h.agent.newSession({ cwd: cwd2, mcpServers: [] });
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    // Rounds: "one" (streak 1), tool call + "three" (0), "four" (1), "five"
+    // (2), "five" again (3). The tool round has two model calls of its own.
+    assert.equal(h.modelCalls.length, 6);
+    assert.match(await h.status(sessionId), /- Rounds: 5\/20/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(no progress\)\*\*/);
+  } finally { rmSync(cwd2, { recursive: true, force: true }); }
+});
+
+test("cancelling a goal turn pauses the goal and /goal resume continues it", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const h = setup({
+      main: [{ toolCall: true }, { text: "interrupted" }, { text: "status reply" }, { toolCall: true }, { text: "done" }],
+      judge: [MET("green")],
+      beforeMain: async index => { if (index === 1) { started(); await new Promise(resolve => setTimeout(resolve, 100)); } },
+    });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const pending = h.agent.prompt({ sessionId, messageId: "cancel-me", prompt: [{ type: "text", text: "/goal x" }] });
+    await running;
+    await h.agent.cancel({ sessionId });
+    const cancelled = await pending;
+    assert.equal(cancelled.stopReason, "cancelled");
+    assert.equal(cancelled.userMessageId, "cancel-me");
+    assert.deepEqual(cancelled.usage, summedUsage(1, 0));
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — turn cancelled/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(cancelled\)\*\*/);
+    assert.equal(h.modelCalls.length, 2);
+    // A plain message while paused runs one turn and does not restart the loop.
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "status?" }] });
+    assert.equal(h.modelCalls.length, 3);
+    assert.equal(h.judgeCalls.length, 0);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(cancelled\)\*\*/);
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.equal(h.modelCalls.length, 5);
+    assert.equal(h.judgeCalls.length, 1);
+    assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a newer prompt supersedes a goal round without pausing; its turn is judged and the loop continues", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const h = setup({
+      main: [{ toolCall: true }, { text: "interrupted" }, { text: "answer to your message" }, { toolCall: true }, { text: "finished" }],
+      judge: [NOT_MET("still not done"), MET("green")],
+      beforeMain: async index => { if (index === 1) { started(); await new Promise(resolve => setTimeout(resolve, 100)); } },
+    });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const superseded = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    await running;
+    const steering = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "also fix the README" }] });
+    assert.equal((await superseded).stopReason, "cancelled");
+    assert.equal(steering.stopReason, "end_turn");
+    // The superseded round never reached its judge. The steering turn ran, was
+    // judged (not met), and the goal round continued to completion.
+    assert.equal(h.modelCalls.length, 5);
+    assert.equal(h.judgeCalls.length, 2);
+    assert.match(h.lastUserText(h.modelCalls[2]!), /also fix the README/);
+    assert.match(h.lastUserText(h.modelCalls[3]!), /^<goal_continuation round="1\/20">/);
+    const status = await h.status(sessionId);
+    assert.match(status, GOAL_ACHIEVED);
+    assert.doesNotMatch(status, /paused/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("an impossible verdict blocks the goal until re-scoped or resumed", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "I cannot reach the staging DB" }], judge: ['{"verdict":"impossible","reason":"needs staging credentials"}', MET("overridden")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal deploy to staging" }] });
+    assert.match(h.texts().at(-1) ?? "", /Goal judged unachievable — paused: needs staging credentials/);
+    const status = await h.status(sessionId);
+    assert.match(status, /\*\*Goal: blocked\*\*/);
+    assert.match(status, /- Last check: impossible — needs staging credentials/);
+    assert.match(status, /\/goal resume to override/);
+    assert.match(await h.status(sessionId, "/goal pause"), /Goal is blocked; \/goal pause applies to an active goal/);
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("evaluator failure pauses the goal after one retry", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "done?" }], judge: [new Error("503 upstream"), new Error("503 upstream")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(h.modelCalls.length, 1);
+    assert.equal(h.judgeCalls.length, 2);
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — evaluator unavailable: 503 upstream/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(judge unavailable\)\*\*/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a turn that stops on max_turn_requests pauses the goal with that reason", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ toolCall: true }, { text: "done" }], judge: [MET("green")] }, { maxTurns: 1 });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(result.stopReason, "max_turn_requests");
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — turn ended with stop reason max_turn_requests/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(error\)\*\*/);
+    assert.equal((await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] })).stopReason, "end_turn");
+    assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("the evaluator model comes from --judge, then the environment, then the session", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const flagged = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
+    const { sessionId } = await flagged.agent.newSession({ cwd, mcpServers: [] });
+    await flagged.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal --judge glm-4.7 all tests pass" }] });
+    assert.equal(flagged.judgeOptions[0]?.model, "glm-4.7");
+    assert.equal(flagged.judgeOptions[0]?.reasoningEffort, "on");
+    assert.match(flagged.lastUserText(flagged.modelCalls[0]!), /<condition>\nall tests pass\n<\/condition>/);
+    assert.match(await flagged.status(sessionId), /- Evaluator: glm-4\.7\n/);
+
+    process.env["ACP_GLM_GOAL_JUDGE_MODEL"] = "glm-5.3-flash";
+    try {
+      const env = setup({ main: [{ text: "ok" }], judge: [MET("yes"), MET("yes")] });
+      const { sessionId: envSession } = await env.agent.newSession({ cwd, mcpServers: [] });
+      await env.agent.prompt({ sessionId: envSession, prompt: [{ type: "text", text: "/goal x" }] });
+      assert.equal(env.judgeOptions[0]?.model, "glm-5.3-flash");
+      assert.equal(env.judgeOptions[0]?.reasoningEffort, "low");
+      // The flag wins over the environment.
+      await env.agent.prompt({ sessionId: envSession, prompt: [{ type: "text", text: "/goal clear" }] });
+      await env.agent.prompt({ sessionId: envSession, prompt: [{ type: "text", text: "/goal --judge=glm-5.3 y" }] });
+      assert.equal(env.judgeOptions[1]?.model, "glm-5.3");
+      assert.match(await env.status(envSession), /- Evaluator: glm-5\.3\n/);
+    } finally { delete process.env["ACP_GLM_GOAL_JUDGE_MODEL"]; }
+
+    const sessionModel = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
+    const { sessionId: sessionModelId } = await sessionModel.agent.newSession({ cwd, mcpServers: [] });
+    await sessionModel.agent.prompt({ sessionId: sessionModelId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(sessionModel.judgeOptions[0]?.model, "glm-5.4");
+    assert.equal(sessionModel.judgeOptions[0]?.reasoningEffort, "minimal");
+    assert.match(await sessionModel.status(sessionModelId), /- Evaluator: glm-5\.4 \(session model\)/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("invalid goals are answered without a model call; a control word followed by words is a condition", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    assert.match(await h.status(sessionId, "/goal --rounds 5 x"), /Unknown \/goal option/);
+    assert.match(await h.status(sessionId, `/goal ${"x".repeat(4_001)}`), /limit is 4000/);
+    assert.match(await h.status(sessionId, "/goal --judge glm-5.3-flash"), /A goal needs a condition/);
+    assert.match(await h.status(sessionId), /No goal set/);
+    assert.equal(h.modelCalls.length, 0);
+    assert.equal(h.judgeCalls.length, 0);
+    // "pause" followed by words is a condition, not a pause.
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal pause after verification" }] });
+    assert.match(h.lastUserText(h.modelCalls[0]!), /<condition>\npause after verification\n<\/condition>/);
+    assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+    assert.match(await h.status(sessionId, "/goal pause"), /Goal is achieved; \/goal pause applies to an active goal/);
+    // Control words are case-insensitive and accept the clear aliases.
+    assert.match(await h.status(sessionId, "/goal STOP"), /Goal cleared: pause after verification/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});

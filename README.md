@@ -35,6 +35,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
+- **Goals (`/goal`)** – `/goal <condition>` keeps the agent working across turns until a separate evaluator model confirms the condition is met, judges it impossible, or you pause it; the round budget, a no-progress streak, a cancel, or an evaluator outage pause the goal instead of running unbounded (see [Goals](#goals-goal))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.4` and `glm-5.3-flash` send supported pasted ACP image blocks directly as native `image_url` content parts, while `glm-5.3`, `glm-5-turbo` and `glm-4.7` route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Ten built-in tools** (see below)
@@ -90,7 +91,7 @@ A stdio MCP child starts with a copy of the agent process environment, then the 
 
 ### Context compaction
 
-Before provider requests, the agent estimates context use with a heuristic rather than the provider's tokenizer. When history exceeds the model budget, it can remove older complete exchanges and shorten tool results; the system context and latest user request are retained. If those, the tool schemas, and reserved output/safety space still exceed the model's context window, the request fails with guidance to narrow it or choose a larger-context model. Earlier conversation details may therefore not remain verbatim in model context.
+Before provider requests, the agent estimates context use with a heuristic rather than the provider's tokenizer. When history exceeds the model budget, it can remove older complete exchanges and shorten tool results; the system context and latest user request are retained. If those, the tool schemas, and reserved output/safety space still exceed the model's context window, the request fails with guidance to narrow it or choose a larger-context model. Earlier conversation details may therefore not remain verbatim in model context. An active `/goal` is not affected: every continuation message restates the condition, so the model keeps working toward it even after the original directive has been compacted away.
 
 ### Trust boundary
 
@@ -140,7 +141,7 @@ sends an ACP [`available_commands_update`](https://agentclientprotocol.com/proto
 notification. Clients such as Zed and Paseo use it to populate their `/` autocomplete.
 Each notification is a full snapshot that replaces the previous list.
 
-The snapshot always includes the built-in `/usage` command. Other commands use the same on-disk layout Claude Code uses, read from the
+The snapshot always includes the built-in `/usage` and `/goal` commands. Other commands use the same on-disk layout Claude Code uses, read from the
 session's working directory and from `~/.claude` for user-level definitions:
 
 | Path | Command name |
@@ -195,6 +196,45 @@ unavailable rather than zero. No fixed plan allowances are assumed. Duration
 units known to the reader are hours, days, and weeks; other units retain an
 unspecified duration. The monitoring endpoint is not a versioned public quota
 contract, so provider changes or account restrictions may make quota unavailable.
+
+### Goals (`/goal`)
+
+`/goal` sets one condition for the session and keeps the agent working toward it across turns, so you state an outcome once instead of sending "keep going" after every premature stop. It follows the `/goal` commands of Claude Code, Codex CLI, Kimi Code, and Hermes Agent, adapted to ACP: the agent cannot start a turn on its own, so the loop runs inside the `session/prompt` call. The client sees one long turn, and `session/cancel` (the stop button) is the escape hatch.
+
+```
+/goal all tests in test/auth pass and the lint step is clean
+```
+
+Setting a goal starts working immediately. When the model ends a turn, a separate **evaluator** model — a plain, tool-less completion on the session's model by default — reads the condition and a bounded window of the recent transcript and returns one verdict:
+
+| Verdict | What happens |
+|---|---|
+| `met` | The goal is marked achieved and the loop ends. |
+| `impossible` | The goal is marked blocked and paused; re-scope it with `/goal <condition>` or override with `/goal resume`. |
+| `not_met` | The evaluator's reason is fed back as the next round's instructions and the agent continues. |
+
+The evaluator never runs tools, so it can only judge what the agent has surfaced: the directive tells the model to run the verification the condition names (tests, lint, a build) and show the output before stopping. Write conditions with one measurable end state and a stated check, as you would for the other agents' `/goal` commands.
+
+| Command | Action |
+|---|---|
+| `/goal <condition>` | Set or replace the goal (up to 4,000 characters) and start the first round. |
+| `/goal --judge <model> <condition>` | Same, with this goal evaluated by `<model>` instead of the agent-wide default. |
+| `/goal` or `/goal status` | Show the condition, status, rounds used, running time, evaluator, token spend, and the last verdict with its reason. |
+| `/goal pause` | Stop auto-continuation and keep the goal. |
+| `/goal resume` | Continue a paused or blocked goal with a fresh round budget. |
+| `/goal clear` | Drop the goal (`stop`, `off`, `reset`, `cancel`, and `none` are aliases). |
+
+A control word counts only when it is the entire argument, so `/goal pause after verification` is a goal with that text. Use `-- ` before a condition that starts with an option or a control word.
+
+The loop pauses itself — keeping the goal, so `/goal resume` continues it — when:
+
+- the round budget is used up (`ACP_GLM_GOAL_MAX_ROUNDS`, default 20 continuation rounds per activation);
+- three rounds in a row end without a single tool call (the model is answering the evaluator instead of working);
+- a turn ends on another stop reason such as `max_turn_requests`;
+- the evaluator cannot be reached or does not answer in the verdict format (one retry, then pause);
+- you cancel the turn. A newer prompt sent while a round is running does not pause the goal: it supersedes the round, its own turn is judged when it ends, and the loop continues from there.
+
+A goal does not change the permission mode. In `default` mode every edit and command of every round still prompts, so run a goal under `accept_edits` or `bypass_permissions` if you want it unattended. Each round is a normal user-role message (the client shows it as `[goal 3/20] Continuing — not met yet: <reason>`), which keeps the system prompt untouched and lets the goal survive context compaction. Goals are persisted with the session and restored by `session/load`, `session/resume`, and `session/fork` with their round counter, no-progress streak, and timer reset; the condition, status, and token spend carry over.
 
 ### ACP quota extension (version 1)
 
@@ -310,6 +350,8 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model turns per prompt (also settable via `--max-turns`). The final turn's tool calls still run and their results are saved |
+| `ACP_GLM_GOAL_MAX_ROUNDS` | No | `20` | Continuation rounds a `/goal` may run per activation before it pauses itself. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_GOAL_JUDGE_MODEL` | No | session model | Model that evaluates `/goal`. A goal's `--judge <model>` flag takes precedence. |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_TOOL_RESULT_LIMIT_BYTES` | No | `262144` | Inclusive UTF-8 byte limit for every model-facing tool result. It preserves a prefix and suffix with an omitted-bytes marker; values below 128 fall back with a stderr warning. |
@@ -585,6 +627,8 @@ src/
 │   ├── connection.ts         # Sets up the ACP stdio connection
 │   ├── agent.ts              # GlmAcpAgent – ACP protocol implementation
 │   ├── slash-commands.ts     # Discovers .claude commands/skills; expands `/name`
+│   ├── goal.ts               # /goal state, command grammar, and prompt rendering
+│   ├── goal-evaluator.ts     # Tool-less evaluator model call behind /goal
 │   └── session-store.ts      # On-disk persistence for load/fork/resume
 ├── tools/
 │   ├── definitions.ts        # Tool JSON schemas (function-calling format)
@@ -596,6 +640,9 @@ src/
     ├── glm-client.test.ts    # Tests for streaming / tool-call assembly
     ├── transport-recovery.test.ts # Connection-loss retry and session recovery
     ├── slash-commands.test.ts # Command discovery and `/name` expansion
+    ├── goal.test.ts          # /goal grammar, state, and rendering
+    ├── goal-evaluator.test.ts # Evaluator prompt, transcript window, and verdict parsing
+    ├── goal-agent.test.ts    # The /goal loop end to end through GlmAcpAgent
     └── integration.test.ts   # End-to-end tests over the real ACP ndjson transport
 ```
 

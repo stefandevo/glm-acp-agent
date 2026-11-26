@@ -370,6 +370,26 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
 });
 
+test("streamChat with tools: null sends a plain completion with no tool-calling fields", async () => {
+  const stream = fakeStream([{ choices: [{ delta: { content: "{}" }, finish_reason: "stop" }] }]);
+  let requestBody: Record<string, unknown> | undefined;
+  const c = makeClientWithCreate((body) => {
+    requestBody = body;
+    return Promise.resolve(stream);
+  });
+
+  const chunks: string[] = [];
+  for await (const chunk of c.streamChat([{ role: "user", content: "judge" }], undefined, { model: "glm-5.3-flash", tools: null, reasoningEffort: "low" })) {
+    if (chunk.text) chunks.push(chunk.text);
+  }
+
+  assert.deepEqual(chunks, ["{}"]);
+  assert.equal(requestBody?.["model"], "glm-5.3-flash");
+  assert.equal("tools" in (requestBody ?? {}), false);
+  assert.equal("tool_choice" in (requestBody ?? {}), false);
+  assert.equal(requestBody?.["reasoning_effort"], "low");
+});
+
 test("streamChat sends reasoning_effort when level is set on glm-5.3", async () => {
   const stream = fakeStream([{ choices: [{ delta: {}, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;
@@ -378,8 +398,7 @@ test("streamChat sends reasoning_effort when level is set on glm-5.3", async () 
     return Promise.resolve(stream);
   });
 
-  // Spot-check across the ladder: endpoints, a middle level, and the one
-  // non-capitalized id ("xhigh") that would break on naive name mangling.
+  // Spot-check across the ladder: endpoints, a middle level, and the one  // non-capitalized id ("xhigh") that would break on naive name mangling.
   for (const effort of ["max", "medium", "minimal", "xhigh"] as const) {
     for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3", reasoningEffort: effort })) {
       void chunk;

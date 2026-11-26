@@ -4138,7 +4138,7 @@ test("newSession advertises commands discovered under the session cwd", async ()
     const commands = updates[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["deploy", "usage"]
+      ["deploy", "goal", "usage"]
     );
     assert.equal(commands[0]?.description, "Ship the current branch");
     assert.equal(commands[0]?.input?.hint, "<environment>");
@@ -4161,7 +4161,7 @@ test("advertised command names carry no leading slash", async () => {
     const commands = commandUpdates(conn)[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["audit", "deploy", "usage"]
+      ["audit", "deploy", "goal", "usage"]
     );
     for (const command of commands) {
       assert.ok(!command.name.startsWith("/"), `${command.name} should not start with /`);
@@ -4171,7 +4171,7 @@ test("advertised command names carry no leading slash", async () => {
   }
 });
 
-test("newSession advertises the built-in usage command when the cwd has no commands", async () => {
+test("newSession advertises the built-in goal and usage commands when the cwd has no commands", async () => {
   const { cwd, cleanup } = makeTempCwd({ "README.md": "hello" });
   try {
     const conn = createConnectionStub();
@@ -4179,7 +4179,7 @@ test("newSession advertises the built-in usage command when the cwd has no comma
     await agent.newSession({ cwd, mcpServers: [] });
     await flushNotifications();
 
-    assert.deepEqual(commandUpdates(conn)[0]?.update.availableCommands?.map(command => command.name), ["usage"]);
+    assert.deepEqual(commandUpdates(conn)[0]?.update.availableCommands?.map(command => command.name), ["goal", "usage"]);
   } finally {
     cleanup();
   }
@@ -4220,7 +4220,7 @@ test("loadSession advertises commands after replaying history", async () => {
     assert.equal(kinds[kinds.length - 1], "available_commands_update");
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy", "usage"]
+      ["deploy", "goal", "usage"]
     );
   } finally {
     cleanupCwd();
@@ -4276,7 +4276,7 @@ test("resumeSession advertises commands for the resumed cwd", async () => {
 
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy", "usage"]
+      ["deploy", "goal", "usage"]
     );
   } finally {
     cleanupCwd();

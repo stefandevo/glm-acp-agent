@@ -161,8 +161,12 @@ export interface GlmStreamChunk {
 export interface StreamChatOptions {
   /** GLM model identifier to use for this call. */
   model: string;
-  /** Tool schemas available in this specific session. */
-  tools?: ToolDefinition[];
+  /**
+   * Tool schemas available in this specific session. `undefined` falls back
+   * to the built-in tools; `null` sends no tool-calling fields at all, for
+   * side queries that must not use tools (the goal evaluator).
+   */
+  tools?: ToolDefinition[] | null;
   /** Reasoning effort for this call, or undefined to use the model defaults. */
   reasoningEffort?: ThoughtLevel;
   /** Maximum silence while awaiting one provider stream item. */
@@ -586,7 +590,11 @@ export class GlmClient {
   ): AsyncGenerator<GlmStreamChunk> {
     const model = options?.model ?? getDefaultModel();
     const thinkingParams = buildThinkingParams(model, options?.reasoningEffort);
-    const tools: ChatCompletionTool[] = (options?.tools ?? TOOL_DEFINITIONS).map((t) => ({
+    // `tools: null` is a plain completion with no tool-calling fields at all
+    // (side queries such as the goal evaluator); undefined falls back to the
+    // built-in tools, and an explicit [] is sent as-is.
+    const toolDefinitions = options?.tools === null ? null : (options?.tools ?? TOOL_DEFINITIONS);
+    const tools: ChatCompletionTool[] | null = toolDefinitions === null ? null : toolDefinitions.map((t) => ({
       type: "function" as const,
       function: {
         name: t.function.name,
@@ -596,7 +604,7 @@ export class GlmClient {
     }));
 
     debug(
-      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools.length} thinking=${JSON.stringify(thinkingParams)}`
+      `streamChat: model=${model} baseURL=${this.client.baseURL} messages=${messages.length} tools=${tools?.length ?? 0} thinking=${JSON.stringify(thinkingParams)}`
     );
 
     // The OpenAI SDK forwards unknown extra body fields verbatim, so we use
@@ -613,8 +621,7 @@ export class GlmClient {
         {
           model,
           messages,
-          tools,
-          tool_choice: "auto",
+          ...(tools ? { tools, tool_choice: "auto" as const } : {}),
           stream: true,
           // Always ask the API to include final usage in the streaming response.
           stream_options: { include_usage: true },

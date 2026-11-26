@@ -474,10 +474,11 @@ test("end-to-end: the client receives an available_commands_update after session
     ).availableCommands;
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["deploy", "usage"]
+      ["deploy", "goal", "usage"]
     );
     assert.equal(commands[0]?.description, "Ship the current branch");
     assert.equal(commands[0]?.input?.hint, "<environment>");
+    assert.equal(commands[1]?.input?.hint, "<condition | status | pause | resume | clear>");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

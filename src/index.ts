@@ -14,6 +14,8 @@
  *   ACP_GLM_STREAM_IDLE_TIMEOUT_MS - (optional) Model stream idle deadline in milliseconds (default: 300000)
  *   ACP_GLM_COMMAND_TIMEOUT_MS - (optional) run_command deadline in milliseconds (default: 120000)
  *   ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES - (optional) combined run_command stdout/stderr capture limit (default: 65536)
+ *   ACP_GLM_GOAL_MAX_ROUNDS - (optional) Continuation rounds a /goal may run before it pauses (default: 20)
+ *   ACP_GLM_GOAL_JUDGE_MODEL - (optional) Model that evaluates /goal (default: the session model)
  */
 import { startAgentRuntime } from "./protocol/connection.js";
 import { parseMaxTurnsFlag } from "./cli-args.js";
@@ -52,6 +54,8 @@ if (args.includes("--setup")) {
       "  ACP_GLM_THINKING               Force thinking mode (true / false)",
       "  ACP_GLM_STREAM_THINKING        Forward reasoning to the client as thought chunks (default true)",
       "  ACP_GLM_STREAM_IDLE_TIMEOUT_MS Model stream idle deadline in milliseconds (default 300000)",
+      "  ACP_GLM_GOAL_MAX_ROUNDS         Continuation rounds a /goal may run before it pauses (default 20)",
+      "  ACP_GLM_GOAL_JUDGE_MODEL        Model that evaluates /goal; unset uses the session model",
       "  ACP_GLM_SESSION_DIR            Where to persist sessions (default: ~/.local/state/glm-acp-agent/sessions)",
       "  ACP_GLM_DEBUG                  Enable verbose stderr logging (true or 1)",
       "  XDG_CONFIG_HOME                Where to read/write credentials.json (default: ~/.config)",

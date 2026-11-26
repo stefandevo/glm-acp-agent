@@ -18,6 +18,7 @@ import {
   SessionStore,
   type PersistedSession,
 } from "../protocol/session-store.js";
+import type { GoalState } from "../protocol/goal.js";
 
 function makeDir(): string {
   return mkdtempSync(join(tmpdir(), "glm-acp-session-store-"));
@@ -83,7 +84,7 @@ test("load rejects malformed metadata, mismatched ids, and unsupported versions"
       ["bad-display-text", { ...base, displayText: { "0": 12 } }],
       ["bad-display-text-root", { ...base, displayText: [] }],
       ["bad-version-type", { ...base, schemaVersion: "4" }],
-      ["unsupported-version", { ...base, schemaVersion: 5 }],
+      ["unsupported-version", { ...base, schemaVersion: SESSION_SCHEMA_VERSION + 1 }],
       ["old-version-zero", { ...base, schemaVersion: 0 }],
     ];
 
@@ -205,7 +206,7 @@ test("load migrates valid v1 through v4 records without losing fields", () => {
       ["v1", { ...validSession({ sessionId: "v1" }), schemaVersion: undefined, mode: undefined, thoughtLevel: undefined }],
       ["v2", { ...validSession({ sessionId: "v2" }), schemaVersion: 2, thoughtLevel: undefined }],
       ["v3", { ...validSession({ sessionId: "v3" }), schemaVersion: 3, displayText: undefined }],
-      ["v4", { ...validSession({ sessionId: "v4" }), schemaVersion: 4, displayText: { "1": "hello" } }],
+      ["v4", { ...validSession({ sessionId: "v4" }), schemaVersion: 4, displayText: { "1": "hello" }, goal: undefined }],
     ];
     for (const [id, value] of records) {
       writeRaw(dir, id, value);
@@ -214,8 +215,52 @@ test("load migrates valid v1 through v4 records without losing fields", () => {
       assert.equal(loaded?.sessionId, id);
       assert.equal(loaded?.thoughtLevel, "max", id);
       assert.equal(loaded?.mode, "default", id);
+      assert.equal(loaded?.goal, undefined, id);
       if (id === "v4") assert.deepEqual(loaded?.displayText, { "1": "hello" });
     }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("a v5 record round-trips its goal and rejects a malformed one", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const goal: GoalState = {
+      condition: "all tests pass",
+      status: "paused",
+      judgeModel: "glm-5.3-flash",
+      setAt: "2026-11-27T10:00:00.000Z",
+      rounds: 2,
+      maxRounds: 20,
+      noProgressRounds: 0,
+      lastVerdict: "not_met",
+      lastReason: "refresh still fails",
+      pauseReason: "budget",
+      tokens: { inputTokens: 11, outputTokens: 7, totalTokens: 18 },
+    };
+    const session = validSession({ goal });
+    await store.save(session);
+    assert.deepEqual(store.load(session.sessionId), { ...session, schemaVersion: SESSION_SCHEMA_VERSION });
+
+    for (const [index, broken] of [
+      { ...goal, status: "done" },
+      { ...goal, rounds: -1 },
+      { ...goal, maxRounds: 0 },
+      { ...goal, pauseReason: "because" },
+      { ...goal, tokens: { inputTokens: 1 } },
+      "goal",
+    ].entries()) {
+      const id = `bad-goal-${index}`;
+      writeRaw(dir, id, validSession({ sessionId: id, goal: broken as PersistedSession["goal"] }));
+      assert.equal(store.load(id), undefined, JSON.stringify(broken));
+    }
+    // Validation runs before any I/O, so the rejection is synchronous.
+    assert.throws(
+      () => store.save(validSession({ goal: { ...goal, status: "finished" } as unknown as GoalState })),
+      /Invalid persisted session/
+    );
   } finally {
     cleanup(dir);
   }
