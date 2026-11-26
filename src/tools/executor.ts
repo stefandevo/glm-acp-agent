@@ -614,10 +614,13 @@ export class ToolExecutor {
           sessionId: this.sessionId,
           toolCall: {
             toolCallId,
-            title: elideStringForPreview(question.question),
+            // Full text, like every other permission request: the user is
+            // choosing from this question, so nothing may be elided on the
+            // approval channel — card elision stays on sessionUpdate.
+            title: question.question,
             kind: "other",
             status: "pending",
-            rawInput: elideForPreview(args),
+            rawInput: args,
           },
           options: [
             ...question.options.map((option) => ({

@@ -278,6 +278,51 @@ test("without elicitation a multi-select tells the model to ask in text", async 
   );
 });
 
+test("the permission request carries the full question and arguments", async () => {
+  const args = structuredClone(SINGLE_ARGS);
+  const question = args.questions[0];
+  question.question = question.question +
+    " — note the condition that decides the answer sits at the very end of a question " +
+    "that runs far past every preview elision budget in the client card, so only the " +
+    "full untruncated text carried on the approval channel can show it to the user.";
+  const fullText = question.question;
+  assert.ok(fullText.length > 240);
+  const conn = askConnection({ outcome: { outcome: "selected", optionId: "chrono" } });
+  const exec = new ToolExecutor(conn as never, "s1", {});
+  const result = await exec.execute("t1", "ask_user_question", JSON.stringify(args));
+  assert.equal(result.outcome, "completed");
+
+  // the approval channel carries the whole question and the whole payload
+  const request = conn.permissionRequests[0] as { toolCall: Record<string, unknown> };
+  assert.equal(request.toolCall["title"], fullText);
+  assert.deepEqual(request.toolCall["rawInput"], JSON.parse(JSON.stringify(args)));
+
+  // the announcement card keeps its preview elision
+  const announcement = conn.updates[0] as { update: Record<string, unknown> };
+  const rawInput = (announcement.update["rawInput"] as { questions: Array<{ question: unknown }> });
+  assert.match(String(rawInput.questions[0].question), /\[\d+ chars\]$/);
+});
+
+test("duplicate question text is rejected before anything is shown", async () => {
+  const duplicate = {
+    questions: [SINGLE_ARGS.questions[0], { ...SINGLE_ARGS.questions[0], header: "Library again" }],
+  };
+  assert.match(parseAskQuestions(duplicate) as string, /duplicates an earlier question/);
+
+  const conn = askConnection({ action: "accept", content: {} });
+  const exec = new ToolExecutor(conn as never, "s1", FORM_CAPS);
+  const result = await exec.execute("t1", "ask_user_question", JSON.stringify(duplicate));
+  assert.equal(conn.elicitations.length, 0);
+  assert.equal(conn.permissionRequests.length, 0);
+  assert.match(result.content, /questions\[1\].question duplicates an earlier question/);
+  // the parse error precedes the announcement: one failed card, no pending
+  const updates = conn.updates.map((update) => update["update"] as Record<string, unknown>);
+  assert.deepEqual(
+    updates.map((update) => `${update["sessionUpdate"]}:${update["status"]}`),
+    ["tool_call:failed"]
+  );
+});
+
 test("a transport failure closes the announced card", async () => {
   const conn = askConnection(() => {
     throw new Error("connection reset");

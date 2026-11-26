@@ -42,12 +42,19 @@ export function parseAskQuestions(args: Record<string, unknown>): AskQuestion[] 
   if (!Array.isArray(raw)) return "`questions` must be an array of questions.";
   if (raw.length < 1 || raw.length > 4) return "`questions` must hold 1-4 questions.";
   const questions: AskQuestion[] = [];
+  // Answers are keyed by question text, so a repeated question would
+  // silently drop the earlier answer; reject it before anything is shown.
+  const seenQuestions = new Set<string>();
   for (let index = 0; index < raw.length; index += 1) {
     const entry: unknown = raw[index];
     if (typeof entry !== "object" || entry === null) return `questions[${index}] must be an object.`;
     const record = entry as Record<string, unknown>;
     const question = typeof record["question"] === "string" ? record["question"].trim() : "";
     if (!question) return `questions[${index}].question is required.`;
+    if (seenQuestions.has(question)) {
+      return `questions[${index}].question duplicates an earlier question; give each question distinct text, so each answer has its own key.`;
+    }
+    seenQuestions.add(question);
     const header = typeof record["header"] === "string" ? record["header"].trim() : "";
     if (!header) return `questions[${index}].header is required.`;
     const multiSelect = record["multiSelect"];
