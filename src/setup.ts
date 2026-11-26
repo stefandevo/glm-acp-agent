@@ -17,15 +17,42 @@ export async function runSetup(
   output.write("===================\n\n");
   output.write("Get a Z.AI API key from https://z.ai/manage-apikey/apikey-list\n\n");
 
-  const apiKey = (await readSecret(input, output, "Z_AI_API_KEY: ")).trim();
+  const stream = input as NodeJS.ReadStream;
+  const isTTY = stream.isTTY === true && typeof stream.setRawMode === "function";
+  // Piped input is read through one buffered line iterator so lines that
+  // arrive together are not lost between prompts; a TTY masks the key.
+  const piped = isTTY ? undefined : createInterface({ input, terminal: false });
+  const lines = piped?.[Symbol.asyncIterator]();
+  const nextLine = async (prompt: string): Promise<string> => {
+    output.write(prompt);
+    const line = await lines!.next();
+    return line.done ? "" : line.value;
+  };
+  try {
+    const apiKey = (lines ? await nextLine("Z_AI_API_KEY: ") : await readSecret(input, output, "Z_AI_API_KEY: ")).trim();
 
-  if (apiKey.length === 0) {
-    throw new Error("No API key entered; aborting setup.");
+    if (apiKey.length === 0) {
+      throw new Error("No API key entered; aborting setup.");
+    }
+
+    output.write("\nOptional: Z.AI team seat for /usage quota (leave both blank for a personal key).\n");
+    const ask = async (prompt: string): Promise<string> => {
+      if (lines) return (await nextLine(prompt)).trim();
+      const rl = createInterface({ input, output, terminal: false });
+      try { return (await rl.question(prompt)).trim(); } finally { rl.close(); }
+    };
+    const organizationId = await ask("Z_AI_ORGANIZATION_ID: ");
+    const projectId = await ask("Z_AI_PROJECT_ID: ");
+    if (!organizationId !== !projectId) {
+      throw new Error("Team seat needs both an organization ID and a project ID; aborting setup.");
+    }
+
+    writeCredentials(apiKey, path, { organizationId, projectId });
+    output.write(`\nAPI key${organizationId ? " and team seat" : ""} saved to ${path}\n`);
+    output.write("You can now run `glm-acp-agent` from your ACP client.\n");
+  } finally {
+    piped?.close();
   }
-
-  writeCredentials(apiKey);
-  output.write(`\nAPI key saved to ${path}\n`);
-  output.write("You can now run `glm-acp-agent` from your ACP client.\n");
 }
 
 /**

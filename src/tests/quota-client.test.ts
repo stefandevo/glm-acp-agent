@@ -198,3 +198,130 @@ test("formats actual usage, remaining credits, resets, and timestamps", async ()
   assert.match(text, /Resets: 2026-10-25T10:00:00.000Z/);
   assert.match(text, /Last updated:/);
 });
+
+const ORG = "org-placeholder-0001";
+const PROJECT = "proj-placeholder-0002";
+const teamReply = () => ({
+  code: 200, success: true,
+  data: {
+    level: "max",
+    limits: [
+      { type: "CREDIT_LIMIT", unit: 3, number: 5, usage: 4000, currentValue: 1000, remaining: 3000, percentage: 25, nextResetTime: reset },
+      { type: "CREDIT_LIMIT", unit: 6, number: 1, usage: 40000, currentValue: 30000, remaining: 10000, percentage: 75, nextResetTime: reset + 6 * 86_400_000 },
+    ],
+  },
+});
+
+test("personal keys send the unchanged request when no team seat is configured", async () => {
+  const seen: { url: string; headers: [string, string][] }[] = [];
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}),
+    fetch: async (url, init) => {
+      seen.push({ url: String(url), headers: [...new Headers(init?.headers)].sort() });
+      assert.equal(init?.redirect, "error");
+      return json(payload());
+    },
+  });
+  await client.getUsage();
+  assert.deepEqual(seen, [{
+    url: "https://api.z.ai/api/monitor/usage/quota/limit",
+    headers: [["accept", "application/json"], ["authorization", "test-key"]],
+  }]);
+});
+
+test("team seats add type=2 and the organization and project headers", async () => {
+  const seen: { url: string; init?: RequestInit }[] = [];
+  const client = new QuotaClient({ resolveKey: () => "test-key",
+    resolveTeam: () => ({ organizationId: ` ${ORG} `, projectId: PROJECT }),
+    fetch: async (url, init) => { seen.push({ url: String(url), init }); return json(teamReply()); },
+  });
+  const result = await client.getUsage();
+  assert.equal(result.unavailable, undefined);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.url, "https://api.z.ai/api/monitor/usage/quota/limit?type=2");
+  const headers = new Headers(seen[0]!.init?.headers);
+  assert.equal(headers.get("Authorization"), "test-key");
+  assert.equal(headers.get("bigmodel-organization"), ORG);
+  assert.equal(headers.get("bigmodel-project"), PROJECT);
+  assert.equal(seen[0]!.init?.redirect, "error");
+});
+
+test("team seats keep the allowed-host rule", async () => {
+  const client = new QuotaClient({ baseUrl: () => "https://example.com", resolveKey: () => "private-key",
+    resolveTeam: () => ({ organizationId: ORG, projectId: PROJECT }),
+    fetch: async () => { throw new Error("must not fetch"); },
+  });
+  const result = await client.getUsage();
+  assert.equal(result.unavailable?.reason, "unsupportedEndpoint");
+});
+
+test("a half-configured or malformed team seat is unavailable and sends nothing", async () => {
+  for (const seat of [{ organizationId: ORG }, { projectId: PROJECT }, { organizationId: ORG, projectId: "  " },
+    { organizationId: `${ORG}\r\nx-injected: 1`, projectId: PROJECT }, { organizationId: ORG, projectId: "has space" }]) {
+    let calls = 0;
+    const client = new QuotaClient({ resolveKey: () => "private-key", resolveTeam: () => seat,
+      fetch: async () => { calls++; return json(payload()); },
+    });
+    const result = await client.getUsage();
+    assert.equal(calls, 0);
+    assert.equal(result.unavailable?.reason, "missingCredentials");
+    assert.match(result.unavailable!.message, /Z_AI_ORGANIZATION_ID/);
+    assert.deepEqual(result.windows, []);
+    assert.doesNotMatch(JSON.stringify(result), /private-key|placeholder|injected|has space/);
+  }
+});
+
+test("changing the team seat invalidates cached quota", async () => {
+  let seat: { organizationId?: string; projectId?: string } = {};
+  const requests: string[] = [];
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => seat,
+    fetch: async (url, init) => {
+      const headers = new Headers(init?.headers);
+      requests.push(`${String(url)} ${headers.get("bigmodel-organization")} ${headers.get("bigmodel-project")}`);
+      return json(teamReply());
+    },
+  });
+  await client.getUsage();
+  await client.getUsage();
+  assert.equal(requests.length, 1); // cached within the minute
+  seat = { organizationId: ORG, projectId: PROJECT };
+  await client.getUsage();
+  seat = { organizationId: ORG, projectId: "proj-placeholder-0003" };
+  await client.getUsage();
+  await client.getUsage();
+  seat = {};
+  await client.getUsage();
+  assert.deepEqual(requests, [
+    "https://api.z.ai/api/monitor/usage/quota/limit null null",
+    `https://api.z.ai/api/monitor/usage/quota/limit?type=2 ${ORG} ${PROJECT}`,
+    `https://api.z.ai/api/monitor/usage/quota/limit?type=2 ${ORG} proj-placeholder-0003`,
+    "https://api.z.ai/api/monitor/usage/quota/limit null null",
+  ]);
+});
+
+test("parses a team reply with 5-hour and 7-day credit windows", async () => {
+  const client = new QuotaClient({ resolveKey: () => "test-key",
+    resolveTeam: () => ({ organizationId: ORG, projectId: PROJECT }),
+    fetch: async () => json(teamReply()),
+  });
+  const { windows } = await client.getUsage();
+  assert.deepEqual(windows, [{
+    id: "credit_limit-3-5", label: "5-hour Model quota", kind: "session",
+    usedPercent: 25, windowDurationMins: 300, used: 1000, limit: 4000, remaining: 3000,
+    unit: "credits", resetsAt: "2026-10-25T10:00:00.000Z",
+  }, {
+    id: "credit_limit-6-1", label: "1-week Model quota", kind: "weekly",
+    usedPercent: 75, windowDurationMins: 7 * 24 * 60, used: 30000, limit: 40000, remaining: 10000,
+    unit: "credits", resetsAt: "2026-10-31T10:00:00.000Z",
+  }]);
+});
+
+test("team-seat business failures point at the seat settings without echoing IDs", async () => {
+  const client = new QuotaClient({ resolveKey: () => "private-key",
+    resolveTeam: () => ({ organizationId: ORG, projectId: PROJECT }),
+    fetch: async () => json({ code: 500, success: false, msg: "private" }),
+  });
+  const result = await client.getUsage();
+  assert.equal(result.unavailable?.reason, "requestFailed");
+  assert.match(result.unavailable!.message, /team-seat quota/);
+  assert.doesNotMatch(JSON.stringify(result), /private|placeholder/);
+});

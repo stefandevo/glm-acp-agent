@@ -1,4 +1,4 @@
-import { resolveApiKey } from "./credentials.js";
+import { resolveApiKey, resolveTeamSeat, type TeamSeat } from "./credentials.js";
 
 export interface QuotaWindow {
   id: string;
@@ -28,6 +28,8 @@ export interface QuotaSnapshot {
 interface QuotaClientOptions {
   fetch?: typeof fetch;
   resolveKey?: () => string | undefined;
+  /** Optional Z.AI team seat; both IDs select team-seat quota. */
+  resolveTeam?: () => TeamSeat;
   baseUrl?: () => string;
   now?: () => number;
   cacheMs?: number;
@@ -38,6 +40,9 @@ interface QuotaClientOptions {
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_WINDOWS = 64;
+// Opaque provider identifiers sent as header values: visible ASCII only, bounded.
+const TEAM_ID_PATTERN = /^[\x21-\x7e]{1,256}$/;
+const TEAM_HEADERS = { organization: "bigmodel-organization", project: "bigmodel-project" } as const;
 
 class QuotaError extends Error {
   constructor(readonly reason: NonNullable<QuotaSnapshot["unavailable"]>["reason"], message: string) {
@@ -66,7 +71,7 @@ export function parseQuotaWindows(value: unknown): QuotaWindow[] {
     throw new QuotaError("authenticationFailed", "Z.AI rejected the quota credentials. Check your Coding Plan API key.");
   }
   if (envelope.success === false || (envelope.code !== undefined && ![0, 200, "0", "200"].includes(envelope.code as number | string))) {
-    throw new QuotaError("requestFailed", "Z.AI could not return Coding Plan quota. Check your subscription in the Z.AI dashboard.");
+    throw new QuotaError("requestFailed", "Z.AI could not return Coding Plan quota. Check your subscription in the Z.AI dashboard. For a team-seat key, set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID.");
   }
   const limits = record(envelope.data)?.limits;
   if (!Array.isArray(limits) || limits.length > MAX_WINDOWS) return invalidResponse();
@@ -114,6 +119,25 @@ export function parseQuotaWindows(value: unknown): QuotaWindow[] {
   return windows;
 }
 
+/**
+ * Validate the optional team seat before anything is sent. Messages name the
+ * settings, never their values.
+ */
+function teamSeat(seat: TeamSeat): { organizationId: string; projectId: string } | undefined {
+  const organizationId = seat.organizationId?.trim() || undefined;
+  const projectId = seat.projectId?.trim() || undefined;
+  if (!organizationId && !projectId) return undefined;
+  if (!organizationId || !projectId) {
+    throw new QuotaError("missingCredentials",
+      "Team-seat quota needs both Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID (or both in glm-acp-agent --setup). Set both, or unset both for a personal key.");
+  }
+  if (!TEAM_ID_PATTERN.test(organizationId) || !TEAM_ID_PATTERN.test(projectId)) {
+    throw new QuotaError("missingCredentials",
+      "Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID must be printable IDs without spaces.");
+  }
+  return { organizationId, projectId };
+}
+
 /** Only send quota credentials to supported provider origins, never an arbitrary model proxy. */
 function quotaUrl(baseUrl: string): string {
   let url: URL;
@@ -152,6 +176,7 @@ async function readQuotaJson(response: Response, signal: AbortSignal): Promise<u
 /** Account-wide, memory-only cache shared by prompts and extension requests in this process. */
 export class QuotaClient {
   private cached?: { key: string; attemptedAt: number; snapshot: QuotaSnapshot };
+  // Cache keys hold the API key and team IDs; they stay in memory and are never surfaced.
   private pending?: { key: string; promise: Promise<QuotaSnapshot> };
 
   constructor(private readonly options: QuotaClientOptions = {}) {}
@@ -162,11 +187,15 @@ export class QuotaClient {
     let key: string;
     let url: string;
     let apiKey: string | undefined;
+    let team: ReturnType<typeof teamSeat>;
     try {
       url = quotaUrl(this.options.baseUrl?.() ?? process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL);
       apiKey = (this.options.resolveKey ?? resolveApiKey)();
       if (!apiKey) throw new QuotaError("missingCredentials", "Set Z_AI_API_KEY or run glm-acp-agent --setup to check quota.");
-      key = `${url}\n${apiKey}`;
+      team = teamSeat((this.options.resolveTeam ?? resolveTeamSeat)());
+      if (team) url = `${url}?type=2`;
+      // Switching key, region, or team seat invalidates the cache.
+      key = team ? `${url}\n${apiKey}\n${team.organizationId}\n${team.projectId}` : `${url}\n${apiKey}`;
     } catch (err) {
       this.cached = undefined;
       return this.failure(err, time);
@@ -178,7 +207,7 @@ export class QuotaClient {
     }
     if (this.pending?.key === key) return structuredClone(await this.pending.promise);
     const previous = this.cached?.snapshot;
-    const promise = this.fetchUsage(url, apiKey, now).catch(err => this.failure(err, now(), previous));
+    const promise = this.fetchUsage(url, apiKey, team, now).catch(err => this.failure(err, now(), previous));
     const pending = { key, promise };
     this.pending = pending;
     try {
@@ -190,13 +219,22 @@ export class QuotaClient {
     }
   }
 
-  private async fetchUsage(url: string, apiKey: string, now: () => number): Promise<QuotaSnapshot> {
+  private async fetchUsage(
+    url: string,
+    apiKey: string,
+    team: ReturnType<typeof teamSeat>,
+    now: () => number,
+  ): Promise<QuotaSnapshot> {
     const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 10_000);
     const parentSignal = this.options.signal?.();
     const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout;
     const response = await (this.options.fetch ?? fetch)(url, {
       // The provider's official usage script sends the key without a Bearer prefix.
-      headers: { Authorization: apiKey, Accept: "application/json" },
+      // Team seats add the seat headers, as Z.AI's own desktop client does.
+      headers: team
+        ? { Authorization: apiKey, Accept: "application/json",
+          [TEAM_HEADERS.organization]: team.organizationId, [TEAM_HEADERS.project]: team.projectId }
+        : { Authorization: apiKey, Accept: "application/json" },
       redirect: "error",
       signal,
     });
@@ -207,7 +245,17 @@ export class QuotaClient {
       }
       throw new QuotaError("requestFailed", `Quota lookup failed (HTTP ${response.status}). Try again later.`);
     }
-    const windows = parseQuotaWindows(await readQuotaJson(response, signal));
+    const body = await readQuotaJson(response, signal);
+    let windows: QuotaWindow[];
+    try {
+      windows = parseQuotaWindows(body);
+    } catch (err) {
+      if (team && err instanceof QuotaError && err.reason === "requestFailed") {
+        throw new QuotaError("requestFailed",
+          "Z.AI could not return team-seat quota. Check Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID match the key's team project.");
+      }
+      throw err;
+    }
     return { version: 1, checkedAt: new Date(now()).toISOString(), stale: false, windows };
   }
 
