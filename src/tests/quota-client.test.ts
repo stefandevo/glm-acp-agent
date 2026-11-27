@@ -56,7 +56,7 @@ test("fetches once for concurrent callers, caches for a minute, and isolates cal
   let time = reset;
   let calls = 0;
   const client = new QuotaClient({
-    resolveKey: () => "test-key", now: () => time,
+    resolveKey: () => "test-key", resolveTeam: () => ({}), now: () => time,
     baseUrl: () => "https://api.z.ai/api/coding/paas/v4",
     fetch: async (url, init) => {
       calls++;
@@ -80,7 +80,7 @@ test("fetches once for concurrent callers, caches for a minute, and isolates cal
 test("a failed refresh retains dated stale data and caches failures to avoid repeated probes", async () => {
   let time = reset;
   let calls = 0;
-  const client = new QuotaClient({ resolveKey: () => "key", now: () => time,
+  const client = new QuotaClient({ resolveKey: () => "key", resolveTeam: () => ({}), now: () => time,
     fetch: async () => { if (++calls > 1) throw new Error("secret provider response"); return json(payload()); },
   });
   const first = await client.getUsage();
@@ -100,7 +100,7 @@ test("credential or region changes invalidate cached data", async () => {
   let key: string | undefined = "first";
   let base = "https://api.z.ai/api/coding/paas/v4";
   const urls: string[] = [];
-  const client = new QuotaClient({ resolveKey: () => key, baseUrl: () => base,
+  const client = new QuotaClient({ resolveKey: () => key, resolveTeam: () => ({}), baseUrl: () => base,
     fetch: async url => { urls.push(String(url)); return urls.length === 1 ? json(payload()) : new Response("private", { status: 503 }); },
   });
   await client.getUsage();
@@ -119,7 +119,7 @@ test("credential or region changes invalidate cached data", async () => {
 test("never sends a key to custom, insecure, credential-bearing, or lookalike origins", async () => {
   for (const base of ["http://api.z.ai", "https://api.z.ai.attacker.invalid", "https://example.com",
     "https://user:pass@api.z.ai", "https://api.z.ai:8443", "invalid"]) {
-    const client = new QuotaClient({ baseUrl: () => base, resolveKey: () => "private-key",
+    const client = new QuotaClient({ baseUrl: () => base, resolveKey: () => "private-key", resolveTeam: () => ({}),
       fetch: async () => { throw new Error("must not fetch"); },
     });
     const result = await client.getUsage();
@@ -132,7 +132,7 @@ test("handles HTTP and business authentication errors and clears previous quota"
   for (const response of [() => new Response("private", { status: 401 }), () => new Response("private", { status: 403 }),
     () => json({ code: 401, msg: "private" }), () => json({ code: "403", success: false, msg: "private" })]) {
     let calls = 0;
-    const client = new QuotaClient({ resolveKey: () => "private-key", cacheMs: 0,
+    const client = new QuotaClient({ resolveKey: () => "private-key", resolveTeam: () => ({}), cacheMs: 0,
       fetch: async () => ++calls === 1 ? json(payload()) : response(),
     });
     await client.getUsage();
@@ -151,7 +151,7 @@ test("handles rate limiting, business failures, malformed JSON, and oversized bo
     [() => new Response("private"), "invalidResponse"],
     [() => new Response("x".repeat(256 * 1024 + 1)), "invalidResponse"],
   ] as const) {
-    const client = new QuotaClient({ resolveKey: () => "private-key", fetch: async () => response() });
+    const client = new QuotaClient({ resolveKey: () => "private-key", resolveTeam: () => ({}), fetch: async () => response() });
     const result = await client.getUsage();
     assert.equal(result.unavailable?.reason, reason);
     assert.deepEqual(result.windows, []);
@@ -161,7 +161,7 @@ test("handles rate limiting, business failures, malformed JSON, and oversized bo
 
 test("bounds a stalled response body with the request deadline", async () => {
   let cancelled = false;
-  const client = new QuotaClient({ resolveKey: () => "key", timeoutMs: 20,
+  const client = new QuotaClient({ resolveKey: () => "key", resolveTeam: () => ({}), timeoutMs: 20,
     fetch: async () => new Response(new ReadableStream({ cancel() { cancelled = true; } })),
   });
   // AbortSignal.timeout is unref'ed; keep the test alive while the response stalls.
@@ -176,7 +176,7 @@ test("transport disconnect aborts a shared in-flight quota request", async () =>
   const controller = new AbortController();
   let started!: () => void;
   const ready = new Promise<void>(resolve => { started = resolve; });
-  const client = new QuotaClient({ resolveKey: () => "key", signal: () => controller.signal,
+  const client = new QuotaClient({ resolveKey: () => "key", resolveTeam: () => ({}), signal: () => controller.signal,
     fetch: async (_url, init) => {
       const signal = init!.signal!;
       started();
@@ -190,7 +190,7 @@ test("transport disconnect aborts a shared in-flight quota request", async () =>
 });
 
 test("formats actual usage, remaining credits, resets, and timestamps", async () => {
-  const client = new QuotaClient({ resolveKey: () => "key", fetch: async () => json(payload()) });
+  const client = new QuotaClient({ resolveKey: () => "key", resolveTeam: () => ({}), fetch: async () => json(payload()) });
   const text = formatQuotaUsage(await client.getUsage());
   assert.match(text, /25% used/);
   assert.match(text, /Remaining: 1500 credits/);
@@ -428,6 +428,63 @@ test("multiple active team projects ask for an explicit seat and send no team re
   assert.match(result.unavailable!.message, /Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID/);
   assert.deepEqual(result.windows, []);
   assert.doesNotMatch(JSON.stringify(result), PRIVATE);
+});
+
+test("truncated organization or project lists decline automatic selection without calling type=2", async () => {
+  const tooManyOrgs = customerInfo([
+    { organizationId: ORG, projects: [project(PROJECT, ORG, 2)] },
+    ...Array.from({ length: 63 }, (_, i) => ({
+      organizationId: `org-personal-placeholder-${i}`,
+      projects: [project(`proj-personal-placeholder-${i}`, `org-personal-placeholder-${i}`, 1)],
+    })),
+    { organizationId: "org-hidden-placeholder", projects: [project("proj-hidden-placeholder", "org-hidden-placeholder", 2)] },
+  ]);
+  const tooManyProjects = customerInfo([
+    {
+      organizationId: ORG,
+      projects: [
+        project(PROJECT, ORG, 2),
+        ...Array.from({ length: 63 }, (_, i) => project(`proj-personal-placeholder-${i}`, ORG, 1)),
+        project("proj-hidden-placeholder", ORG, 2),
+      ],
+    },
+  ]);
+  for (const reply of [tooManyOrgs, tooManyProjects]) {
+    const { seen, fetch } = discoveryFetch({ customer: () => json(reply) });
+    const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), cacheMs: 0, fetch });
+    const result = await client.getUsage();
+    assert.deepEqual(seen.map(s => s.url), [QUOTA_URL, CUSTOMER_URL]);
+    assert.equal(result.unavailable?.reason, "requestFailed");
+    assert.match(result.unavailable!.message, /Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID/);
+    assert.deepEqual(result.windows, []);
+    assert.doesNotMatch(JSON.stringify(result), PRIVATE);
+    // Confirm no seat was remembered for the next refresh.
+    await client.getUsage();
+    assert.deepEqual(seen.slice(2).map(s => s.url), [QUOTA_URL, CUSTOMER_URL]);
+  }
+});
+
+test("discovery still auto-selects at the exact 64-organization and 64-project boundary", async () => {
+  const atLimit = customerInfo([
+    {
+      organizationId: ORG,
+      projects: [
+        project(PROJECT, ORG, 2),
+        ...Array.from({ length: 63 }, (_, i) => project(`proj-personal-placeholder-${i}`, ORG, 1)),
+      ],
+    },
+    ...Array.from({ length: 63 }, (_, i) => ({
+      organizationId: `org-personal-placeholder-${i}`,
+      projects: [project(`proj-personal-placeholder-${i}`, `org-personal-placeholder-${i}`, 1)],
+    })),
+  ]);
+  const { seen, fetch } = discoveryFetch({ customer: () => json(atLimit) });
+  const client = new QuotaClient({ resolveKey: () => "test-key", resolveTeam: () => ({}), fetch });
+  const result = await client.getUsage();
+  assert.equal(result.unavailable, undefined);
+  assert.deepEqual(seen.map(s => s.url), [QUOTA_URL, CUSTOMER_URL, `${QUOTA_URL}?type=2`]);
+  assert.equal(seen[2]!.headers.get("bigmodel-organization"), ORG);
+  assert.equal(seen[2]!.headers.get("bigmodel-project"), PROJECT);
 });
 
 test("no team project or a failed discovery falls back to the original failure without leaking the reply", async () => {

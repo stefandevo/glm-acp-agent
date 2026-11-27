@@ -196,9 +196,10 @@ two IDs are read from the account reply; names, contact details, and IDs are
 never included in errors. If discovery fails or finds no team project, the
 original "no coding plan" error is reported.
 
-If the account belongs to more than one active team project, the agent does not
-guess: quota is reported as `requestFailed` and asks you to choose the seat.
-Set the team's organization ID and project ID explicitly to override discovery:
+If the account belongs to more than one active team project (or lists more than
+64 organizations or projects), the agent does not guess: quota is reported as
+`requestFailed` and asks you to choose the seat. Set the team's organization ID
+and project ID explicitly to override discovery:
 
 ```bash
 export Z_AI_ORGANIZATION_ID=org-xxxxxxxxxxxxxxxx
@@ -207,7 +208,8 @@ export Z_AI_PROJECT_ID=proj-xxxxxxxxxxxxxxxx
 
 …or enter both when `glm-acp-agent --setup` asks for them (stored as
 `z_ai_organization_id` / `z_ai_project_id` in `credentials.json`). When either
-environment variable is set, the environment pair wins over the file as a unit.
+environment variable is set (including to a blank value to clear a stored seat),
+the environment pair wins over the file as a unit.
 With both set, discovery is skipped and the lookup goes straight to `?type=2`
 with those IDs. If only one is set, or a value contains whitespace or control
 characters, quota is reported as `missingCredentials` and no request is sent.

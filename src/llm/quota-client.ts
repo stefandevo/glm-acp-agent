@@ -158,20 +158,31 @@ function quotaUrl(baseUrl: string): string {
   return new URL("/api/monitor/usage/quota/limit", url.origin).href;
 }
 
+interface TeamProjectScan {
+  projects: TeamIds[];
+  truncated: boolean;
+}
+
 /**
- * Pick the account's active team projects from a getCustomerInfo reply. Only
- * the two IDs are kept; names, contact details, and other fields are ignored.
+ * Scan the account's active team projects from a getCustomerInfo reply within
+ * bounded organization and project limits, reporting whether either list
+ * exceeded the scan cap. Only the two IDs are kept; names, contact details,
+ * and other fields are ignored.
  */
-export function parseTeamProjects(value: unknown): TeamIds[] {
+function scanTeamProjects(value: unknown): TeamProjectScan {
   const envelope = record(value);
   if (!envelope || envelope.success === false ||
-      (envelope.code !== undefined && ![0, 200, "0", "200"].includes(envelope.code as number | string))) return [];
+      (envelope.code !== undefined && ![0, 200, "0", "200"].includes(envelope.code as number | string))) {
+    return { projects: [], truncated: false };
+  }
   const organizations = record(envelope.data)?.organizations;
-  if (!Array.isArray(organizations)) return [];
+  if (!Array.isArray(organizations)) return { projects: [], truncated: false };
+  let truncated = organizations.length > MAX_ORGANIZATIONS;
   const found = new Map<string, TeamIds>();
   for (const rawOrganization of organizations.slice(0, MAX_ORGANIZATIONS)) {
     const organization = record(rawOrganization);
     if (!organization || !Array.isArray(organization.projects)) continue;
+    if (organization.projects.length > MAX_PROJECTS) truncated = true;
     for (const rawProject of organization.projects.slice(0, MAX_PROJECTS)) {
       const project = record(rawProject);
       if (!project || project.projectType !== TEAM_PROJECT_TYPE) continue;
@@ -185,7 +196,15 @@ export function parseTeamProjects(value: unknown): TeamIds[] {
       found.set(`${organizationId}\n${projectId}`, { organizationId, projectId });
     }
   }
-  return [...found.values()];
+  return { projects: [...found.values()], truncated };
+}
+
+/**
+ * Pick the account's active team projects from a getCustomerInfo reply. Only
+ * the two IDs are kept; names, contact details, and other fields are ignored.
+ */
+export function parseTeamProjects(value: unknown): TeamIds[] {
+  return scanTeamProjects(value).projects;
 }
 
 async function readQuotaJson(response: Response, signal: AbortSignal): Promise<unknown> {
@@ -306,20 +325,24 @@ export class QuotaClient {
 
   /** Find the key's single active team project, or rethrow the original lookup failure. */
   private async discoverTeam(url: string, apiKey: string, signal: AbortSignal, original: QuotaError): Promise<TeamIds> {
-    let seats: TeamIds[];
+    let scan: TeamProjectScan;
     try {
-      seats = parseTeamProjects(await this.getJson(new URL("/api/biz/customer/getCustomerInfo", url).href, apiKey, signal));
+      scan = scanTeamProjects(await this.getJson(new URL("/api/biz/customer/getCustomerInfo", url).href, apiKey, signal));
     } catch (err) {
       // Discovery is best effort; keep cancellation, but never surface its errors or body.
       if (signal.aborted) throw err;
       throw original;
     }
-    if (seats.length > 1) {
+    if (scan.projects.length > 1) {
       throw new QuotaError("requestFailed",
         "Multiple Z.AI team projects found for this account. Set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID to select the team seat.");
     }
-    if (!seats[0]) throw original;
-    return seats[0];
+    if (scan.truncated) {
+      throw new QuotaError("requestFailed",
+        "Too many Z.AI organizations or projects to auto-select a team seat. Set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID to select the team seat.");
+    }
+    if (!scan.projects[0]) throw original;
+    return scan.projects[0];
   }
 
   private async teamQuota(

@@ -86,13 +86,17 @@ export function readCredentialsTeamSeat(path: string = credentialsPath()): TeamS
 
 /**
  * Resolve the optional team seat. The environment pair
- * (`Z_AI_ORGANIZATION_ID` / `Z_AI_PROJECT_ID`) wins as a unit when either
- * variable is set, so a stale file value is never mixed with an env value.
+ * (`Z_AI_ORGANIZATION_ID` / `Z_AI_PROJECT_ID`) wins as a unit whenever either
+ * variable is present in the environment (including when blank/whitespace to
+ * clear a seat stored in `credentials.json`), so a stale file value is never
+ * mixed with an env override.
  */
 export function resolveTeamSeat(): TeamSeat {
-  const organizationId = nonEmptyString(process.env["Z_AI_ORGANIZATION_ID"]);
-  const projectId = nonEmptyString(process.env["Z_AI_PROJECT_ID"]);
-  if (organizationId || projectId) {
+  const rawOrganizationId = process.env["Z_AI_ORGANIZATION_ID"];
+  const rawProjectId = process.env["Z_AI_PROJECT_ID"];
+  if (rawOrganizationId !== undefined || rawProjectId !== undefined) {
+    const organizationId = nonEmptyString(rawOrganizationId);
+    const projectId = nonEmptyString(rawProjectId);
     debug("resolveTeamSeat: source=env");
     return {
       ...(organizationId ? { organizationId } : {}),

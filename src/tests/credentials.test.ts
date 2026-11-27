@@ -180,6 +180,25 @@ test("resolveTeamSeat takes the env pair as a unit over the credentials file", (
   });
 });
 
+test("resolveTeamSeat lets blank env overrides clear a stored credentials-file seat", () => {
+  withTmp((dir) => {
+    writeCredentials("k", join(dir, "glm-acp-agent", "credentials.json"),
+      { organizationId: "org-file", projectId: "proj-file" });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "", Z_AI_PROJECT_ID: "" }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "   ", Z_AI_PROJECT_ID: "\t" }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "", Z_AI_PROJECT_ID: undefined }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: undefined, Z_AI_PROJECT_ID: "  " }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+  });
+});
+
 test("runSetup stores a team seat from piped input, or none when left blank", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-setup-"));
   const old = process.env["XDG_CONFIG_HOME"];
