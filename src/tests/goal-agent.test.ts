@@ -521,3 +521,44 @@ test("ACP_GLM_GOAL_MAX_TURNS sets the agent-wide goal turn limit; --turns still 
     assert.equal(plain.modelCalls.length, 2);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+test("--judge is validated against the advertised models and the id is canonicalised", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "ok" }], judge: [MET("yes"), MET("yes")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    // A bogus id is rejected with the list, before any model call; nothing is set.
+    const rejected = await h.status(sessionId, "/goal --judge umbrella fix the build");
+    assert.match(rejected, /Unknown evaluator model "umbrella"\. Advertised models: glm-5\.4, glm-5\.3, glm-5\.3-flash, glm-5-turbo, glm-4\.7/);
+    assert.match(rejected, /ACP_GLM_AVAILABLE_MODELS/);
+    assert.match(await h.status(sessionId), /No goal set/);
+    assert.equal(h.modelCalls.length, 0);
+    assert.equal(h.judgeCalls.length, 0);
+    // Typed after the condition, in a different case: the flag is honoured and the id canonicalised.
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal fix the build --judge GLM-5.3-Flash" }] });
+    assert.equal(h.judgeOptions[0]?.model, "glm-5.3-flash");
+    assert.equal(h.judgeOptions[0]?.reasoningEffort, "low");
+    assert.match(h.lastUserText(h.modelCalls[0]!), /<condition>\nfix the build\n<\/condition>/);
+    assert.match(await h.status(sessionId), /- Evaluator: glm-5\.3-flash\n/);
+    // ACP_GLM_AVAILABLE_MODELS extends what --judge accepts.
+    process.env["ACP_GLM_AVAILABLE_MODELS"] = "glm-5.4,glm-5.3,glm-5.3-flash,glm-5-turbo,glm-4.7,glm-5.2";
+    try {
+      await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal fix it --judge glm-5.2" }] });
+      assert.equal(h.judgeOptions[1]?.model, "glm-5.2");
+    } finally { delete process.env["ACP_GLM_AVAILABLE_MODELS"]; }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("an invalid ACP_GLM_GOAL_JUDGE_MODEL is ignored and the session model judges", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    process.env["ACP_GLM_GOAL_JUDGE_MODEL"] = "umbrella";
+    try {
+      const h = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
+      const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+      await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+      assert.equal(h.judgeOptions[0]?.model, "glm-5.4");
+      assert.match(await h.status(sessionId), /- Evaluator: glm-5\.4 \(session model\)/);
+    } finally { delete process.env["ACP_GLM_GOAL_JUDGE_MODEL"]; }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});

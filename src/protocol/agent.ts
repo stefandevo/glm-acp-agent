@@ -396,13 +396,38 @@ function envGoalMaxTurns(): GoalTurnLimit | undefined {
 }
 
 /**
+ * Resolve an evaluator model id against the advertised catalog
+ * (case-insensitive), so `--judge GLM-5.3-Flash` lands on `glm-5.3-flash`.
+ * Returns `undefined` for anything else; the agent never sends an
+ * unrecognised id to the provider for a goal evaluation.
+ */
+function resolveJudgeModel(raw: string): string | undefined {
+  const wanted = raw.trim().toLowerCase();
+  return getAvailableModels().find((model) => model.modelId.toLowerCase() === wanted)?.modelId;
+}
+
+function advertisedJudgeModels(): string {
+  return getAvailableModels().map((model) => model.modelId).join(", ");
+}
+
+/**
  * Agent-wide default evaluator model for `/goal`, from
  * `$ACP_GLM_GOAL_JUDGE_MODEL`. `undefined` means the session's own model
- * judges; a goal's `--judge` flag takes precedence over this.
+ * judges; a goal's `--judge` flag takes precedence over this. An id that is
+ * not an advertised model is ignored with a stderr warning, like the other
+ * environment settings.
  */
 function envGoalJudgeModel(): string | undefined {
   const raw = process.env["ACP_GLM_GOAL_JUDGE_MODEL"]?.trim();
-  return raw ? raw : undefined;
+  if (!raw) return undefined;
+  const resolved = resolveJudgeModel(raw);
+  if (!resolved) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring ACP_GLM_GOAL_JUDGE_MODEL="${raw}": not an advertised model (${advertisedJudgeModels()}).\n`
+    );
+    return undefined;
+  }
+  return resolved;
 }
 
 /**
@@ -2287,6 +2312,16 @@ export class GlmAcpAgent implements Agent {
         }
         return { arm: command };
       case "set":
+        if (command.judgeModel !== undefined) {
+          const resolved = resolveJudgeModel(command.judgeModel);
+          if (!resolved) {
+            return {
+              reply: `Unknown evaluator model "${command.judgeModel}". Advertised models: ${advertisedJudgeModels()} (extend the list with ACP_GLM_AVAILABLE_MODELS).\n${GOAL_USAGE}`,
+              mutated: false,
+            };
+          }
+          return { arm: { ...command, judgeModel: resolved } };
+        }
         return { arm: command };
       case "invalid":
         return { reply: command.message, mutated: false };
@@ -2307,12 +2342,9 @@ export class GlmAcpAgent implements Agent {
     const now = new Date().toISOString();
     let text: string;
     if (command.kind === "set") {
+      // The flag's id was validated in applyGoalCommand; the environment's
+      // is validated by envGoalJudgeModel.
       const judgeModel = command.judgeModel ?? envGoalJudgeModel();
-      if (judgeModel && !getAvailableModels().some((model) => model.modelId === judgeModel)) {
-        process.stderr.write(
-          `[glm-acp-agent] warning: goal evaluator model "${judgeModel}" is not in the advertised list; using as-is.\n`
-        );
-      }
       session.goal = createGoal({
         condition: command.condition,
         maxRounds: this.goalMaxRounds,

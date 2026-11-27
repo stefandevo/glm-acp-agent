@@ -121,9 +121,11 @@ export function parseGoalInvocation(text: string): string | undefined {
  * A control word counts only when it is the entire argument — the DeepSeek
  * Harness grammar — so `/goal pause after verification` is a goal with that
  * text rather than a pause. `--judge <model>` picks the evaluator model and
- * `--turns <n|unlimited>` the per-round turn limit for this goal alone; both
- * may precede the condition in either order. A leading `--` escapes the
- * grammar for a condition that starts with an option or a control word.
+ * `--turns <n|unlimited>` the per-round turn limit for this goal alone. Both
+ * may come before or after the condition, in any order, so
+ * `/goal fix the build --judge glm-5.3-flash` reads the way it is typed. A
+ * leading `--` turns option parsing off for the whole remainder, for a
+ * condition that starts with an option or a control word.
  */
 export function parseGoalCommand(args: string): GoalCommand {
   const trimmed = args.trim();
@@ -134,36 +136,46 @@ export function parseGoalCommand(args: string): GoalCommand {
   let rest = trimmed;
   let judgeModel: string | undefined;
   let turnLimit: GoalTurnLimit | undefined;
+  /** Apply one `--name value` pair; returns the rejection text when it is not a known option. */
+  const applyOption = (name: string, value: string | undefined): string | undefined => {
+    if (name !== "judge" && name !== "turns") {
+      return `Unknown /goal option "--${name}". Supported: --judge <model>, --turns <n|unlimited>, or -- before a condition that starts with an option or control word.\n${GOAL_USAGE}`;
+    }
+    if (value === undefined) return `--${name} needs a value.\n${GOAL_USAGE}`;
+    if (name === "judge") {
+      judgeModel = value;
+      return undefined;
+    }
+    const parsed = parseTurnLimit(value);
+    if (parsed === undefined) {
+      return `--turns needs a positive number or "unlimited", not "${value}".\n${GOAL_USAGE}`;
+    }
+    turnLimit = parsed;
+    return undefined;
+  };
+
   if (rest === "--" || rest.startsWith("-- ")) {
     rest = rest.slice(2).trim();
   } else {
-    // Leading options, in any order and any number; the first non-option
-    // text starts the condition.
+    // Leading options, in any order and any number.
     while (rest.startsWith("--")) {
-      const match = /^--(judge|turns)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
-      if (!match) {
-        return {
-          kind: "invalid",
-          message: `Unknown /goal option. Supported: --judge <model>, --turns <n|unlimited>, or -- before a condition that starts with an option or control word.\n${GOAL_USAGE}`,
-        };
-      }
-      const value = match[2];
-      if (value === undefined) {
-        return { kind: "invalid", message: `--${match[1]} needs a value.\n${GOAL_USAGE}` };
-      }
-      if (match[1] === "judge") {
-        judgeModel = value;
-      } else {
-        const parsed = parseTurnLimit(value);
-        if (parsed === undefined) {
-          return {
-            kind: "invalid",
-            message: `--turns needs a positive number or "unlimited", not "${value}".\n${GOAL_USAGE}`,
-          };
-        }
-        turnLimit = parsed;
+      const match = /^--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
+      const rejection = match && applyOption(match[1]!, match[2]);
+      if (!match || rejection) {
+        return { kind: "invalid", message: rejection ?? `Unknown /goal option in "${rest}".\n${GOAL_USAGE}` };
       }
       rest = (match[3] ?? "").trim();
+    }
+    // Trailing options too, so `/goal fix the build --judge glm-5.3-flash`
+    // reads the way it is typed. The last `--name value` pair is peeled off
+    // until the remainder does not end in one; a bare `--word` at the end is
+    // an unknown option rather than part of the condition.
+    for (;;) {
+      const match = /^(.*?)\s--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?$/.exec(rest);
+      if (!match) break;
+      const rejection = applyOption(match[2]!, match[3]);
+      if (rejection) return { kind: "invalid", message: rejection };
+      rest = match[1]!.trim();
     }
   }
 

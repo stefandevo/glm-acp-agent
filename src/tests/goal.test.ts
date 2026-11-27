@@ -90,6 +90,33 @@ test("--turns sets the per-round turn limit; it composes with --judge in either 
   assert.match(invalidMessage("--rounds 5 x"), /--turns <n\|unlimited>/);
 });
 
+test("options may follow the condition; -- turns option parsing off for the remainder", () => {
+  assert.deepEqual(parseGoalCommand("test 3+3 --judge umbrella"), { kind: "set", condition: "test 3+3", judgeModel: "umbrella" });
+  assert.deepEqual(parseGoalCommand("fix the build --turns=unlimited --judge glm-5.3-flash"), {
+    kind: "set",
+    condition: "fix the build",
+    judgeModel: "glm-5.3-flash",
+    turnLimit: "unlimited",
+  });
+  assert.deepEqual(parseGoalCommand("--judge glm-5.3-flash fix the build --turns 300"), {
+    kind: "set",
+    condition: "fix the build",
+    judgeModel: "glm-5.3-flash",
+    turnLimit: 300,
+  });
+  // The parser keeps the id as typed; the agent matches it case-insensitively.
+  assert.deepEqual(parseGoalCommand("--judge GLM-5.3-Flash x"), { kind: "set", condition: "x", judgeModel: "GLM-5.3-Flash" });
+  // A `--word` in the middle of prose is not an option; one at the very end is.
+  assert.deepEqual(parseGoalCommand("make the --verbose flag work"), { kind: "set", condition: "make the --verbose flag work" });
+  assert.deepEqual(parseGoalCommand("-- fix -- this --judge x"), { kind: "set", condition: "fix -- this --judge x" });
+  assert.match(invalidMessage("fix it --judge"), /--judge needs a value/);
+  assert.match(invalidMessage("fix it --turns"), /--turns needs a value/);
+  assert.match(invalidMessage("fix it --turns 0"), /--turns needs a positive number/);
+  assert.match(invalidMessage("fix it --rounds 5"), /Unknown \/goal option "--rounds"/);
+  assert.match(invalidMessage("fix it --watch"), /Unknown \/goal option "--watch"/);
+  assert.match(invalidMessage("--watch fix it"), /Unknown \/goal option "--watch"/);
+});
+
 test("turn limits parse, validate, and resolve to the loop bound", () => {
   assert.equal(parseTurnLimit("1"), 1);
   assert.equal(parseTurnLimit("007"), 7);

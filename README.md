@@ -218,7 +218,7 @@ The evaluator never runs tools, so it can only judge what the agent has surfaced
 | Command | Action |
 |---|---|
 | `/goal <condition>` | Set or replace the goal (up to 4,000 characters) and start the first round. |
-| `/goal --judge <model> <condition>` | Same, with this goal evaluated by `<model>` instead of the agent-wide default. |
+| `/goal --judge <model> <condition>` | Same, with this goal evaluated by `<model>` instead of the agent-wide default. `<model>` is an advertised model id (the `session/set_model` list, matched case-insensitively); an unknown id is rejected with the list. |
 | `/goal --turns <n> <condition>` | Same, with each round allowed up to `<n>` model/tool turns instead of the agent-wide default. |
 | `/goal --turns unlimited <condition>` | Same, with no turn limit at all; a round ends only when the model stops, you cancel, or a request fails. |
 | `/goal` or `/goal status` | Show the condition, status, rounds used, running time, turn limit, evaluator, token spend, and the last verdict with its reason. |
@@ -226,7 +226,7 @@ The evaluator never runs tools, so it can only judge what the agent has surfaced
 | `/goal resume` | Continue a paused or blocked goal with a fresh round budget. |
 | `/goal clear` | Drop the goal (`stop`, `off`, `reset`, `cancel`, and `none` are aliases). |
 
-The options may appear in either order and both are optional: `/goal --turns 300 --judge glm-5.3-flash fix the build`. A control word counts only when it is the entire argument, so `/goal pause after verification` is a goal with that text. Use `-- ` before a condition that starts with an option or a control word.
+Options may come before or after the condition, in any order, and both are optional: `/goal --turns 300 --judge glm-5.3-flash fix the build` and `/goal fix the build --judge glm-5.3-flash` are equivalent. A control word counts only when it is the entire argument, so `/goal pause after verification` is a goal with that text. A `--word` inside the condition's prose stays part of the condition, but a `--word` at the very end is read as an option and rejected if it is not one of the two above; use `-- ` before a condition that starts with an option or a control word to turn option parsing off entirely.
 
 Two independent budgets bound a goal. The **round budget** (`ACP_GLM_GOAL_MAX_ROUNDS`, 20) counts how many times the evaluator sends the agent back to work. The **turn limit** bounds each round's own tool-calling loop, exactly as it bounds an ordinary prompt (`ACP_GLM_MAX_TURNS`, 100 by default). A long round — a big migration, a full test-suite fix-up — can therefore stop with `[stopped: reached the 100-turn limit]` and pause the goal before the evaluator ever runs. `--turns <n>` raises (or lowers) that limit for one goal and `--turns unlimited` removes it; `ACP_GLM_GOAL_MAX_TURNS` changes the default for every goal. `/goal resume` starts a fresh round with the goal's limit intact, so a goal paused on its turn limit hits the same wall again unless you set a new goal with a higher `--turns`.
 
@@ -356,7 +356,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model turns per prompt (also settable via `--max-turns`). The final turn's tool calls still run and their results are saved |
 | `ACP_GLM_GOAL_MAX_ROUNDS` | No | `20` | Continuation rounds a `/goal` may run per activation before it pauses itself. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_GOAL_MAX_TURNS` | No | `ACP_GLM_MAX_TURNS` (100) | Model/tool turns each `/goal` round may take before it pauses on its turn limit; a positive integer or `unlimited`. A goal's `--turns` flag takes precedence. Invalid values fall back to the default with a stderr warning. |
-| `ACP_GLM_GOAL_JUDGE_MODEL` | No | session model | Model that evaluates `/goal`. A goal's `--judge <model>` flag takes precedence. |
+| `ACP_GLM_GOAL_JUDGE_MODEL` | No | session model | Model that evaluates `/goal`; must be an advertised model id. A goal's `--judge <model>` flag takes precedence. Invalid values are ignored with a stderr warning. |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_TOOL_RESULT_LIMIT_BYTES` | No | `262144` | Inclusive UTF-8 byte limit for every model-facing tool result. It preserves a prefix and suffix with an omitted-bytes marker; values below 128 fall back with a stderr warning. |
