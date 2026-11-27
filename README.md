@@ -178,12 +178,49 @@ The origin follows `ACP_GLM_BASE_URL`: only HTTPS on `api.z.ai`,
 ports, and redirects are rejected for quota lookup; no key is sent to them.
 This does not change model endpoint configuration.
 
+#### Team-seat API keys
+
+A key issued for a Z.AI **team seat** has no personal Coding Plan, so the default
+lookup fails (the provider reports that the user has no coding plan). When that
+happens, the agent discovers the team seat automatically with the same key: it
+calls `GET /api/biz/customer/getCustomerInfo` on the same origin, picks the
+account's single active project with `"projectType": 2`, and retries with
+`GET /api/monitor/usage/quota/limit?type=2` plus
+`bigmodel-organization: <organization ID>` and `bigmodel-project: <project ID>`,
+matching Z.AI's own desktop client. All three requests share the refresh's
+deadline and response cap. A discovered seat is remembered in memory until the
+key or origin changes or a lookup with it fails, so later refreshes make one
+request. Personal keys still make exactly one request, and authentication,
+HTTP, network, or malformed-response failures never trigger discovery. Only the
+two IDs are read from the account reply; names, contact details, and IDs are
+never included in errors. If discovery fails or finds no team project, the
+original "no coding plan" error is reported.
+
+If the account belongs to more than one active team project (or lists more than
+64 organizations or projects), the agent does not guess: quota is reported as
+`requestFailed` and asks you to choose the seat. Set the team's organization ID
+and project ID explicitly to override discovery:
+
+```bash
+export Z_AI_ORGANIZATION_ID=org-xxxxxxxxxxxxxxxx
+export Z_AI_PROJECT_ID=proj-xxxxxxxxxxxxxxxx
+```
+
+…or enter both when `glm-acp-agent --setup` asks for them (stored as
+`z_ai_organization_id` / `z_ai_project_id` in `credentials.json`). When either
+environment variable is set (including to a blank value to clear a stored seat),
+the environment pair wins over the file as a unit.
+With both set, discovery is skipped and the lookup goes straight to `?type=2`
+with those IDs. If only one is set, or a value contains whitespace or control
+characters, quota is reported as `missingCredentials` and no request is sent.
+These settings only affect quota lookup; model requests are unchanged.
+
 Results are cached in memory for 60 seconds and concurrent lookups share one
 request per account. Failed attempts are also cached for 60 seconds. A refresh
 has a 10-second deadline and a 256 KiB response cap. A transient failure retains
 the previous values with an explicit stale notice and their last successful
-timestamp. Authentication failures clear previous values; changing credentials or
-origin invalidates the cache. Cancelling `/usage` stops waiting immediately; a
+timestamp. Authentication failures clear previous values; changing credentials,
+team seat, or origin invalidates the cache. Cancelling `/usage` stops waiting immediately; a
 shared request can finish and populate the cache for another caller. Disconnecting
 the ACP transport aborts the request.
 
@@ -192,8 +229,9 @@ The reader accepts both `CREDIT_LIMIT` and legacy `TOKENS_LIMIT` entries, plus
 percentages or remaining counts only when the necessary totals are present.
 Unknown quota types are ignored; missing or unrecognized data is reported as
 unavailable rather than zero. No fixed plan allowances are assumed. Duration
-units known to the reader are hours, days, and weeks; other units retain an
-unspecified duration. The monitoring endpoint is not a versioned public quota
+units known to the reader are hours, days, and weeks (a team seat's
+`unit: 6, number: 1` window is reported as `1-week`, `kind: "weekly"`,
+`windowDurationMins: 10080`); other units retain an unspecified duration. The monitoring endpoint is not a versioned public quota
 contract, so provider changes or account restrictions may make quota unavailable.
 
 ### ACP quota extension (version 1)
@@ -305,6 +343,8 @@ The agent reads its configuration from environment variables, plus an optional c
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `Z_AI_API_KEY` | One of env / `--setup` | — | API key for the Z.AI / Zhipu AI service. If unset, the credentials file is consulted. |
+| `Z_AI_ORGANIZATION_ID` | No | — | Team-seat organization ID override, used only for quota lookup (team seats are normally discovered automatically). Set together with `Z_AI_PROJECT_ID`; see [Team-seat API keys](#team-seat-api-keys). Falls back to the credentials file. |
+| `Z_AI_PROJECT_ID` | No | — | Team-seat project ID override (`projectType: 2`), used only for quota lookup. Set together with `Z_AI_ORGANIZATION_ID`. |
 | `ACP_GLM_MODEL` | No | `glm-5.4` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
@@ -338,6 +378,8 @@ node dist/index.js --setup
 ```
 
 The key is written to `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json` (default: `~/.config/glm-acp-agent/credentials.json`) with `0600` permissions. The `Z_AI_API_KEY` environment variable, when set, always wins over the file.
+
+Setup then asks for an optional team-seat organization ID and project ID; leave both blank for a personal key or to let the agent discover the team seat. Entering only one aborts setup. See [Team-seat API keys](#team-seat-api-keys).
 
 ### Supported models
 

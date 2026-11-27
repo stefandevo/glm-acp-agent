@@ -24,10 +24,24 @@ import { debug, maskSecret } from "./logger.js";
  *
  * The credentials file lives under `$XDG_CONFIG_HOME/glm-acp-agent/credentials.json`
  * (or `~/.config/glm-acp-agent/credentials.json` if `XDG_CONFIG_HOME` is unset).
+ *
+ * The file and environment can also hold an optional Z.AI team seat
+ * (organization ID + project ID), used only for quota lookups.
  */
 
 interface CredentialsFile {
   z_ai_api_key?: string;
+  z_ai_organization_id?: string;
+  z_ai_project_id?: string;
+}
+
+/**
+ * Optional Z.AI team-seat identifiers. Both must be present to select team
+ * quota; a lone value is a misconfiguration that callers must not send.
+ */
+export interface TeamSeat {
+  organizationId?: string;
+  projectId?: string;
 }
 
 /** Path to the credentials JSON file. Honours `$XDG_CONFIG_HOME`. */
@@ -47,6 +61,51 @@ export function readCredentialsKey(path: string = credentialsPath()): string | u
   } catch {
     return undefined;
   }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Read the optional team-seat IDs from the credentials file. */
+export function readCredentialsTeamSeat(path: string = credentialsPath()): TeamSeat {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as CredentialsFile;
+    const organizationId = nonEmptyString(parsed.z_ai_organization_id);
+    const projectId = nonEmptyString(parsed.z_ai_project_id);
+    return {
+      ...(organizationId ? { organizationId } : {}),
+      ...(projectId ? { projectId } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolve the optional team seat. The environment pair
+ * (`Z_AI_ORGANIZATION_ID` / `Z_AI_PROJECT_ID`) wins as a unit whenever either
+ * variable is present in the environment (including when blank/whitespace to
+ * clear a seat stored in `credentials.json`), so a stale file value is never
+ * mixed with an env override.
+ */
+export function resolveTeamSeat(): TeamSeat {
+  const rawOrganizationId = process.env["Z_AI_ORGANIZATION_ID"];
+  const rawProjectId = process.env["Z_AI_PROJECT_ID"];
+  if (rawOrganizationId !== undefined || rawProjectId !== undefined) {
+    const organizationId = nonEmptyString(rawOrganizationId);
+    const projectId = nonEmptyString(rawProjectId);
+    debug("resolveTeamSeat: source=env");
+    return {
+      ...(organizationId ? { organizationId } : {}),
+      ...(projectId ? { projectId } : {}),
+    };
+  }
+  const fromFile = readCredentialsTeamSeat();
+  debug(`resolveTeamSeat: source=${fromFile.organizationId || fromFile.projectId ? "file" : "none"}`);
+  return fromFile;
 }
 
 /**
@@ -69,15 +128,23 @@ export function resolveApiKey(): string | undefined {
 }
 
 /**
- * Write the API key to the credentials file. Restricts the file to mode 0600
- * so it isn't world-readable on shared machines.
+ * Write the API key (and optional team seat) to the credentials file.
+ * Restricts the file to mode 0600 so it isn't world-readable on shared machines.
  */
-export function writeCredentials(apiKey: string, path: string = credentialsPath()): void {
+export function writeCredentials(apiKey: string, path: string = credentialsPath(), teamSeat: TeamSeat = {}): void {
   if (!apiKey || apiKey.length === 0) {
     throw new Error("Refusing to write empty API key");
   }
+  const organizationId = nonEmptyString(teamSeat.organizationId);
+  const projectId = nonEmptyString(teamSeat.projectId);
+  if (!organizationId !== !projectId) {
+    throw new Error("Refusing to write a team seat without both an organization ID and a project ID");
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const body: CredentialsFile = { z_ai_api_key: apiKey };
+  const body: CredentialsFile = {
+    z_ai_api_key: apiKey,
+    ...(organizationId && projectId ? { z_ai_organization_id: organizationId, z_ai_project_id: projectId } : {}),
+  };
   const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT, 0o600);
   try {
     fchmodSync(fd, 0o600);

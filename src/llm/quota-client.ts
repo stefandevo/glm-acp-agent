@@ -1,4 +1,4 @@
-import { resolveApiKey } from "./credentials.js";
+import { resolveApiKey, resolveTeamSeat, type TeamSeat } from "./credentials.js";
 
 export interface QuotaWindow {
   id: string;
@@ -28,6 +28,8 @@ export interface QuotaSnapshot {
 interface QuotaClientOptions {
   fetch?: typeof fetch;
   resolveKey?: () => string | undefined;
+  /** Optional Z.AI team seat; both IDs select team-seat quota. */
+  resolveTeam?: () => TeamSeat;
   baseUrl?: () => string;
   now?: () => number;
   cacheMs?: number;
@@ -38,6 +40,18 @@ interface QuotaClientOptions {
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_WINDOWS = 64;
+// Opaque provider identifiers sent as header values: visible ASCII only, bounded.
+const TEAM_ID_PATTERN = /^[\x21-\x7e]{1,256}$/;
+const TEAM_HEADERS = { organization: "bigmodel-organization", project: "bigmodel-project" } as const;
+// Bounds for walking the account's organizations and projects during team-seat discovery.
+const MAX_ORGANIZATIONS = 64;
+const MAX_PROJECTS = 64;
+// Z.AI marks team (seat) projects with projectType 2; personal projects use 1.
+const TEAM_PROJECT_TYPE = 2;
+const DISCOVERED_TEAM_FAILED =
+  "Z.AI could not return team-seat quota for this key. Set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID to select the team seat.";
+
+type TeamIds = { organizationId: string; projectId: string };
 
 class QuotaError extends Error {
   constructor(readonly reason: NonNullable<QuotaSnapshot["unavailable"]>["reason"], message: string) {
@@ -66,7 +80,7 @@ export function parseQuotaWindows(value: unknown): QuotaWindow[] {
     throw new QuotaError("authenticationFailed", "Z.AI rejected the quota credentials. Check your Coding Plan API key.");
   }
   if (envelope.success === false || (envelope.code !== undefined && ![0, 200, "0", "200"].includes(envelope.code as number | string))) {
-    throw new QuotaError("requestFailed", "Z.AI could not return Coding Plan quota. Check your subscription in the Z.AI dashboard.");
+    throw new QuotaError("requestFailed", "Z.AI could not return Coding Plan quota. Check your subscription in the Z.AI dashboard. For a team-seat key, set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID.");
   }
   const limits = record(envelope.data)?.limits;
   if (!Array.isArray(limits) || limits.length > MAX_WINDOWS) return invalidResponse();
@@ -114,6 +128,25 @@ export function parseQuotaWindows(value: unknown): QuotaWindow[] {
   return windows;
 }
 
+/**
+ * Validate the optional team seat before anything is sent. Messages name the
+ * settings, never their values.
+ */
+function teamSeat(seat: TeamSeat): TeamIds | undefined {
+  const organizationId = seat.organizationId?.trim() || undefined;
+  const projectId = seat.projectId?.trim() || undefined;
+  if (!organizationId && !projectId) return undefined;
+  if (!organizationId || !projectId) {
+    throw new QuotaError("missingCredentials",
+      "Team-seat quota needs both Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID (or both in glm-acp-agent --setup). Set both, or unset both for a personal key.");
+  }
+  if (!TEAM_ID_PATTERN.test(organizationId) || !TEAM_ID_PATTERN.test(projectId)) {
+    throw new QuotaError("missingCredentials",
+      "Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID must be printable IDs without spaces.");
+  }
+  return { organizationId, projectId };
+}
+
 /** Only send quota credentials to supported provider origins, never an arbitrary model proxy. */
 function quotaUrl(baseUrl: string): string {
   let url: URL;
@@ -123,6 +156,55 @@ function quotaUrl(baseUrl: string): string {
     throw new QuotaError("unsupportedEndpoint", "Quota lookup is unavailable for this custom API endpoint.");
   }
   return new URL("/api/monitor/usage/quota/limit", url.origin).href;
+}
+
+interface TeamProjectScan {
+  projects: TeamIds[];
+  truncated: boolean;
+}
+
+/**
+ * Scan the account's active team projects from a getCustomerInfo reply within
+ * bounded organization and project limits, reporting whether either list
+ * exceeded the scan cap. Only the two IDs are kept; names, contact details,
+ * and other fields are ignored.
+ */
+function scanTeamProjects(value: unknown): TeamProjectScan {
+  const envelope = record(value);
+  if (!envelope || envelope.success === false ||
+      (envelope.code !== undefined && ![0, 200, "0", "200"].includes(envelope.code as number | string))) {
+    return { projects: [], truncated: false };
+  }
+  const organizations = record(envelope.data)?.organizations;
+  if (!Array.isArray(organizations)) return { projects: [], truncated: false };
+  let truncated = organizations.length > MAX_ORGANIZATIONS;
+  const found = new Map<string, TeamIds>();
+  for (const rawOrganization of organizations.slice(0, MAX_ORGANIZATIONS)) {
+    const organization = record(rawOrganization);
+    if (!organization || !Array.isArray(organization.projects)) continue;
+    if (organization.projects.length > MAX_PROJECTS) truncated = true;
+    for (const rawProject of organization.projects.slice(0, MAX_PROJECTS)) {
+      const project = record(rawProject);
+      if (!project || project.projectType !== TEAM_PROJECT_TYPE) continue;
+      if (project.status !== undefined &&
+          (typeof project.status !== "string" || project.status.toLowerCase() !== "active")) continue;
+      const organizationId = typeof project.organizationId === "string" && project.organizationId.trim()
+        ? project.organizationId.trim()
+        : typeof organization.organizationId === "string" ? organization.organizationId.trim() : "";
+      const projectId = typeof project.projectId === "string" ? project.projectId.trim() : "";
+      if (!TEAM_ID_PATTERN.test(organizationId) || !TEAM_ID_PATTERN.test(projectId)) continue;
+      found.set(`${organizationId}\n${projectId}`, { organizationId, projectId });
+    }
+  }
+  return { projects: [...found.values()], truncated };
+}
+
+/**
+ * Pick the account's active team projects from a getCustomerInfo reply. Only
+ * the two IDs are kept; names, contact details, and other fields are ignored.
+ */
+export function parseTeamProjects(value: unknown): TeamIds[] {
+  return scanTeamProjects(value).projects;
 }
 
 async function readQuotaJson(response: Response, signal: AbortSignal): Promise<unknown> {
@@ -152,7 +234,10 @@ async function readQuotaJson(response: Response, signal: AbortSignal): Promise<u
 /** Account-wide, memory-only cache shared by prompts and extension requests in this process. */
 export class QuotaClient {
   private cached?: { key: string; attemptedAt: number; snapshot: QuotaSnapshot };
+  // Cache keys hold the API key and team IDs; they stay in memory and are never surfaced.
   private pending?: { key: string; promise: Promise<QuotaSnapshot> };
+  // A team seat found through getCustomerInfo, reused until the key or origin changes or it fails.
+  private discoveredTeam?: { key: string; seat: TeamIds };
 
   constructor(private readonly options: QuotaClientOptions = {}) {}
 
@@ -162,15 +247,21 @@ export class QuotaClient {
     let key: string;
     let url: string;
     let apiKey: string | undefined;
+    let team: TeamIds | undefined;
     try {
       url = quotaUrl(this.options.baseUrl?.() ?? process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL);
       apiKey = (this.options.resolveKey ?? resolveApiKey)();
       if (!apiKey) throw new QuotaError("missingCredentials", "Set Z_AI_API_KEY or run glm-acp-agent --setup to check quota.");
-      key = `${url}\n${apiKey}`;
+      team = teamSeat((this.options.resolveTeam ?? resolveTeamSeat)());
+      // Switching key, region, or team seat invalidates the cache.
+      key = team ? `${url}?type=2\n${apiKey}\n${team.organizationId}\n${team.projectId}` : `${url}\n${apiKey}`;
     } catch (err) {
       this.cached = undefined;
+      this.discoveredTeam = undefined;
       return this.failure(err, time);
     }
+    // An explicit team seat, or a different key or region, replaces any discovered one.
+    if (team || this.discoveredTeam?.key !== key) this.discoveredTeam = undefined;
     // Changing credentials or region invalidates both successes and failures.
     if (this.cached?.key !== key) this.cached = undefined;
     if (this.cached && time - this.cached.attemptedAt < (this.options.cacheMs ?? 60_000)) {
@@ -178,7 +269,7 @@ export class QuotaClient {
     }
     if (this.pending?.key === key) return structuredClone(await this.pending.promise);
     const previous = this.cached?.snapshot;
-    const promise = this.fetchUsage(url, apiKey, now).catch(err => this.failure(err, now(), previous));
+    const promise = this.fetchUsage(url, apiKey, team, key, now).catch(err => this.failure(err, now(), previous));
     const pending = { key, promise };
     this.pending = pending;
     try {
@@ -190,13 +281,94 @@ export class QuotaClient {
     }
   }
 
-  private async fetchUsage(url: string, apiKey: string, now: () => number): Promise<QuotaSnapshot> {
+  private async fetchUsage(
+    url: string,
+    apiKey: string,
+    team: TeamIds | undefined,
+    key: string,
+    now: () => number,
+  ): Promise<QuotaSnapshot> {
     const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 10_000);
     const parentSignal = this.options.signal?.();
+    // One deadline covers every request in this refresh, discovery included.
     const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout;
+    const snapshot = (windows: QuotaWindow[]): QuotaSnapshot =>
+      ({ version: 1, checkedAt: new Date(now()).toISOString(), stale: false, windows });
+
+    if (team) {
+      return snapshot(await this.teamQuota(url, apiKey, team, signal,
+        "Z.AI could not return team-seat quota. Check Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID match the key's team project."));
+    }
+    const discovered = this.discoveredTeam;
+    if (discovered) {
+      try {
+        return snapshot(await this.teamQuota(url, apiKey, discovered.seat, signal, DISCOVERED_TEAM_FAILED));
+      } catch (err) {
+        // Forget a seat that stopped working; the next refresh discovers again.
+        if (this.discoveredTeam === discovered) this.discoveredTeam = undefined;
+        throw err;
+      }
+    }
+    const body = await this.getJson(url, apiKey, signal);
+    try {
+      return snapshot(parseQuotaWindows(body));
+    } catch (err) {
+      // A key with no personal plan may belong to a team seat. HTTP, transport,
+      // authentication, and malformed-response failures never trigger discovery.
+      if (!(err instanceof QuotaError) || err.reason !== "requestFailed" || signal.aborted) throw err;
+      const seat = await this.discoverTeam(url, apiKey, signal, err);
+      const windows = await this.teamQuota(url, apiKey, seat, signal, DISCOVERED_TEAM_FAILED);
+      this.discoveredTeam = { key, seat };
+      return snapshot(windows);
+    }
+  }
+
+  /** Find the key's single active team project, or rethrow the original lookup failure. */
+  private async discoverTeam(url: string, apiKey: string, signal: AbortSignal, original: QuotaError): Promise<TeamIds> {
+    let scan: TeamProjectScan;
+    try {
+      scan = scanTeamProjects(await this.getJson(new URL("/api/biz/customer/getCustomerInfo", url).href, apiKey, signal));
+    } catch (err) {
+      // Discovery is best effort; keep cancellation, but never surface its errors or body.
+      if (signal.aborted) throw err;
+      throw original;
+    }
+    if (scan.projects.length > 1) {
+      throw new QuotaError("requestFailed",
+        "Multiple Z.AI team projects found for this account. Set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID to select the team seat.");
+    }
+    if (scan.truncated) {
+      throw new QuotaError("requestFailed",
+        "Too many Z.AI organizations or projects to auto-select a team seat. Set Z_AI_ORGANIZATION_ID and Z_AI_PROJECT_ID to select the team seat.");
+    }
+    if (!scan.projects[0]) throw original;
+    return scan.projects[0];
+  }
+
+  private async teamQuota(
+    url: string,
+    apiKey: string,
+    team: TeamIds,
+    signal: AbortSignal,
+    businessFailure: string,
+  ): Promise<QuotaWindow[]> {
+    const body = await this.getJson(`${url}?type=2`, apiKey, signal, team);
+    try {
+      return parseQuotaWindows(body);
+    } catch (err) {
+      if (err instanceof QuotaError && err.reason === "requestFailed") throw new QuotaError("requestFailed", businessFailure);
+      throw err;
+    }
+  }
+
+  private async getJson(url: string, apiKey: string, signal: AbortSignal, team?: TeamIds): Promise<unknown> {
     const response = await (this.options.fetch ?? fetch)(url, {
       // The provider's official usage script sends the key without a Bearer prefix.
-      headers: { Authorization: apiKey, Accept: "application/json" },
+      // Team seats add the seat headers, as Z.AI's own desktop client does.
+      headers: team
+        ? { Authorization: apiKey, Accept: "application/json",
+          [TEAM_HEADERS.organization]: team.organizationId, [TEAM_HEADERS.project]: team.projectId }
+        : { Authorization: apiKey, Accept: "application/json" },
       redirect: "error",
       signal,
     });
@@ -207,8 +379,7 @@ export class QuotaClient {
       }
       throw new QuotaError("requestFailed", `Quota lookup failed (HTTP ${response.status}). Try again later.`);
     }
-    const windows = parseQuotaWindows(await readQuotaJson(response, signal));
-    return { version: 1, checkedAt: new Date(now()).toISOString(), stale: false, windows };
+    return readQuotaJson(response, signal);
   }
 
   private failure(error: unknown, time: number, previous?: QuotaSnapshot): QuotaSnapshot {

@@ -9,6 +9,8 @@
  * Environment variables:
  *   Z_AI_API_KEY      - API key for the Z.AI / Zhipu AI service. If unset,
  *                       falls back to the credentials file written by --setup.
+ *   Z_AI_ORGANIZATION_ID / Z_AI_PROJECT_ID - (optional, set together) Z.AI
+ *                       team seat override for quota lookups (auto-discovered otherwise).
  *   ACP_GLM_MODEL     - (optional) Override the default model (default: glm-5.4)
  *   ACP_GLM_MAX_TURNS - (optional) Max model/tool turns per prompt (default: 100)
  *   ACP_GLM_STREAM_IDLE_TIMEOUT_MS - (optional) Model stream idle deadline in milliseconds (default: 300000)
@@ -42,6 +44,8 @@ if (args.includes("--setup")) {
       "",
       "Environment variables:",
       "  Z_AI_API_KEY                   API key (overrides the stored credentials)",
+      "  Z_AI_ORGANIZATION_ID           Team-seat organization ID override for /usage quota (set with Z_AI_PROJECT_ID; auto-discovered otherwise)",
+      "  Z_AI_PROJECT_ID                Team-seat project ID for /usage quota (set with Z_AI_ORGANIZATION_ID)",
       "  ACP_GLM_MODEL                  Default model id (default: glm-5.4)",
       "  ACP_GLM_MAX_TURNS              Max model/tool turns per prompt (default 100)",
       "  ACP_GLM_COMMAND_TIMEOUT_MS     run_command deadline in milliseconds (default 120000)",

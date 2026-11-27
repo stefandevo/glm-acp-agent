@@ -1,14 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough, Readable } from "node:stream";
 import {
   credentialsPath,
   readCredentialsKey,
+  readCredentialsTeamSeat,
   resolveApiKey,
+  resolveTeamSeat,
   writeCredentials,
 } from "../llm/credentials.js";
+import { runSetup } from "../setup.js";
 
 function withTmp<T>(fn: (dir: string) => T): T {
   const dir = mkdtempSync(join(tmpdir(), "glm-creds-"));
@@ -125,4 +130,91 @@ test("resolveApiKey falls back to the credentials file when env is unset", () =>
       else process.env["XDG_CONFIG_HOME"] = oldXdg;
     }
   });
+});
+
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+  const old = Object.fromEntries(Object.keys(vars).map((name) => [name, process.env[name]]));
+  try {
+    for (const [name, value] of Object.entries(vars)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    return fn();
+  } finally {
+    for (const [name, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+test("writeCredentials stores an optional team seat and refuses half of one", () => {
+  withTmp((dir) => {
+    const path = join(dir, "credentials.json");
+    writeCredentials("k", path, { organizationId: "org-placeholder", projectId: "proj-placeholder" });
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {
+      z_ai_api_key: "k", z_ai_organization_id: "org-placeholder", z_ai_project_id: "proj-placeholder",
+    });
+    assert.deepEqual(readCredentialsTeamSeat(path), { organizationId: "org-placeholder", projectId: "proj-placeholder" });
+    assert.throws(() => writeCredentials("k", path, { organizationId: "org-placeholder" }), /both/);
+    writeCredentials("k", path);
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { z_ai_api_key: "k" });
+    assert.deepEqual(readCredentialsTeamSeat(path), {});
+  });
+});
+
+test("resolveTeamSeat takes the env pair as a unit over the credentials file", () => {
+  withTmp((dir) => {
+    writeCredentials("k", join(dir, "glm-acp-agent", "credentials.json"),
+      { organizationId: "org-file", projectId: "proj-file" });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: undefined, Z_AI_PROJECT_ID: undefined }, () => {
+      assert.deepEqual(resolveTeamSeat(), { organizationId: "org-file", projectId: "proj-file" });
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "org-env", Z_AI_PROJECT_ID: "proj-env" }, () => {
+      assert.deepEqual(resolveTeamSeat(), { organizationId: "org-env", projectId: "proj-env" });
+    });
+    // A lone env value is reported as-is (half-configured) rather than mixed with the file.
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "org-env", Z_AI_PROJECT_ID: "" }, () => {
+      assert.deepEqual(resolveTeamSeat(), { organizationId: "org-env" });
+    });
+  });
+});
+
+test("resolveTeamSeat lets blank env overrides clear a stored credentials-file seat", () => {
+  withTmp((dir) => {
+    writeCredentials("k", join(dir, "glm-acp-agent", "credentials.json"),
+      { organizationId: "org-file", projectId: "proj-file" });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "", Z_AI_PROJECT_ID: "" }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "   ", Z_AI_PROJECT_ID: "\t" }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: "", Z_AI_PROJECT_ID: undefined }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+    withEnv({ XDG_CONFIG_HOME: dir, Z_AI_ORGANIZATION_ID: undefined, Z_AI_PROJECT_ID: "  " }, () => {
+      assert.deepEqual(resolveTeamSeat(), {});
+    });
+  });
+});
+
+test("runSetup stores a team seat from piped input, or none when left blank", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-setup-"));
+  const old = process.env["XDG_CONFIG_HOME"];
+  try {
+    process.env["XDG_CONFIG_HOME"] = dir;
+    const path = join(dir, "glm-acp-agent", "credentials.json");
+    await runSetup(Readable.from(["setup-key\norg-placeholder\nproj-placeholder\n"]), new PassThrough());
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {
+      z_ai_api_key: "setup-key", z_ai_organization_id: "org-placeholder", z_ai_project_id: "proj-placeholder",
+    });
+    await runSetup(Readable.from(["setup-key\n"]), new PassThrough());
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { z_ai_api_key: "setup-key" });
+    await assert.rejects(runSetup(Readable.from(["setup-key\norg-placeholder\n\n"]), new PassThrough()), /both/);
+  } finally {
+    if (old === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = old;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
