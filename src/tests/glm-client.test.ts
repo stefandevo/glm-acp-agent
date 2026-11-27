@@ -370,6 +370,21 @@ test("streamChat auto-enables thinking for glm-5v-turbo", async () => {
   assert.deepEqual(requestBody?.["thinking"], { type: "enabled" });
 });
 
+test("streamChat reports the model the provider says served the request on the final chunk", async () => {
+  const stream = fakeStream([
+    { model: "glm-5.3", choices: [{ delta: { content: "{}" }, finish_reason: null }] },
+    { model: "glm-5.3", choices: [{ delta: {}, finish_reason: "stop" }] },
+    { choices: [] },
+  ]);
+  const c = makeClient(stream);
+  let done: { stopReason?: string; model?: string } | undefined;
+  for await (const chunk of c.streamChat([], undefined, { model: "glm-5.2" })) {
+    if (chunk.done) done = chunk;
+  }
+  assert.equal(done?.stopReason, "stop");
+  assert.equal(done?.model, "glm-5.3");
+});
+
 test("streamChat with tools: null sends a plain completion with no tool-calling fields", async () => {
   const stream = fakeStream([{ choices: [{ delta: { content: "{}" }, finish_reason: "stop" }] }]);
   let requestBody: Record<string, unknown> | undefined;

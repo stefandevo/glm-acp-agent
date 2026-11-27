@@ -56,6 +56,11 @@ export interface GoalState {
   judgeModel?: string;
   /** Model/tool turns each round may take; absent means the agent-wide goal default. */
   turnLimit?: GoalTurnLimit;
+  /**
+   * Model that served the most recent evaluation, as the provider reported it
+   * — proof of which model actually judged, and of any routing behind the id.
+   */
+  lastJudgeModel?: string;
   /** Start of the current activation; reset by `/goal resume` and by a restore. */
   setAt: string;
   /** Continuation rounds consumed in the current activation. */
@@ -293,6 +298,9 @@ export function isGoalState(value: unknown): value is GoalState {
   if (goal.lastVerdict !== undefined && (typeof goal.lastVerdict !== "string" || !VALID_VERDICTS.has(goal.lastVerdict))) {
     return false;
   }
+  if (goal.lastJudgeModel !== undefined && (typeof goal.lastJudgeModel !== "string" || goal.lastJudgeModel.length === 0)) {
+    return false;
+  }
   if (goal.turnLimit !== undefined &&
       !(goal.turnLimit === "unlimited" || (isCount(goal.turnLimit) && goal.turnLimit >= 1))) {
     return false;
@@ -402,7 +410,10 @@ export function formatGoalStatus(
   const lines = [`**Goal: ${goal.status}${pause}**`, "", goal.condition, "", `- Rounds: ${goal.rounds}/${goal.maxRounds}`];
   if (goal.status === "active") lines.push(`- Running: ${formatDuration(Math.max(0, now - Date.parse(goal.setAt)))}`);
   lines.push(`- Turn limit: ${formatTurnLimit(goal.turnLimit ?? defaultTurnLimit)} per round`);
-  lines.push(`- Evaluator: ${goal.judgeModel ?? `${sessionModel} (session model)`}`);
+  lines.push(
+    `- Evaluator: ${goal.judgeModel ?? `${sessionModel} (session model)`}` +
+      (goal.lastJudgeModel ? ` (last verdict answered by ${goal.lastJudgeModel})` : "")
+  );
   if (goal.tokens) lines.push(`- Tokens: ${formatTokens(goal.tokens.totalTokens)} (agent + evaluator)`);
   if (goal.lastVerdict) {
     lines.push(`- Last check: ${formatVerdict(goal.lastVerdict)}${goal.lastReason ? ` — ${goal.lastReason}` : ""}`);

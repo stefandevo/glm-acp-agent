@@ -103,7 +103,7 @@ function fakeJudge(reply: () => string | Error): GoalJudgeClient & { calls: Arra
       if (value instanceof Error) throw value;
       yield { text: value } satisfies GlmStreamChunk;
       yield { usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } } satisfies GlmStreamChunk;
-      yield { done: true, stopReason: "stop" } satisfies GlmStreamChunk;
+      yield { done: true, stopReason: "stop", model: "glm-5.3-flash" } satisfies GlmStreamChunk;
     },
   };
 }
@@ -117,7 +117,12 @@ test("evaluateGoal calls a tool-less judge on the chosen model and returns the v
     messages: transcript,
     model: "glm-5.3-flash",
   });
-  assert.deepEqual(result, { verdict: "not_met", reason: "refresh still fails", usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } });
+  assert.deepEqual(result, {
+    verdict: "not_met",
+    reason: "refresh still fails",
+    usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+    model: "glm-5.3-flash",
+  });
   assert.equal(judge.calls.length, 1);
   assert.equal(judge.calls[0]?.options?.model, "glm-5.3-flash");
   assert.equal(judge.calls[0]?.options?.tools, null);
@@ -138,7 +143,7 @@ test("evaluateGoal retries once, then raises GoalJudgeUnavailableError", async (
     return attempt === 1 ? new Error("socket hang up") : '{"verdict":"met","reason":"suite green"}';
   });
   const result = await evaluateGoal(recovering, { condition: "c", rounds: 0, maxRounds: 20, messages: transcript, model: "glm-5.4" });
-  assert.deepEqual(result, { verdict: "met", reason: "suite green", usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } });
+  assert.deepEqual(result, { verdict: "met", reason: "suite green", usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, model: "glm-5.3-flash" });
   assert.equal(recovering.calls[0]?.options?.reasoningEffort, "minimal");
 });
 

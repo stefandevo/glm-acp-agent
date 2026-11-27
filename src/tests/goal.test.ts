@@ -195,6 +195,7 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
   assert.equal(isGoalState({ ...goal, judgeModel: "glm-5.3-flash", tokens: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }), true);
   assert.equal(isGoalState({ ...goal, turnLimit: 500 }), true);
   assert.equal(isGoalState({ ...goal, turnLimit: "unlimited" }), true);
+  assert.equal(isGoalState({ ...goal, lastJudgeModel: "glm-5.3" }), true);
   for (const broken of [
     null,
     "goal",
@@ -208,6 +209,8 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
     { ...goal, turnLimit: 0 },
     { ...goal, turnLimit: "many" },
     { ...goal, turnLimit: 1.5 },
+    { ...goal, lastJudgeModel: "" },
+    { ...goal, lastJudgeModel: 7 },
     { ...goal, lastVerdict: "maybe" },
     { ...goal, pauseReason: "because" },
     { ...goal, tokens: { inputTokens: 1 } },
@@ -277,7 +280,11 @@ test("formatGoalStatus reports the state the other /goal commands expose", () =>
   assert.match(text, /- Tokens: 42\.0k \(agent \+ evaluator\)/);
   assert.match(text, /- Last check: not met — 2 tests fail/);
   assert.match(text, /\/goal pause/);
-  assert.match(formatGoalStatus({ ...active, judgeModel: "glm-5.3-flash" }, "glm-5.4", now), /- Evaluator: glm-5\.3-flash/);
+  assert.match(formatGoalStatus({ ...active, judgeModel: "glm-5.3-flash" }, "glm-5.4", now), /- Evaluator: glm-5\.3-flash\n/);
+  assert.match(
+    formatGoalStatus({ ...active, judgeModel: "glm-5.2", lastJudgeModel: "glm-5.3" }, "glm-5.4", now),
+    /- Evaluator: glm-5\.2 \(last verdict answered by glm-5\.3\)\n/
+  );
   assert.match(formatGoalStatus({ ...active, status: "paused", pauseReason: "budget" }, "glm-5.4", now), /\*\*Goal: paused \(budget\)\*\*/);
   assert.doesNotMatch(formatGoalStatus({ ...active, status: "paused" }, "glm-5.4", now), /Running:/);
   assert.match(formatGoalStatus({ ...active, status: "blocked", pauseReason: "blocked" }, "glm-5.4", now), /\/goal resume to override/);

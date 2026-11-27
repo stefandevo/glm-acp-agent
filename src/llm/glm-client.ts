@@ -155,6 +155,12 @@ export interface GlmStreamChunk {
   done?: boolean;
   /** Stop reason when done */
   stopReason?: string;
+  /**
+   * Model that served the request, as the provider reports it in its stream
+   * chunks. Lets callers confirm which model actually answered when the
+   * requested id is an alias or gets routed (e.g. `glm-5.2` → `glm-5.3`).
+   */
+  model?: string;
 }
 
 /** Options applied to a single `streamChat` call. */
@@ -657,6 +663,7 @@ export class GlmClient {
     > = new Map();
 
     let lastFinishReason: string | undefined;
+    let servedModel: string | undefined;
     let terminalChoiceSeen = false;
 
     try {
@@ -720,6 +727,11 @@ export class GlmClient {
           }
         }
 
+        // Providers stamp every chunk with the model that is answering; keep
+        // the last value so the final chunk can report it.
+        const chunkModel = (chunk as { model?: unknown }).model;
+        if (typeof chunkModel === "string" && chunkModel.length > 0) servedModel = chunkModel;
+
         // The final chunk on most providers (GLM included when
         // include_usage: true) ships only a `usage` object with no choices.
         const rawUsage = (chunk as { usage?: unknown }).usage as
@@ -762,7 +774,8 @@ export class GlmClient {
     if (stopReason === "tool_calls") {
       for (const call of calls) yield { toolCall: call };
     }
-    yield { done: true, stopReason };
+    debug(`streamChat done: model=${servedModel ?? model} stop=${stopReason}`);
+    yield { done: true, stopReason, ...(servedModel ? { model: servedModel } : {}) };
   }
 }
 

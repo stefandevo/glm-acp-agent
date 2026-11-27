@@ -2444,6 +2444,7 @@ export class GlmAcpAgent implements Agent {
       usage = mergeUsage(usage, verdict.usage);
       goal.lastVerdict = verdict.verdict;
       goal.lastReason = verdict.reason;
+      if (verdict.model) goal.lastJudgeModel = verdict.model;
 
       if (verdict.verdict === "met" || verdict.verdict === "impossible") {
         goal.status = verdict.verdict === "met" ? "achieved" : "blocked";

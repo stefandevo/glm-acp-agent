@@ -238,6 +238,7 @@ test("a v5 record round-trips its goal and rejects a malformed one", async () =>
       lastVerdict: "not_met",
       lastReason: "refresh still fails",
       pauseReason: "budget",
+      lastJudgeModel: "glm-5.3-flash",
       tokens: { inputTokens: 11, outputTokens: 7, totalTokens: 18 },
     };
     const session = validSession({ goal });

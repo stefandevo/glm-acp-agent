@@ -58,7 +58,7 @@ function setup(script: Script, options: Partial<GlmAcpAgentOptions> = {}, store:
         const reply = script.judge[judgeIndex++] ?? NOT_MET("no verdict scripted");
         if (reply instanceof Error) throw reply;
         yield { text: reply, usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } };
-        yield { done: true, stopReason: "stop" };
+        yield { done: true, stopReason: "stop", model: options?.model };
         return;
       }
       const index = mainIndex++;
@@ -402,7 +402,8 @@ test("the evaluator model comes from --judge, then the environment, then the ses
     assert.equal(flagged.judgeOptions[0]?.model, "glm-4.7");
     assert.equal(flagged.judgeOptions[0]?.reasoningEffort, "on");
     assert.match(flagged.lastUserText(flagged.modelCalls[0]!), /<condition>\nall tests pass\n<\/condition>/);
-    assert.match(await flagged.status(sessionId), /- Evaluator: glm-4\.7\n/);
+    // The provider's own answer about which model judged is part of the status.
+    assert.match(await flagged.status(sessionId), /- Evaluator: glm-4\.7 \(last verdict answered by glm-4\.7\)\n/);
 
     process.env["ACP_GLM_GOAL_JUDGE_MODEL"] = "glm-5.3-flash";
     try {
@@ -415,7 +416,7 @@ test("the evaluator model comes from --judge, then the environment, then the ses
       await env.agent.prompt({ sessionId: envSession, prompt: [{ type: "text", text: "/goal clear" }] });
       await env.agent.prompt({ sessionId: envSession, prompt: [{ type: "text", text: "/goal --judge=glm-5.3 y" }] });
       assert.equal(env.judgeOptions[1]?.model, "glm-5.3");
-      assert.match(await env.status(envSession), /- Evaluator: glm-5\.3\n/);
+      assert.match(await env.status(envSession), /- Evaluator: glm-5\.3 \(last verdict answered by glm-5\.3\)\n/);
     } finally { delete process.env["ACP_GLM_GOAL_JUDGE_MODEL"]; }
 
     const sessionModel = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
@@ -543,7 +544,7 @@ test("--judge is validated against the advertised models and the id is canonical
     assert.equal(h.judgeOptions[0]?.model, "glm-5.3-flash");
     assert.equal(h.judgeOptions[0]?.reasoningEffort, "low");
     assert.match(h.lastUserText(h.modelCalls[0]!), /<condition>\nfix the build\n<\/condition>/);
-    assert.match(await h.status(sessionId), /- Evaluator: glm-5\.3-flash\n/);
+    assert.match(await h.status(sessionId), /- Evaluator: glm-5\.3-flash \(last verdict answered by glm-5\.3-flash\)\n/);
     // ACP_GLM_AVAILABLE_MODELS extends what --judge accepts.
     process.env["ACP_GLM_AVAILABLE_MODELS"] = "glm-5.4,glm-5.3,glm-5.3-flash,glm-5-turbo,glm-4.7,glm-5.2";
     try {

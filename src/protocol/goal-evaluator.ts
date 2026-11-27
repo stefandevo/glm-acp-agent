@@ -32,6 +32,8 @@ export interface GoalVerdictResult {
   verdict: GoalVerdict;
   reason: string;
   usage?: Usage;
+  /** Model that served the evaluation, as the provider reported it. */
+  model?: string;
 }
 
 /** Raised when no attempt produced a parseable verdict. The agent pauses the goal. */
@@ -147,10 +149,12 @@ export async function evaluateGoal(
     input.signal?.throwIfAborted();
     let text = "";
     let usage: Usage | undefined;
+    let servedModel: string | undefined;
     try {
       for await (const chunk of client.streamChat(judgeMessages, input.signal, options)) {
         if (chunk.text) text += chunk.text;
         if (chunk.usage) usage = chunk.usage;
+        if (chunk.model) servedModel = chunk.model;
       }
     } catch (err) {
       input.signal?.throwIfAborted();
@@ -158,7 +162,7 @@ export async function evaluateGoal(
       continue;
     }
     const verdict = parseGoalVerdict(text);
-    if (verdict) return { ...verdict, ...(usage ? { usage } : {}) };
+    if (verdict) return { ...verdict, ...(usage ? { usage } : {}), ...(servedModel ? { model: servedModel } : {}) };
     lastFailure = new Error(`reply was not a verdict: ${JSON.stringify(text.slice(0, 200))}`);
   }
   throw new GoalJudgeUnavailableError(

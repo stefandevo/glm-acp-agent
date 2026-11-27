@@ -215,6 +215,8 @@ Setting a goal starts working immediately. When the model ends a turn, a separat
 
 The evaluator never runs tools, so it can only judge what the agent has surfaced: the directive tells the model to run the verification the condition names (tests, lint, a build) and show the output before stopping. Write conditions with one measurable end state and a stated check, as you would for the other agents' `/goal` commands.
 
+To confirm which model actually judged, `/goal` status reports the model the provider says served the last evaluation next to the configured one: `- Evaluator: glm-5.3-flash (last verdict answered by glm-5.3-flash)`. The provider stamps every response with the serving model, so a routed alias shows up as such (`glm-5.2` … answered by `glm-5.3`). With `ACP_GLM_DEBUG=1` the agent also logs every provider call to stderr; the evaluator is the `streamChat: model=<id> … tools=0` line. Zed forwards only warnings and errors from an agent's stderr to its log, so inside Zed the status line is the check.
+
 | Command | Action |
 |---|---|
 | `/goal <condition>` | Set or replace the goal (up to 4,000 characters) and start the first round. |
