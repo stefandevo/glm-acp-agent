@@ -92,6 +92,13 @@ test("--turns sets the per-round turn limit; it composes with --judge in either 
 
 test("options may follow the condition; -- turns option parsing off for the remainder", () => {
   assert.deepEqual(parseGoalCommand("test 3+3 --judge umbrella"), { kind: "set", condition: "test 3+3", judgeModel: "umbrella" });
+  // A trailing option's value runs to the end, so a multi-word model name is
+  // a (rejected) model name rather than prose silently appended to the goal.
+  assert.deepEqual(parseGoalCommand("test 2+2 --judge Uncle Bob"), { kind: "set", condition: "test 2+2", judgeModel: "Uncle Bob" });
+  assert.deepEqual(parseGoalCommand("fix the build --turns 300 --judge Uncle Bob"), { kind: "set", condition: "fix the build", judgeModel: "Uncle Bob", turnLimit: 300 });
+  assert.deepEqual(parseGoalCommand("--judge x -- fix --watch"), { kind: "set", condition: "fix --watch", judgeModel: "x" });
+  assert.match(invalidMessage("fix it --judge="), /--judge needs a value/);
+  assert.match(invalidMessage("fix it --turns three hundred"), /--turns needs a positive number/);
   assert.deepEqual(parseGoalCommand("fix the build --turns=unlimited --judge glm-5.3-flash"), {
     kind: "set",
     condition: "fix the build",
@@ -106,8 +113,9 @@ test("options may follow the condition; -- turns option parsing off for the rema
   });
   // The parser keeps the id as typed; the agent matches it case-insensitively.
   assert.deepEqual(parseGoalCommand("--judge GLM-5.3-Flash x"), { kind: "set", condition: "x", judgeModel: "GLM-5.3-Flash" });
-  // A `--word` in the middle of prose is not an option; one at the very end is.
-  assert.deepEqual(parseGoalCommand("make the --verbose flag work"), { kind: "set", condition: "make the --verbose flag work" });
+  // Any other `--word` is an unknown option, wherever it sits; escape with `-- `.
+  assert.match(invalidMessage("make the --verbose flag work"), /Unknown \/goal option "--verbose"/);
+  assert.deepEqual(parseGoalCommand("-- make the --verbose flag work"), { kind: "set", condition: "make the --verbose flag work" });
   assert.deepEqual(parseGoalCommand("-- fix -- this --judge x"), { kind: "set", condition: "fix -- this --judge x" });
   assert.match(invalidMessage("fix it --judge"), /--judge needs a value/);
   assert.match(invalidMessage("fix it --turns"), /--turns needs a value/);

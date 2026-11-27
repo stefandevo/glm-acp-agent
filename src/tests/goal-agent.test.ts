@@ -534,6 +534,10 @@ test("--judge is validated against the advertised models and the id is canonical
     assert.match(await h.status(sessionId), /No goal set/);
     assert.equal(h.modelCalls.length, 0);
     assert.equal(h.judgeCalls.length, 0);
+    // A multi-word trailing value is still a (bad) model name, never goal text.
+    const uncleBob = await h.status(sessionId, "/goal test 2+2 --judge Uncle Bob");
+    assert.match(uncleBob, /Unknown evaluator model "Uncle Bob"\./);
+    assert.match(await h.status(sessionId), /No goal set/);
     // Typed after the condition, in a different case: the flag is honoured and the id canonicalised.
     await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal fix the build --judge GLM-5.3-Flash" }] });
     assert.equal(h.judgeOptions[0]?.model, "glm-5.3-flash");

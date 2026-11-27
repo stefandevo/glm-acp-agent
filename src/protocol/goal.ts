@@ -123,9 +123,12 @@ export function parseGoalInvocation(text: string): string | undefined {
  * text rather than a pause. `--judge <model>` picks the evaluator model and
  * `--turns <n|unlimited>` the per-round turn limit for this goal alone. Both
  * may come before or after the condition, in any order, so
- * `/goal fix the build --judge glm-5.3-flash` reads the way it is typed. A
- * leading `--` turns option parsing off for the whole remainder, for a
- * condition that starts with an option or a control word.
+ * `/goal fix the build --judge glm-5.3-flash` reads the way it is typed.
+ * Every `--word` is read as an option — a mistyped one is rejected rather
+ * than becoming goal text — and a trailing option's value runs to the end of
+ * the input. A `--` (before or after leading options) turns option parsing
+ * off for the remainder, for a condition that contains `--word` prose or
+ * starts with a control word.
  */
 export function parseGoalCommand(args: string): GoalCommand {
   const trimmed = args.trim();
@@ -139,44 +142,53 @@ export function parseGoalCommand(args: string): GoalCommand {
   /** Apply one `--name value` pair; returns the rejection text when it is not a known option. */
   const applyOption = (name: string, value: string | undefined): string | undefined => {
     if (name !== "judge" && name !== "turns") {
-      return `Unknown /goal option "--${name}". Supported: --judge <model>, --turns <n|unlimited>, or -- before a condition that starts with an option or control word.\n${GOAL_USAGE}`;
+      return `Unknown /goal option "--${name}". Supported: --judge <model>, --turns <n|unlimited>, or -- before the condition to turn option parsing off.\n${GOAL_USAGE}`;
     }
-    if (value === undefined) return `--${name} needs a value.\n${GOAL_USAGE}`;
+    const trimmedValue = value?.trim();
+    if (!trimmedValue) return `--${name} needs a value.\n${GOAL_USAGE}`;
     if (name === "judge") {
-      judgeModel = value;
+      judgeModel = trimmedValue;
       return undefined;
     }
-    const parsed = parseTurnLimit(value);
+    const parsed = parseTurnLimit(trimmedValue);
     if (parsed === undefined) {
-      return `--turns needs a positive number or "unlimited", not "${value}".\n${GOAL_USAGE}`;
+      return `--turns needs a positive number or "unlimited", not "${trimmedValue}".\n${GOAL_USAGE}`;
     }
     turnLimit = parsed;
     return undefined;
   };
 
+  // Every `--word` is an option, wherever it appears, so a mistyped one is
+  // rejected rather than silently becoming goal text. A leading `--` turns
+  // option parsing off for the whole remainder. Leading options take a
+  // single-token value (the condition follows); a trailing option takes
+  // everything after it, so `--judge Uncle Bob` is a rejected model name
+  // rather than prose. The right-most option is peeled first, which lets
+  // several trailing options chain.
+  let escaped = false;
   if (rest === "--" || rest.startsWith("-- ")) {
     rest = rest.slice(2).trim();
-  } else {
-    // Leading options, in any order and any number.
-    while (rest.startsWith("--")) {
-      const match = /^--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
-      const rejection = match && applyOption(match[1]!, match[2]);
-      if (!match || rejection) {
-        return { kind: "invalid", message: rejection ?? `Unknown /goal option in "${rest}".\n${GOAL_USAGE}` };
-      }
-      rest = (match[3] ?? "").trim();
+    escaped = true;
+  }
+  while (!escaped && rest.startsWith("--")) {
+    if (rest === "--" || rest.startsWith("-- ")) {
+      rest = rest.slice(2).trim();
+      escaped = true;
+      break;
     }
-    // Trailing options too, so `/goal fix the build --judge glm-5.3-flash`
-    // reads the way it is typed. The last `--name value` pair is peeled off
-    // until the remainder does not end in one; a bare `--word` at the end is
-    // an unknown option rather than part of the condition.
-    for (;;) {
-      const match = /^(.*?)\s--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?$/.exec(rest);
-      if (!match) break;
-      const rejection = applyOption(match[2]!, match[3]);
-      if (rejection) return { kind: "invalid", message: rejection };
-      rest = match[1]!.trim();
+    const match = /^--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
+    const rejection = match ? applyOption(match[1]!, match[2]) : undefined;
+    if (!match || rejection) {
+      return { kind: "invalid", message: rejection ?? `Unknown /goal option in "${rest}".\n${GOAL_USAGE}` };
     }
+    rest = (match[3] ?? "").trim();
+  }
+  while (!escaped) {
+    const match = /^(.*)\s--([A-Za-z][\w-]*)(?:[=\s]+([\s\S]*))?$/.exec(rest);
+    if (!match) break;
+    const rejection = applyOption(match[2]!, match[3]);
+    if (rejection) return { kind: "invalid", message: rejection };
+    rest = match[1]!.trim();
   }
 
   const condition = rest.trim();
