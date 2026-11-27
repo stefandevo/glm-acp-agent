@@ -379,15 +379,15 @@ test("evaluator failure pauses the goal after one retry", async () => {
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test("a turn that stops on max_turn_requests pauses the goal with that reason", async () => {
+test("a round that stops on its turn limit pauses the goal with that reason", async () => {
   const cwd = tempDir("glm-goal-cwd-");
   try {
     const h = setup({ main: [{ toolCall: true }, { text: "done" }], judge: [MET("green")] }, { maxTurns: 1 });
     const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
     const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
     assert.equal(result.stopReason, "max_turn_requests");
-    assert.match(h.texts().at(-1) ?? "", /Goal paused — turn ended with stop reason max_turn_requests/);
-    assert.match(await h.status(sessionId), /\*\*Goal: paused \(error\)\*\*/);
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — the round hit its turn limit \(1\)\./);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(turn limit\)\*\*/);
     assert.equal((await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] })).stopReason, "end_turn");
     assert.match(await h.status(sessionId), GOAL_ACHIEVED);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
@@ -445,5 +445,79 @@ test("invalid goals are answered without a model call; a control word followed b
     assert.match(await h.status(sessionId, "/goal pause"), /Goal is achieved; \/goal pause applies to an active goal/);
     // Control words are case-insensitive and accept the clear aliases.
     assert.match(await h.status(sessionId, "/goal STOP"), /Goal cleared: pause after verification/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a goal round stops on the agent's turn limit unless the goal raises or removes it", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    // Five tool turns, then a text turn; the agent default here is 2, so a
+    // plain goal trips the limit before the model ever gets to "done".
+    const script = () => ({
+      main: [{ toolCall: true }, { toolCall: true }, { toolCall: true }, { toolCall: true }, { toolCall: true }, { text: "done" }],
+      judge: [MET("green")],
+    });
+    const plain = setup(script(), { maxTurns: 2 });
+    const { sessionId } = await plain.agent.newSession({ cwd, mcpServers: [] });
+    const result = await plain.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(result.stopReason, "max_turn_requests");
+    assert.equal(plain.modelCalls.length, 2);
+    assert.match(plain.texts().join("\n"), /\[stopped: reached the 2-turn limit/);
+    assert.match(plain.texts().at(-1) ?? "", /Goal paused — the round hit its turn limit \(2\)\./);
+    const status = await plain.status(sessionId);
+    assert.match(status, /\*\*Goal: paused \(turn limit\)\*\*/);
+    assert.match(status, /- Turn limit: 2 per round/);
+
+    const raised = setup(script(), { maxTurns: 2 });
+    const { sessionId: raisedSession } = await raised.agent.newSession({ cwd, mcpServers: [] });
+    const raisedResult = await raised.agent.prompt({ sessionId: raisedSession, prompt: [{ type: "text", text: "/goal --turns 6 x" }] });
+    assert.equal(raisedResult.stopReason, "end_turn");
+    assert.equal(raised.modelCalls.length, 6);
+    assert.match(await raised.status(raisedSession), /- Turn limit: 6 per round/);
+    assert.match(await raised.status(raisedSession), GOAL_ACHIEVED);
+
+    const unlimited = setup(script(), { maxTurns: 2 });
+    const { sessionId: unlimitedSession } = await unlimited.agent.newSession({ cwd, mcpServers: [] });
+    const unlimitedResult = await unlimited.agent.prompt({ sessionId: unlimitedSession, prompt: [{ type: "text", text: "/goal --turns unlimited x" }] });
+    assert.equal(unlimitedResult.stopReason, "end_turn");
+    assert.equal(unlimited.modelCalls.length, 6);
+    assert.match(await unlimited.status(unlimitedSession), /- Turn limit: unlimited per round/);
+
+    // /goal resume keeps the goal's own (default) limit, so it trips again.
+    const resumed = await plain.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.equal(resumed.stopReason, "max_turn_requests");
+    assert.equal(plain.modelCalls.length, 4);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("ACP_GLM_GOAL_MAX_TURNS sets the agent-wide goal turn limit; --turns still wins", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    process.env["ACP_GLM_GOAL_MAX_TURNS"] = "6";
+    try {
+      const h = setup({
+        main: [{ toolCall: true }, { toolCall: true }, { toolCall: true }, { toolCall: true }, { toolCall: true }, { text: "done" }],
+        judge: [MET("green"), MET("green")],
+      }, { maxTurns: 2 });
+      const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+      assert.equal((await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] })).stopReason, "end_turn");
+      assert.equal(h.modelCalls.length, 6);
+      assert.match(await h.status(sessionId), /- Turn limit: 6 per round/);
+      // A lower per-goal limit still wins over the environment.
+      const lowered = setup({
+        main: [{ toolCall: true }, { toolCall: true }, { text: "done" }],
+        judge: [MET("green")],
+      }, { maxTurns: 2 });
+      const { sessionId: loweredSession } = await lowered.agent.newSession({ cwd, mcpServers: [] });
+      const loweredResult = await lowered.agent.prompt({ sessionId: loweredSession, prompt: [{ type: "text", text: "/goal --turns 1 x" }] });
+      assert.equal(loweredResult.stopReason, "max_turn_requests");
+      assert.equal(lowered.modelCalls.length, 1);
+      assert.match(await lowered.status(loweredSession), /- Turn limit: 1 per round/);
+    } finally { delete process.env["ACP_GLM_GOAL_MAX_TURNS"]; }
+    // ...and ordinary prompts keep the agent's own limit, whatever goals use.
+    const plain = setup({ main: [{ toolCall: true }, { text: "done" }], judge: [] }, { maxTurns: 2 });
+    const { sessionId } = await plain.agent.newSession({ cwd, mcpServers: [] });
+    assert.equal((await plain.agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] })).stopReason, "end_turn");
+    assert.equal(plain.modelCalls.length, 2);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });

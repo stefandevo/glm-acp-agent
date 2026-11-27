@@ -5,6 +5,7 @@ import {
   addGoalTokens,
   createGoal,
   formatGoalStatus,
+  formatTurnLimit,
   formatDuration,
   formatTokens,
   goalContinuationDisplayText,
@@ -12,10 +13,12 @@ import {
   isGoalState,
   parseGoalCommand,
   parseGoalInvocation,
+  parseTurnLimit,
   renderGoalContinuation,
   renderGoalDirective,
   renderGoalResume,
   restoreGoal,
+  turnLimitForLoop,
   type GoalState,
 } from "../protocol/goal.js";
 
@@ -54,6 +57,53 @@ test("--judge picks the evaluator model for one goal; -- escapes the grammar", (
   assert.deepEqual(parseGoalCommand("-- pause the nightly cron"), { kind: "set", condition: "pause the nightly cron" });
 });
 
+/** Parse `args`, assert it was rejected, and return the message. */
+function invalidMessage(args: string): string {
+  const parsed = parseGoalCommand(args);
+  assert.equal(parsed.kind, "invalid", args);
+  return parsed.kind === "invalid" ? parsed.message : "";
+}
+
+test("--turns sets the per-round turn limit; it composes with --judge in either order", () => {
+  assert.deepEqual(parseGoalCommand("--turns 500 fix the build"), { kind: "set", condition: "fix the build", turnLimit: 500 });
+  assert.deepEqual(parseGoalCommand("--turns=unlimited fix the build"), { kind: "set", condition: "fix the build", turnLimit: "unlimited" });
+  assert.deepEqual(parseGoalCommand("--turns NONE fix the build"), { kind: "set", condition: "fix the build", turnLimit: "unlimited" });
+  assert.deepEqual(parseGoalCommand("--turns 300 --judge glm-5.3-flash fix the build"), {
+    kind: "set",
+    condition: "fix the build",
+    judgeModel: "glm-5.3-flash",
+    turnLimit: 300,
+  });
+  assert.deepEqual(parseGoalCommand("--judge glm-5.3-flash --turns=unlimited fix the build"), {
+    kind: "set",
+    condition: "fix the build",
+    judgeModel: "glm-5.3-flash",
+    turnLimit: "unlimited",
+  });
+  for (const bad of ["--turns 0 x", "--turns abc x", "--turns -5 x", "--turns 1.5 x", "--turns x"]) {
+    const parsed = parseGoalCommand(bad);
+    assert.equal(parsed.kind, "invalid", bad);
+    assert.match(parsed.kind === "invalid" ? parsed.message : "", /--turns needs a positive number or "unlimited"/);
+  }
+  assert.match(invalidMessage("--judge"), /--judge needs a value/);
+  assert.match(invalidMessage("--turns"), /--turns needs a value/);
+  assert.match(invalidMessage("--rounds 5 x"), /--turns <n\|unlimited>/);
+});
+
+test("turn limits parse, validate, and resolve to the loop bound", () => {
+  assert.equal(parseTurnLimit("1"), 1);
+  assert.equal(parseTurnLimit("007"), 7);
+  assert.equal(parseTurnLimit("unlimited"), "unlimited");
+  assert.equal(parseTurnLimit("Unlimited"), "unlimited");
+  for (const bad of ["", "0", "-1", "1.5", "1e3", "many", "unlimited "]) assert.equal(parseTurnLimit(bad), undefined, bad);
+  assert.equal(turnLimitForLoop(undefined, 100), 100);
+  assert.equal(turnLimitForLoop(500, 100), 500);
+  assert.equal(turnLimitForLoop("unlimited", 100), Number.POSITIVE_INFINITY);
+  assert.equal(turnLimitForLoop(undefined, "unlimited"), Number.POSITIVE_INFINITY);
+  assert.equal(formatTurnLimit("unlimited"), "unlimited");
+  assert.equal(formatTurnLimit(250), "250");
+});
+
 test("invalid goals explain themselves", () => {
   const noCondition = parseGoalCommand("--judge glm-5.3-flash");
   assert.equal(noCondition.kind, "invalid");
@@ -74,6 +124,9 @@ test("createGoal arms a goal; restoreGoal resets the activation but keeps the co
   assert.equal(goal.rounds, 0);
   assert.equal(goal.judgeModel, "glm-5.3-flash");
   assert.equal("judgeModel" in createGoal({ condition: "x", maxRounds: 1, now: "2026-11-27T10:00:00.000Z" }), false);
+  const limited = createGoal({ condition: "x", maxRounds: 1, turnLimit: "unlimited", now: "2026-11-27T10:00:00.000Z" });
+  assert.equal(limited.turnLimit, "unlimited");
+  assert.equal("turnLimit" in createGoal({ condition: "x", maxRounds: 1, now: "2026-11-27T10:00:00.000Z" }), false);
 
   addGoalTokens(goal, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
   addGoalTokens(goal, { inputTokens: 1, outputTokens: 2, totalTokens: 3 });
@@ -105,6 +158,8 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
   };
   assert.equal(isGoalState(goal), true);
   assert.equal(isGoalState({ ...goal, judgeModel: "glm-5.3-flash", tokens: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }), true);
+  assert.equal(isGoalState({ ...goal, turnLimit: 500 }), true);
+  assert.equal(isGoalState({ ...goal, turnLimit: "unlimited" }), true);
   for (const broken of [
     null,
     "goal",
@@ -115,6 +170,9 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
     { ...goal, rounds: -1 },
     { ...goal, maxRounds: 0 },
     { ...goal, judgeModel: "" },
+    { ...goal, turnLimit: 0 },
+    { ...goal, turnLimit: "many" },
+    { ...goal, turnLimit: 1.5 },
     { ...goal, lastVerdict: "maybe" },
     { ...goal, pauseReason: "because" },
     { ...goal, tokens: { inputTokens: 1 } },
@@ -154,6 +212,8 @@ test("display text and notices are short and name the reason", () => {
   assert.match(goalPausedNotice({ ...goal, pauseReason: "error" }, "stop reason max_turn_requests"), /turn ended with stop reason max_turn_requests/);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "judge_unavailable" }, "401"), /evaluator unavailable: 401/);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "user" }), /Goal paused — user\./);
+  assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /Goal paused — the round hit its turn limit \(100\)\./);
+  assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /\/goal --turns <n\|unlimited> to set a new goal/);
 });
 
 test("formatGoalStatus reports the state the other /goal commands expose", () => {
@@ -173,6 +233,10 @@ test("formatGoalStatus reports the state the other /goal commands expose", () =>
   const text = formatGoalStatus(active, "glm-5.4", now);
   assert.match(text, /\*\*Goal: active\*\*/);
   assert.match(text, /- Rounds: 3\/20/);
+  assert.match(text, /- Turn limit: 100 per round/);
+  assert.match(formatGoalStatus({ ...active, turnLimit: 500 }, "glm-5.4", now), /- Turn limit: 500 per round/);
+  assert.match(formatGoalStatus({ ...active, turnLimit: "unlimited" }, "glm-5.4", now), /- Turn limit: unlimited per round/);
+  assert.match(formatGoalStatus(active, "glm-5.4", now, 40), /- Turn limit: 40 per round/);
   assert.match(text, /- Running: 30m/);
   assert.match(text, /- Evaluator: glm-5\.4 \(session model\)/);
   assert.match(text, /- Tokens: 42\.0k \(agent \+ evaluator\)/);

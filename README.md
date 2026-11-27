@@ -35,7 +35,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
-- **Goals (`/goal`)** – `/goal <condition>` keeps the agent working across turns until a separate evaluator model confirms the condition is met, judges it impossible, or you pause it; the round budget, a no-progress streak, a cancel, or an evaluator outage pause the goal instead of running unbounded (see [Goals](#goals-goal))
+- **Goals (`/goal`)** – `/goal <condition>` keeps the agent working across turns until a separate evaluator model confirms the condition is met, judges it impossible, or you pause it; the round budget, a round's turn limit, a no-progress streak, a cancel, or an evaluator outage pause the goal instead of running unbounded (see [Goals](#goals-goal))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.4` and `glm-5.3-flash` send supported pasted ACP image blocks directly as native `image_url` content parts, while `glm-5.3`, `glm-5-turbo` and `glm-4.7` route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Ten built-in tools** (see below)
@@ -219,18 +219,22 @@ The evaluator never runs tools, so it can only judge what the agent has surfaced
 |---|---|
 | `/goal <condition>` | Set or replace the goal (up to 4,000 characters) and start the first round. |
 | `/goal --judge <model> <condition>` | Same, with this goal evaluated by `<model>` instead of the agent-wide default. |
-| `/goal` or `/goal status` | Show the condition, status, rounds used, running time, evaluator, token spend, and the last verdict with its reason. |
+| `/goal --turns <n> <condition>` | Same, with each round allowed up to `<n>` model/tool turns instead of the agent-wide default. |
+| `/goal --turns unlimited <condition>` | Same, with no turn limit at all; a round ends only when the model stops, you cancel, or a request fails. |
+| `/goal` or `/goal status` | Show the condition, status, rounds used, running time, turn limit, evaluator, token spend, and the last verdict with its reason. |
 | `/goal pause` | Stop auto-continuation and keep the goal. |
 | `/goal resume` | Continue a paused or blocked goal with a fresh round budget. |
 | `/goal clear` | Drop the goal (`stop`, `off`, `reset`, `cancel`, and `none` are aliases). |
 
-A control word counts only when it is the entire argument, so `/goal pause after verification` is a goal with that text. Use `-- ` before a condition that starts with an option or a control word.
+The options may appear in either order and both are optional: `/goal --turns 300 --judge glm-5.3-flash fix the build`. A control word counts only when it is the entire argument, so `/goal pause after verification` is a goal with that text. Use `-- ` before a condition that starts with an option or a control word.
+
+Two independent budgets bound a goal. The **round budget** (`ACP_GLM_GOAL_MAX_ROUNDS`, 20) counts how many times the evaluator sends the agent back to work. The **turn limit** bounds each round's own tool-calling loop, exactly as it bounds an ordinary prompt (`ACP_GLM_MAX_TURNS`, 100 by default). A long round — a big migration, a full test-suite fix-up — can therefore stop with `[stopped: reached the 100-turn limit]` and pause the goal before the evaluator ever runs. `--turns <n>` raises (or lowers) that limit for one goal and `--turns unlimited` removes it; `ACP_GLM_GOAL_MAX_TURNS` changes the default for every goal. `/goal resume` starts a fresh round with the goal's limit intact, so a goal paused on its turn limit hits the same wall again unless you set a new goal with a higher `--turns`.
 
 The loop pauses itself — keeping the goal, so `/goal resume` continues it — when:
 
 - the round budget is used up (`ACP_GLM_GOAL_MAX_ROUNDS`, default 20 continuation rounds per activation);
 - three rounds in a row end without a single tool call (the model is answering the evaluator instead of working);
-- a turn ends on another stop reason such as `max_turn_requests`;
+- a round uses up its turn limit, or ends on another stop reason such as `max_tokens`;
 - the evaluator cannot be reached or does not answer in the verdict format (one retry, then pause);
 - you cancel the turn. A newer prompt sent while a round is running does not pause the goal: it supersedes the round, its own turn is judged when it ends, and the loop continues from there.
 
@@ -351,6 +355,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model turns per prompt (also settable via `--max-turns`). The final turn's tool calls still run and their results are saved |
 | `ACP_GLM_GOAL_MAX_ROUNDS` | No | `20` | Continuation rounds a `/goal` may run per activation before it pauses itself. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_GOAL_MAX_TURNS` | No | `ACP_GLM_MAX_TURNS` (100) | Model/tool turns each `/goal` round may take before it pauses on its turn limit; a positive integer or `unlimited`. A goal's `--turns` flag takes precedence. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_GOAL_JUDGE_MODEL` | No | session model | Model that evaluates `/goal`. A goal's `--judge <model>` flag takes precedence. |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |

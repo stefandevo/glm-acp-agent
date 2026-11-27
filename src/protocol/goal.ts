@@ -15,6 +15,11 @@
 
 export type GoalStatus = "active" | "paused" | "achieved" | "blocked";
 export type GoalVerdict = "met" | "not_met" | "impossible";
+/**
+ * Model/tool turns one goal round may take before it stops on
+ * `max_turn_requests`. A positive integer, or "unlimited" for no cap.
+ */
+export type GoalTurnLimit = number | "unlimited";
 export type GoalPauseReason =
   /** `/goal pause`. */
   | "user"
@@ -24,7 +29,9 @@ export type GoalPauseReason =
   | "budget"
   /** Several rounds in a row without a single tool call. */
   | "no_progress"
-  /** A turn ended on a stop reason other than `end_turn`. */
+  /** A round used up its turn limit (`max_turn_requests`). */
+  | "turn_limit"
+  /** A turn ended on another stop reason. */
   | "error"
   /** The evaluator model could not be reached or did not answer in the verdict format. */
   | "judge_unavailable"
@@ -47,6 +54,8 @@ export interface GoalState {
   status: GoalStatus;
   /** Evaluator model id; absent means the session's own model. */
   judgeModel?: string;
+  /** Model/tool turns each round may take; absent means the agent-wide goal default. */
+  turnLimit?: GoalTurnLimit;
   /** Start of the current activation; reset by `/goal resume` and by a restore. */
   setAt: string;
   /** Continuation rounds consumed in the current activation. */
@@ -65,20 +74,22 @@ export const GOAL_COMMAND_NAME = "goal";
 /** Matches the Claude Code and Kimi Code limits. */
 export const GOAL_CONDITION_CAP_CHARS = 4_000;
 export const DEFAULT_GOAL_MAX_ROUNDS = 20;
+/** Shown in status when nothing else is known; the agent passes its real default. */
+export const DEFAULT_GOAL_TURN_LIMIT = 100;
 /** Claude Code, Kimi Code and Qwen Code all stop after about three answer-only turns. */
 export const GOAL_NO_PROGRESS_ROUNDS = 3;
 /** Evaluator reasons become the next continuation's instructions; keep them short. */
 export const GOAL_REASON_CAP_CHARS = 500;
 
 export const GOAL_USAGE =
-  "Usage: /goal <condition> [--judge <model>]  |  /goal status  |  /goal pause  |  /goal resume  |  /goal clear";
+  "Usage: /goal <condition> [--judge <model>] [--turns <n|unlimited>]  |  /goal status  |  /goal pause  |  /goal resume  |  /goal clear";
 
 export type GoalCommand =
   | { kind: "status" }
   | { kind: "pause" }
   | { kind: "resume" }
   | { kind: "clear" }
-  | { kind: "set"; condition: string; judgeModel?: string }
+  | { kind: "set"; condition: string; judgeModel?: string; turnLimit?: GoalTurnLimit }
   | { kind: "invalid"; message: string };
 
 const CONTROL_WORDS = new Map<string, "status" | "pause" | "resume" | "clear">([
@@ -109,10 +120,10 @@ export function parseGoalInvocation(text: string): string | undefined {
  *
  * A control word counts only when it is the entire argument — the DeepSeek
  * Harness grammar — so `/goal pause after verification` is a goal with that
- * text rather than a pause. `--judge <model>` (or `--judge=<model>`) may
- * precede the condition and picks the evaluator model for this goal alone.
- * A leading `--` escapes the grammar for a condition that starts with an
- * option or a control word.
+ * text rather than a pause. `--judge <model>` picks the evaluator model and
+ * `--turns <n|unlimited>` the per-round turn limit for this goal alone; both
+ * may precede the condition in either order. A leading `--` escapes the
+ * grammar for a condition that starts with an option or a control word.
  */
 export function parseGoalCommand(args: string): GoalCommand {
   const trimmed = args.trim();
@@ -122,18 +133,38 @@ export function parseGoalCommand(args: string): GoalCommand {
 
   let rest = trimmed;
   let judgeModel: string | undefined;
+  let turnLimit: GoalTurnLimit | undefined;
   if (rest === "--" || rest.startsWith("-- ")) {
     rest = rest.slice(2).trim();
-  } else if (rest.startsWith("--")) {
-    const match = /^--judge(?:[=\s]+)(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
-    if (!match) {
-      return {
-        kind: "invalid",
-        message: `Unknown /goal option. Supported: --judge <model>, or -- before a condition that starts with an option or control word.\n${GOAL_USAGE}`,
-      };
+  } else {
+    // Leading options, in any order and any number; the first non-option
+    // text starts the condition.
+    while (rest.startsWith("--")) {
+      const match = /^--(judge|turns)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
+      if (!match) {
+        return {
+          kind: "invalid",
+          message: `Unknown /goal option. Supported: --judge <model>, --turns <n|unlimited>, or -- before a condition that starts with an option or control word.\n${GOAL_USAGE}`,
+        };
+      }
+      const value = match[2];
+      if (value === undefined) {
+        return { kind: "invalid", message: `--${match[1]} needs a value.\n${GOAL_USAGE}` };
+      }
+      if (match[1] === "judge") {
+        judgeModel = value;
+      } else {
+        const parsed = parseTurnLimit(value);
+        if (parsed === undefined) {
+          return {
+            kind: "invalid",
+            message: `--turns needs a positive number or "unlimited", not "${value}".\n${GOAL_USAGE}`,
+          };
+        }
+        turnLimit = parsed;
+      }
+      rest = (match[3] ?? "").trim();
     }
-    judgeModel = match[1];
-    rest = (match[2] ?? "").trim();
   }
 
   const condition = rest.trim();
@@ -146,19 +177,53 @@ export function parseGoalCommand(args: string): GoalCommand {
       message: `Goal condition is ${condition.length} characters; the limit is ${GOAL_CONDITION_CAP_CHARS}.`,
     };
   }
-  return { kind: "set", condition, ...(judgeModel ? { judgeModel } : {}) };
+  return {
+    kind: "set",
+    condition,
+    ...(judgeModel ? { judgeModel } : {}),
+    ...(turnLimit !== undefined ? { turnLimit } : {}),
+  };
+}
+
+/**
+ * Parse a per-round turn limit: a positive integer, or "unlimited" / "none"
+ * for no cap. `undefined` for anything else.
+ */
+export function parseTurnLimit(raw: string): GoalTurnLimit | undefined {
+  const lowered = raw.toLowerCase();
+  if (lowered === "unlimited" || lowered === "none") return "unlimited";
+  if (!/^\d+$/.test(raw)) return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : undefined;
+}
+
+/**
+ * The bound the prompt loop iterates against. An unset goal limit falls back
+ * to the agent-wide goal default; "unlimited" becomes Infinity, so the loop
+ * only ends when the model stops, the client cancels, or a request fails.
+ */
+export function turnLimitForLoop(limit: GoalTurnLimit | undefined, fallback: GoalTurnLimit): number {
+  const resolved = limit ?? fallback;
+  return resolved === "unlimited" ? Number.POSITIVE_INFINITY : resolved;
+}
+
+/** `500` or `unlimited`, for notices and status lines. */
+export function formatTurnLimit(limit: GoalTurnLimit): string {
+  return limit === "unlimited" ? "unlimited" : String(limit);
 }
 
 export function createGoal(input: {
   condition: string;
   maxRounds: number;
   judgeModel?: string;
+  turnLimit?: GoalTurnLimit;
   now: string;
 }): GoalState {
   return {
     condition: input.condition,
     status: "active",
     ...(input.judgeModel ? { judgeModel: input.judgeModel } : {}),
+    ...(input.turnLimit !== undefined ? { turnLimit: input.turnLimit } : {}),
     setAt: input.now,
     rounds: 0,
     maxRounds: input.maxRounds,
@@ -204,6 +269,10 @@ export function isGoalState(value: unknown): value is GoalState {
   if (goal.lastVerdict !== undefined && (typeof goal.lastVerdict !== "string" || !VALID_VERDICTS.has(goal.lastVerdict))) {
     return false;
   }
+  if (goal.turnLimit !== undefined &&
+      !(goal.turnLimit === "unlimited" || (isCount(goal.turnLimit) && goal.turnLimit >= 1))) {
+    return false;
+  }
   if (goal.lastReason !== undefined && typeof goal.lastReason !== "string") return false;
   if (goal.pauseReason !== undefined && (typeof goal.pauseReason !== "string" || !VALID_PAUSE_REASONS.has(goal.pauseReason))) {
     return false;
@@ -225,6 +294,7 @@ const VALID_PAUSE_REASONS = new Set<string>([
   "cancelled",
   "budget",
   "no_progress",
+  "turn_limit",
   "error",
   "judge_unavailable",
   "blocked",
@@ -293,12 +363,21 @@ export function goalContinuationDisplayText(round: number, maxRounds: number, re
 // Client-facing text
 // ---------------------------------------------------------------------------
 
-/** Reply to `/goal` (status). */
-export function formatGoalStatus(goal: GoalState | null | undefined, sessionModel: string, now: number = Date.now()): string {
+/**
+ * Reply to `/goal` (status). `defaultTurnLimit` is the agent-wide goal turn
+ * limit, shown when the goal did not set its own.
+ */
+export function formatGoalStatus(
+  goal: GoalState | null | undefined,
+  sessionModel: string,
+  now: number = Date.now(),
+  defaultTurnLimit: GoalTurnLimit = DEFAULT_GOAL_TURN_LIMIT
+): string {
   if (!goal) return `No goal set.\n\n${GOAL_USAGE}`;
   const pause = goal.status === "paused" && goal.pauseReason ? ` (${goal.pauseReason.replaceAll("_", " ")})` : "";
   const lines = [`**Goal: ${goal.status}${pause}**`, "", goal.condition, "", `- Rounds: ${goal.rounds}/${goal.maxRounds}`];
   if (goal.status === "active") lines.push(`- Running: ${formatDuration(Math.max(0, now - Date.parse(goal.setAt)))}`);
+  lines.push(`- Turn limit: ${formatTurnLimit(goal.turnLimit ?? defaultTurnLimit)} per round`);
   lines.push(`- Evaluator: ${goal.judgeModel ?? `${sessionModel} (session model)`}`);
   if (goal.tokens) lines.push(`- Tokens: ${formatTokens(goal.tokens.totalTokens)} (agent + evaluator)`);
   if (goal.lastVerdict) {
@@ -352,6 +431,9 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
     case "cancelled":
       line = "turn cancelled";
       break;
+    case "turn_limit":
+      line = `the round hit its turn limit (${detail ?? "default"})`;
+      break;
     case "error":
       line = `turn ended with ${detail ?? "an error"}`;
       break;
@@ -361,7 +443,10 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
     default:
       line = cause;
   }
-  return `Goal paused — ${line}.\nSend /goal resume to continue, or /goal clear to drop the goal.`;
+  const hint = cause === "turn_limit"
+    ? "Send /goal resume to continue, /goal --turns <n|unlimited> to set a new goal with a higher limit, or /goal clear to drop the goal."
+    : "Send /goal resume to continue, or /goal clear to drop the goal.";
+  return `Goal paused — ${line}.\n${hint}`;
 }
 
 export function formatVerdict(verdict: GoalVerdict): string {

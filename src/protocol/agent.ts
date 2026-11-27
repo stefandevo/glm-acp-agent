@@ -74,6 +74,7 @@ import {
   GOAL_NO_PROGRESS_ROUNDS,
   GOAL_USAGE,
   addGoalTokens,
+  formatTurnLimit,
   createGoal,
   formatGoalStatus,
   goalAchievedNotice,
@@ -84,13 +85,16 @@ import {
   goalPauseNotice,
   parseGoalCommand,
   parseGoalInvocation,
+  parseTurnLimit,
   renderGoalDirective,
   renderGoalContinuation,
   renderGoalResume,
   restoreGoal,
+  turnLimitForLoop,
   type GoalCommand,
   type GoalPauseReason,
   type GoalState,
+  type GoalTurnLimit,
 } from "./goal.js";
 import { evaluateGoal } from "./goal-evaluator.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
@@ -286,6 +290,12 @@ export interface GlmAcpAgentOptions {
    */
   goalMaxRounds?: number;
   /**
+   * Model/tool turns each `/goal` round may take before it pauses on
+   * `max_turn_requests`. Defaults to the agent's `maxTurns`; overridable via
+   * `$ACP_GLM_GOAL_MAX_TURNS`, and per goal with `--turns`.
+   */
+  goalMaxTurns?: GoalTurnLimit;
+  /**
    * Override the session store (used in tests). When undefined the agent
    * uses an on-disk store rooted at `$ACP_GLM_SESSION_DIR` /
    * `$XDG_STATE_HOME/glm-acp-agent/sessions` / `~/.local/state/glm-acp-agent/sessions`.
@@ -367,6 +377,25 @@ function envGoalMaxRounds(): number | undefined {
 }
 
 /**
+ * Resolve the per-round turn limit for `/goal` from
+ * `$ACP_GLM_GOAL_MAX_TURNS`: a positive integer or `unlimited`. Returns
+ * `undefined` when unset or invalid, so the constructor can fall back to the
+ * agent's own `maxTurns` and warn on invalid input.
+ */
+function envGoalMaxTurns(): GoalTurnLimit | undefined {
+  const raw = process.env["ACP_GLM_GOAL_MAX_TURNS"]?.trim();
+  if (!raw) return undefined;
+  const parsed = parseTurnLimit(raw);
+  if (parsed === undefined) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring invalid ACP_GLM_GOAL_MAX_TURNS="${raw}" (expected a positive number or "unlimited")\n`
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
+/**
  * Agent-wide default evaluator model for `/goal`, from
  * `$ACP_GLM_GOAL_JUDGE_MODEL`. `undefined` means the session's own model
  * judges; a goal's `--judge` flag takes precedence over this.
@@ -397,6 +426,8 @@ export class GlmAcpAgent implements Agent {
   private maxTurns: number;
   /** Continuation rounds a `/goal` may run before it pauses itself. */
   private goalMaxRounds: number;
+  /** Model/tool turns each `/goal` round may take; "unlimited" for no cap. */
+  private goalMaxTurns: GoalTurnLimit;
   /** Forward GLM reasoning to the client as agent_thought_chunk. Default on; disable with ACP_GLM_STREAM_THINKING=false. */
   private streamThinking: boolean;
   private clientCapabilities: ClientCapabilities | null = null;
@@ -432,6 +463,7 @@ export class GlmAcpAgent implements Agent {
       Number.isFinite(flooredGoalRounds) && flooredGoalRounds >= 1
         ? flooredGoalRounds
         : DEFAULT_GOAL_MAX_ROUNDS;
+    this.goalMaxTurns = options.goalMaxTurns ?? envGoalMaxTurns() ?? this.maxTurns;
     this.sessionStore =
       options.sessionStore === null
         ? null
@@ -1090,7 +1122,10 @@ export class GlmAcpAgent implements Agent {
         ownsPrompt,
         preservesDrainingHistory,
         this.processSupervisor,
-        toolCallCount
+        toolCallCount,
+        session.goal?.status === "active"
+          ? turnLimitForLoop(session.goal.turnLimit, this.goalMaxTurns)
+          : undefined
       );
       // While a goal is active the turn is judged when the model stops, and
       // a "not met" verdict starts another round inside this same prompt.
@@ -2223,7 +2258,7 @@ export class GlmAcpAgent implements Agent {
     const goal = session.goal;
     switch (command.kind) {
       case "status":
-        return { reply: formatGoalStatus(goal, session.model), mutated: false };
+        return { reply: formatGoalStatus(goal, session.model, Date.now(), this.goalMaxTurns), mutated: false };
       case "pause":
         if (!goal) return { reply: `No goal set.\n\n${GOAL_USAGE}`, mutated: false };
         if (goal.status === "paused") {
@@ -2282,6 +2317,7 @@ export class GlmAcpAgent implements Agent {
         condition: command.condition,
         maxRounds: this.goalMaxRounds,
         judgeModel,
+        turnLimit: command.turnLimit,
         now,
       });
       text = renderGoalDirective(command.condition);
@@ -2328,6 +2364,7 @@ export class GlmAcpAgent implements Agent {
     const goal = session.goal;
     if (!goal || goal.status !== "active") return initial;
     const superseded = (): boolean => session.promptPromise !== promptPromise;
+    const maxTurns = turnLimitForLoop(goal.turnLimit, this.goalMaxTurns);
     let usage = initial.usage;
     addGoalTokens(goal, initial.usage);
     let result = initial;
@@ -2340,6 +2377,9 @@ export class GlmAcpAgent implements Agent {
       // turn is not a pause: the newer prompt continues the same goal.
       if (result.stopReason !== "end_turn") {
         if (superseded() || !ownsPrompt()) return result;
+        if (result.stopReason === "max_turn_requests") {
+          return this.pauseGoal(sessionId, session, promptConnection, signal, "turn_limit", formatTurnLimit(maxTurns), result);
+        }
         return this.pauseGoal(
           sessionId, session, promptConnection, signal,
           signal.aborted ? "cancelled" : "error",
@@ -2419,7 +2459,7 @@ export class GlmAcpAgent implements Agent {
       }
 
       result = await this.runPromptLoop(
-        sessionId, session, signal, ownsPrompt, preservesDrainingHistory, this.processSupervisor, toolCalls
+        sessionId, session, signal, ownsPrompt, preservesDrainingHistory, this.processSupervisor, toolCalls, maxTurns
       );
       addGoalTokens(goal, result.usage);
       usage = mergeUsage(usage, result.usage);
@@ -2477,7 +2517,9 @@ export class GlmAcpAgent implements Agent {
     preservesDrainingHistory: () => boolean,
     processSupervisor: ProcessSupervisor,
     /** Receives the number of tool calls the model issued across this loop. */
-    metrics?: { toolCalls: number }
+    metrics?: { toolCalls: number },
+    /** Turn bound for this loop; a goal round may raise or remove the agent default. */
+    maxTurns: number = this.maxTurns
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
     const promptConnection = this.ownedPromptConnection(ownsPrompt, signal);
     const executor = new ToolExecutor(
@@ -2515,7 +2557,7 @@ export class GlmAcpAgent implements Agent {
       }
     };
 
-    for (let turn = 0; turn < this.maxTurns; turn++) {
+    for (let turn = 0; turn < maxTurns; turn++) {
       if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
       const compatibility = checkModelTransition(session.messages, session.model);
       if (!compatibility.ok) throw new Error(compatibility.message);
@@ -2819,7 +2861,7 @@ export class GlmAcpAgent implements Agent {
           sessionUpdate: "agent_message_chunk",
           content: {
             type: "text",
-            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue (the last turn's tool results were saved)]`,
+            text: `\n[stopped: reached the ${maxTurns}-turn limit — send a message to continue (the last turn's tool results were saved)]`,
           },
         },
       });
