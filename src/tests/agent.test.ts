@@ -31,6 +31,8 @@ process.env["USERPROFILE"] = isolatedHome;
 interface ConnectionStub {
   updates: Array<Record<string, unknown>>;
   permissionRequests: Array<unknown>;
+  elicitationRequests: Array<unknown>;
+  elicitationResponse: () => Record<string, unknown>;
   reads: string[];
   writes: Array<{ path: string; content: string }>;
   terminalCommands: Array<{ command: string; args?: string[] }>;
@@ -38,6 +40,7 @@ interface ConnectionStub {
   fileResponses: Map<string, string>;
   sessionUpdate: (params: Record<string, unknown>) => Promise<void>;
   requestPermission: (params: unknown) => Promise<unknown>;
+  unstable_createElicitation: (params: unknown) => Promise<unknown>;
   readTextFile: (params: { sessionId: string; path: string }) => Promise<{ content: string }>;
   writeTextFile: (params: { sessionId: string; path: string; content: string }) => Promise<void>;
   createTerminal: (params: { command: string; args?: string[] }) => Promise<unknown>;
@@ -47,6 +50,8 @@ function createConnectionStub(): ConnectionStub {
   const stub: ConnectionStub = {
     updates: [],
     permissionRequests: [],
+    elicitationRequests: [],
+    elicitationResponse: () => ({ action: "cancel" }),
     reads: [],
     writes: [],
     terminalCommands: [],
@@ -58,6 +63,10 @@ function createConnectionStub(): ConnectionStub {
     async requestPermission(params) {
       this.permissionRequests.push(params);
       return this.permissionResponse();
+    },
+    async unstable_createElicitation(params) {
+      this.elicitationRequests.push(params);
+      return this.elicitationResponse();
     },
     async readTextFile({ path }) {
       this.reads.push(path);
@@ -2071,6 +2080,70 @@ test("prompt loop returns max_turn_requests after exhausting tool turns", async 
   assert.equal(notice, true);
 });
 
+test("a dismissed question stops the rest of the tool-call batch", async () => {
+  const conn = createConnectionStub();
+  const dir = makeTempCwd({ "target.txt": "keep" });
+  try {
+    conn.elicitationResponse = () => ({ action: "cancel" });
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield {
+          toolCall: {
+            id: "ask-1",
+            name: "ask_user_question",
+            arguments: JSON.stringify({
+              questions: [
+                {
+                  question: "Proceed?",
+                  header: "Choice",
+                  multiSelect: false,
+                  options: [
+                    { label: "yes", description: "go ahead" },
+                    { label: "no", description: "stop" },
+                  ],
+                },
+              ],
+            }),
+          },
+        };
+        yield {
+          toolCall: {
+            id: "write-1",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "target.txt", content: "overwritten" }),
+          },
+        };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { elicitation: { form: {} } },
+    });
+    const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "ask, then write" }],
+    });
+
+    // the dismissed form cancels the turn: nothing later in the batch runs
+    assert.equal(result.stopReason, "cancelled");
+    assert.equal(conn.elicitationRequests.length, 1);
+    assert.equal(conn.permissionRequests.length, 0);
+    assert.equal(conn.writes.length, 0);
+    assert.equal(readFileSync(pathJoin(dir.cwd, "target.txt"), "utf8"), "keep");
+    const cardStatuses = conn.updates
+      .map((update) => update.update as { toolCallId?: string; status?: string } | undefined)
+      .filter((update) => update?.toolCallId === "write-1")
+      .map((update) => update?.status);
+    assert.deepEqual(cardStatuses, []);
+  } finally {
+    dir.cleanup();
+  }
+});
+
 test("turn cap executes every last-turn tool call and saves real results", async () => {
   const conn = createConnectionStub();
   const dir = makeTempCwd({ "a.txt": "alpha", "b.txt": "beta" });
@@ -3396,7 +3469,7 @@ test("advertised tool definitions include edit_file alongside the core tools", a
   )
     .availableToolDefinitions()
     .map((tool) => tool.function.name);
-  for (const expected of ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command"]) {
+  for (const expected of ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "ask_user_question"]) {
     assert.ok(names.includes(expected), `expected advertised tool ${expected}`);
   }
 });

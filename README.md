@@ -37,7 +37,8 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.4` and `glm-5.3-flash` send supported pasted ACP image blocks directly as native `image_url` content parts, while `glm-5.3`, `glm-5-turbo` and `glm-4.7` route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
-- **Nine built-in tools** (see below)
+- **Ten built-in tools** (see below)
+- **Structured questions** – `ask_user_question` renders in the client's own UI as an ACP form elicitation (or permission buttons when the client has no form support); session modes never bypass a question
 - **Self-sufficient local tools** – directory listings and shell commands always run in the agent process; file tools fall back to local filesystem access when ACP client `fs` capabilities are unavailable
 - **Configurable permissions** – `write_file`, `run_command`, `web_reader`, and non-local `image_analysis` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
@@ -63,7 +64,8 @@ ACP Client (IDE plugin, CLI, …)
         │    ├─ list_files / run_command     → Agent process (Node fs / child_process)
         │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
         │    ├─ image_analysis               → Z.AI Coding Plan Vision MCP (stdio)
-        │    └─ todowrite                    → Agent process (per-session task list; replaces chat narration)
+        │    ├─ todowrite                    → Agent process (per-session task list; replaces chat narration)
+        │    └─ ask_user_question            → ACP client (elicitation/create form; permission buttons without form support)
         │
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
@@ -108,6 +110,7 @@ The agent does not run tools inside an OS or container sandbox. Shell commands a
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries. Deliberately silent egress: the query goes to Z.AI's service only; there is no attacker-chosen host. |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | Mode-dependent | Fetch and parse a web page (markdown or plain text). The approval prompt carries the full URL; rejection, cancellation, or permission transport errors make no network request. The approval covers the initial URL — redirects followed by the reader service are not re-prompted. Silent only in `bypass_permissions`. |
+| `ask_user_question` | ACP client (form elicitation, else permission buttons) | Never gated | Ask the user structured multiple-choice questions (1–4 questions of 2–4 options, per-question free-text "Other"). With `clientCapabilities.elicitation.form` the client renders an inline form; otherwise a single single-select question renders as permission buttons plus a "None of these" decline. A question is user input, not an operation, so no session mode bypasses it: declining completes with empty answers, dismissing the form aborts the tool call and no later call in the batch runs. |
 | `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Mode-dependent (non-local) | Analyze a local image path or remote URL using `@z_ai/mcp-server`. A non-local source requires approval first: the prompt carries the full `image_source`, and rejection, cancellation, or permission transport errors make no Vision MCP call. Non-local sources are silent only in `bypass_permissions`; clearly local paths stay silent in all modes and are workspace-confined — a local `image_source` whose path or symlink target resolves outside the workspace is rejected before any Vision MCP call. |
 
 Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/write_text_file` request has no version precondition, so edits made during that write RPC can still race with the replacement. The final read preserves unrelated changes already present and rejects a target snippet that has disappeared or become ambiguous.

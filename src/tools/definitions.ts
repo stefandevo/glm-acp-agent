@@ -234,4 +234,68 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "ask_user_question",
+      description:
+        "Ask the user a question to gather additional information or clarify context. Use this tool to gather user preferences or requirements, clarify ambiguous instructions, get decisions on implementation choices as you work, or offer choices to the user about what direction to take. Each option must be a distinct, mutually exclusive choice unless multiSelect is enabled. The interface adds an automatic \"Other\" free-text answer, so never include an \"Other\" option yourself. Use multiSelect to allow multiple answers to a single question. Clients without form-elicitation support can only show one single-select question; on those, anything richer fails with a hint to ask in plain text instead.",
+      parameters: {
+        type: "object",
+        properties: {
+          questions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 4,
+            description: "Questions to ask the user (1-4).",
+            items: {
+              type: "object",
+              properties: {
+                question: {
+                  type: "string",
+                  description:
+                    "The complete question to ask the user. Clear and specific, ending with a question mark. If multiSelect is enabled, phrase it accordingly, e.g. \"Which features do you want to enable?\".",
+                },
+                header: {
+                  type: "string",
+                  description:
+                    "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\".",
+                },
+                multiSelect: {
+                  type: "boolean",
+                  description:
+                    "Set true to allow the user to select multiple options instead of just one. Use when the choices are not mutually exclusive.",
+                },
+                options: {
+                  type: "array",
+                  minItems: 2,
+                  maxItems: 4,
+                  description:
+                    "The available choices for this question. Each option is a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option; that is provided automatically.",
+                  items: {
+                    type: "object",
+                    properties: {
+                      label: {
+                        type: "string",
+                        description:
+                          "The display text for this option. Concise (1-5 words) and clearly describing the choice.",
+                      },
+                      description: {
+                        type: "string",
+                        description:
+                          "Explanation of what this option means or what happens if chosen — context, trade-offs, implications.",
+                      },
+                    },
+                    required: ["label", "description"],
+                  },
+                },
+              },
+              required: ["question", "header", "options", "multiSelect"],
+            },
+          },
+        },
+        required: ["questions"],
+      },
+    },
+  },
 ];

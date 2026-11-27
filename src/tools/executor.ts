@@ -24,6 +24,14 @@ import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 import { boundToolResult, takeUtf8Prefix } from "./tool-output.js";
 import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./file-reader.js";
 import { validateToolArguments } from "./argument-validation.js";
+import {
+  ASK_DECLINE_OPTION_ID,
+  buildAskElicitation,
+  foldAskResponse,
+  parseAskQuestions,
+  type AskAnnotations,
+  type AskQuestion,
+} from "./ask-question.js";
 
 /**
  * A call that was announced, or was waiting on permission, but whose operation
@@ -313,6 +321,8 @@ export class ToolExecutor {
         return this.imageAnalysis(toolCallId, args);
       case "todowrite":
         return this.todoWrite(toolCallId, args);
+      case "ask_user_question":
+        return this.askUserQuestion(toolCallId, args);
       default: {
         if (this.sessionMcpTools?.hasTool(toolName)) {
           return this.sessionMcpTool(toolCallId, toolName, args);
@@ -512,6 +522,178 @@ export class ToolExecutor {
     });
 
     return { content: `Todo list updated:\n${rendered}` };
+  }
+
+  // ---------------------------------------------------------------------------
+  // ask_user_question: the user answers through the client's UI
+  // ---------------------------------------------------------------------------
+
+  private async askUserQuestion(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const questions = parseAskQuestions(args);
+    if (typeof questions === "string") {
+      return this.failAndReturn(toolCallId, "ask_user_question", args, `Error: ${questions}`);
+    }
+    const first = questions[0];
+    await this.announceToolCall({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: elideStringForPreview(
+          questions.length === 1 ? `Ask: ${first.header || first.question}` : `Ask (${questions.length} questions)`
+        ),
+        kind: "other",
+        status: "pending",
+        rawInput: elideForPreview(args),
+      },
+    });
+
+    if (this.clientCapabilities?.elicitation?.form) {
+      return this.askViaElicitation(toolCallId, args, questions);
+    }
+    return this.askViaPermissionButtons(toolCallId, args, questions);
+  }
+
+  /** The interactive form: what Claude Code's AskUserQuestion shows in Zed. */
+  private async askViaElicitation(
+    toolCallId: string,
+    args: Record<string, unknown>,
+    questions: AskQuestion[]
+  ): Promise<ToolResult> {
+    const request = buildAskElicitation(questions, this.sessionId, toolCallId);
+    let folded;
+    try {
+      const outcome = await this.awaitWithAbort(
+        this.connection.unstable_createElicitation(request)
+      );
+      if (outcome.kind === "aborted") {
+        return this.notStarted(toolCallId, "Cancelled by turn.");
+      }
+      folded = foldAskResponse(outcome.response, questions);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return this.announcedFailure(
+        toolCallId,
+        `Error: could not present the question to the user: ${message}`
+      );
+    }
+    if (folded.action === "cancelled") {
+      return this.notStarted(
+        toolCallId,
+        "The user dismissed the question without answering."
+      );
+    }
+    return this.completeAsk(toolCallId, folded.answers, folded.annotations);
+  }
+
+  /**
+   * Clients without form elicitation: the options render as permission
+   * buttons, one single-select question only. A question is user input, not
+   * an operation, so the session mode never bypasses it. A declined button
+   * or dismissed prompt completes the call with empty answers and a
+   * "dismissed" annotation, like the form's Decline.
+   */
+  private async askViaPermissionButtons(
+    toolCallId: string,
+    args: Record<string, unknown>,
+    questions: AskQuestion[]
+  ): Promise<ToolResult> {
+    const question = questions[0];
+    if (questions.length !== 1 || question.multiSelect) {
+      return this.announcedFailure(
+        toolCallId,
+        "Error: this client cannot show questions interactively; ask the user in plain text and end the turn."
+      );
+    }
+    try {
+      const outcome = await this.awaitWithAbort(
+        this.connection.requestPermission({
+          sessionId: this.sessionId,
+          toolCall: {
+            toolCallId,
+            // Full text, like every other permission request: the user is
+            // choosing from this question, so nothing may be elided on the
+            // approval channel — card elision stays on sessionUpdate.
+            title: question.question,
+            kind: "other",
+            status: "pending",
+            rawInput: args,
+          },
+          options: [
+            ...question.options.map((option) => ({
+              kind: "allow_once" as const,
+              name: option.label,
+              optionId: option.label,
+            })),
+            { kind: "reject_once" as const, name: "None of these", optionId: ASK_DECLINE_OPTION_ID },
+          ],
+        })
+      );
+      if (outcome.kind === "aborted") {
+        return this.notStarted(toolCallId, "Cancelled by turn.");
+      }
+      const decision = outcome.response.outcome;
+      if (decision.outcome === "selected" && decision.optionId !== ASK_DECLINE_OPTION_ID) {
+        return this.completeAsk(toolCallId, { [question.question]: String(decision.optionId) }, {});
+      }
+      // "None of these" or a dismissed prompt: the user declined to pick.
+      return this.completeAsk(toolCallId, {}, {
+        [question.question]: { unanswered: "dismissed" },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return this.announcedFailure(
+        toolCallId,
+        `Error: could not present the question to the user: ${message}`
+      );
+    }
+  }
+
+  private async completeAsk(
+    toolCallId: string,
+    answers: Record<string, string>,
+    annotations: AskAnnotations
+  ): Promise<ToolResult> {
+    const payload: Record<string, unknown> = { answers };
+    if (Object.keys(annotations).length > 0) {
+      payload["annotations"] = annotations;
+    }
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "completed",
+        rawOutput: elideForPreview(payload),
+      },
+    });
+    return { content: JSON.stringify(payload) };
+  }
+
+  /** Await a client request, resolving `aborted` when the turn's signal fires first. */
+  private async awaitWithAbort<T>(
+    promise: Promise<T>
+  ): Promise<{ kind: "response"; response: T } | { kind: "aborted" }> {
+    if (!this.signal) {
+      return { kind: "response", response: await promise };
+    }
+    let abortHandler: (() => void) | undefined;
+    const abortPromise = new Promise<"aborted">((resolve) => {
+      abortHandler = () => resolve("aborted");
+      this.signal!.addEventListener("abort", abortHandler, { once: true });
+      if (this.signal!.aborted) abortHandler();
+    });
+    try {
+      return await Promise.race([
+        promise.then((response) => ({ kind: "response" as const, response })),
+        abortPromise.then(() => ({ kind: "aborted" as const })),
+      ]);
+    } finally {
+      if (abortHandler) this.signal!.removeEventListener("abort", abortHandler);
+    }
   }
 
   private async writeFile(
@@ -1501,6 +1683,16 @@ export class ToolExecutor {
   }
 
   /** Mark an in-progress tool call as failed. */
+  /**
+   * A failure after the pending card was announced: close that card (a second
+   * `tool_call` for the same id would leave the client two cards to
+   * reconcile) and return the error text for the model.
+   */
+  private async announcedFailure(toolCallId: string, message: string): Promise<ToolResult> {
+    await this.markFailed(toolCallId, message);
+    return { content: message };
+  }
+
   private async markFailed(toolCallId: string, message: string): Promise<void> {
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
