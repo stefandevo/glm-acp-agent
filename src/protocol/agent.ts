@@ -281,6 +281,40 @@ interface PromptLoopMetrics {
 }
 
 /**
+ * Slash commands the agent answers itself, with no model call. In ACP every
+ * prompt is a turn, so each of these must deliver its reply through
+ * {@link goalPickupAfterReply}: a round the command interrupted then picks
+ * back up when a goal is active. The list exists so tests can exercise every
+ * local command the same way; add to it when adding a command.
+ */
+const LOCAL_COMMANDS = ["goal", "usage"] as const;
+export type LocalCommand = (typeof LOCAL_COMMANDS)[number];
+
+/** Extract the text after a leading `/usage` in a prompt block, or `undefined`. */
+function parseUsageInvocation(text: string): string | undefined {
+  const match = /^\/usage(?:\s+([\s\S]*))?$/.exec(text.trim());
+  return match ? (match[1] ?? "") : undefined;
+}
+
+/**
+ * After a local command's reply, the pickup that lets an interrupted goal
+ * round continue through the normal prompt flow: a user-role message that
+ * restates the condition, shown to the client as the pickup line. `null`
+ * when no goal is active and the reply was the whole prompt.
+ */
+function goalPickupAfterReply(
+  session: SessionState,
+  interruptedBy: string
+): { blocks: PromptRequest["prompt"]; display: string } | null {
+  const goal = session.goal;
+  if (!goal || goal.status !== "active") return null;
+  return {
+    blocks: [{ type: "text", text: renderGoalInterrupted(goal.condition, interruptedBy) }],
+    display: goalInterruptedDisplayText(interruptedBy),
+  };
+}
+
+/**
  * Optional dependencies for tests.
  */
 export interface GlmAcpAgentOptions {
@@ -1074,10 +1108,22 @@ export class GlmAcpAgent implements Agent {
         return cancelledResponse();
       }
 
+      // Local commands — answered by the agent with no model call — are
+      // `/usage` and `/goal`. Each replies directly and, when a goal is
+      // active, the round this prompt interrupted picks back up afterwards
+      // (`goalPickupAfterReply`), so a quota or status check never leaves
+      // the goal active but idle.
+      let goalBlocks = params.prompt;
+      /** Client-side text for the model-facing message, when it should differ from what was typed. */
+      let goalDisplay: string | undefined;
+      /** The condition titles a goal thread better than the typed command does. */
+      let goalTitle: string | undefined;
+
       // Reserve /usage before file-backed command expansion and image preprocessing.
       // This informational command never calls the model or changes model history.
       const firstText = params.prompt.find(block => block.type === "text" && block.text.trim());
-      if (firstText?.type === "text" && /^\/usage(?:\s|$)/.test(firstText.text.trim())) {
+      const usageArgs = firstText?.type === "text" ? parseUsageInvocation(firstText.text) : undefined;
+      if (usageArgs !== undefined) {
         const standalone = params.prompt.every(block => block.type === "text") &&
           params.prompt.map(block => block.type === "text" ? block.text : "").join("\n").trim() === "/usage";
         const text = standalone
@@ -1089,18 +1135,16 @@ export class GlmAcpAgent implements Agent {
           update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
         });
         if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
-        return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+        const pickup = goalPickupAfterReply(session, "/usage");
+        if (!pickup) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+        goalBlocks = pickup.blocks;
+        goalDisplay = pickup.display;
       }
 
       // `/goal` is reserved the same way. Its control words answer directly
       // with no model call; setting or resuming a goal mutates session state
       // and replaces the typed text with the directive the model acts on.
-      let goalBlocks = params.prompt;
-      /** Client-side text for the model-facing message, when it should differ from what was typed. */
-      let goalDisplay: string | undefined;
-      /** The condition titles a goal thread better than the typed command does. */
-      let goalTitle: string | undefined;
-      const goalArgs = firstText?.type === "text" ? parseGoalInvocation(firstText.text) : undefined;
+      const goalArgs = usageArgs === undefined && firstText?.type === "text" ? parseGoalInvocation(firstText.text) : undefined;
       if (goalArgs !== undefined) {
         const command = parseGoalCommand(goalArgs);
         const applied = this.applyGoalCommand(session, command);
@@ -1116,15 +1160,16 @@ export class GlmAcpAgent implements Agent {
             await this.persistSession(params.sessionId, session);
           }
           // A status check or a mistyped command interrupted a running round
-          // only because ACP makes every prompt a turn. Rather than leave the
-          // goal active but idle, pick the round back up: nothing is counted
-          // and the turn is judged when it ends. Mutating commands (pause,
-          // clear, resume) never get here with an active goal.
-          const active = session.goal?.status === "active" ? session.goal : undefined;
-          if (!active) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
-          const interruptedBy = command.kind === "status" ? "/goal status" : "an invalid /goal command";
-          goalBlocks = [{ type: "text", text: renderGoalInterrupted(active.condition, interruptedBy) }];
-          goalDisplay = goalInterruptedDisplayText(interruptedBy);
+          // only because ACP makes every prompt a turn; `/usage` above takes
+          // the same path. Mutating commands (pause, clear, resume) never get
+          // here with an active goal.
+          const pickup = goalPickupAfterReply(
+            session,
+            command.kind === "status" ? "/goal status" : "an invalid /goal command"
+          );
+          if (!pickup) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+          goalBlocks = pickup.blocks;
+          goalDisplay = pickup.display;
         } else {
           goalBlocks = this.armGoal(params.prompt, session, applied.arm);
           if (applied.arm.kind === "set") goalTitle = applied.arm.condition;
@@ -1180,6 +1225,15 @@ export class GlmAcpAgent implements Agent {
       if (goalDisplay !== undefined) session.displayText.set(userMessage, goalDisplay);
       else if (displayText !== stringifyUserMessage(userContent)) {
         session.displayText.set(userMessage, displayText);
+      }
+      // A local command's pickup is a new user-role message the client has not
+      // seen (it shows the command the user typed instead), so announce it.
+      if (goalDisplay !== undefined) {
+        await promptConnection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: goalDisplay } },
+        });
+        if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
       }
 
       // Tool-call count for the goal loop's no-progress check; it reads it
@@ -2447,6 +2501,11 @@ export class GlmAcpAgent implements Agent {
   /** Whether the session's tool list includes `ask_user_question` (a client-form question). */
   private hasAskTool(): boolean {
     return this.availableToolDefinitions().some((tool) => tool.function.name === "ask_user_question");
+  }
+
+  /** Slash commands the agent answers itself (no model call); each keeps a running goal going. */
+  listLocalCommands(): readonly LocalCommand[] {
+    return LOCAL_COMMANDS;
   }
 
   /**

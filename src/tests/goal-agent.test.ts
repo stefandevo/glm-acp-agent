@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { GlmAcpAgent, type GlmAcpAgentOptions } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
 import type { GlmMessage, StreamChatOptions } from "../llm/glm-client.js";
+import type { QuotaSnapshot } from "../llm/quota-client.js";
 
 const home = mkdtempSync(join(tmpdir(), "glm-goal-home-"));
 process.env.HOME = home;
@@ -884,4 +885,61 @@ test("a goal thread is titled by its condition, not the typed command", async ()
     assert.match(String(saved.messages[typedIndex]?.content), /^<goal>/);
     assert.equal(saved.displayText?.[String(typedIndex)], "/goal fix the failing tests");
   } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("every local command — /usage included — leaves a running goal active and picks the round back up", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  const quota: QuotaSnapshot = {
+    version: 1,
+    checkedAt: "2026-11-28T10:00:00.000Z",
+    stale: false,
+    windows: [{ id: "five-hour", label: "5-hour model quota", kind: "session", usedPercent: 25, remaining: 1500, unit: "credits" }],
+  };
+  // One sample per local command, including its misused form. The reply is
+  // whatever the command answers with — unrelated to the goal — and the
+  // round must continue regardless. A new local command must be added here.
+  const samples: Record<string, Array<{ prompt: string; reply: RegExp }>> = {
+    usage: [
+      { prompt: "/usage", reply: /5-hour model quota/ },
+      { prompt: "/usage please", reply: /Usage: \/usage \(send without arguments or attachments\)/ },
+    ],
+    goal: [
+      { prompt: "/goal status", reply: /\*\*Goal: active\*\*/ },
+      { prompt: "/goal --turns abc", reply: /--turns needs a positive number/ },
+    ],
+  };
+  try {
+    const names = setup({ main: [], judge: [] }).agent.listLocalCommands();
+    assert.deepEqual([...names].sort(), ["goal", "usage"]);
+    for (const name of names) {
+      const cases = samples[name];
+      assert.ok(cases, `add local-command samples for "${name}"`);
+      for (const sample of cases) {
+        let release!: () => void;
+        let started!: () => void;
+        const running = new Promise<void>(resolve => { started = resolve; });
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const h = setup({
+          main: [{ toolCall: true }, { text: "working" }, { text: "done" }],
+          judge: [MET("green")],
+          beforeMain: async index => { if (index === 1) { started(); await gate; } },
+        }, { quotaClient: { getUsage: async () => quota } });
+        const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+        const first = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+        await running;
+        const command = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: sample.prompt }] });
+        release();
+        assert.equal((await first).stopReason, "cancelled", `${sample.prompt}: the round was interrupted`);
+        assert.equal((await command).stopReason, "end_turn", sample.prompt);
+        const texts = h.texts();
+        const replyIndex = texts.findIndex(text => sample.reply.test(text));
+        assert.ok(replyIndex >= 0, `${sample.prompt}: replied`);
+        assert.match(texts[replyIndex + 1] ?? "", /^\[goal\] Continuing after .+ — picking up the interrupted round$/, `${sample.prompt}: pickup announced after the reply`);
+        assert.match(texts.at(-1) ?? "", /Goal achieved after 0 continuation rounds: green/, sample.prompt);
+        assert.equal(h.modelCalls.length, 3, `${sample.prompt}: the round resumed`);
+        assert.equal(h.judgeCalls.length, 1, `${sample.prompt}: judged once`);
+        assert.match(await h.status(sessionId), GOAL_ACHIEVED);
+      }
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
