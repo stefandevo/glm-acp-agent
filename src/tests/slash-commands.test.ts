@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -233,4 +233,48 @@ test("renderSlashCommand substitutes $ARGUMENTS instead of appending them", () =
   assert.match(rendered, /Fix the bug described as: flaky login test/);
   assert.doesNotMatch(rendered, /Arguments:/);
   assert.doesNotMatch(rendered, /\$ARGUMENTS/);
+});
+
+test("discoverSlashCommands follows symlinked skill directories and command files", () => {
+  const { cwd, cleanup } = makeTree({
+    "shared/brainstorm/SKILL.md":
+      "---\nname: brainstorm\ndescription: Brainstorm ideas\n---\nThink broadly.\n",
+    "shared/commit.md": "---\ndescription: Linked commit\n---\nCommit.\n",
+    ".claude/skills/local-only/SKILL.md":
+      "---\nname: local-only\ndescription: Local skill\n---\nBody.\n",
+    ".claude/commands/status.md": "---\ndescription: Show status\n---\nBody.\n",
+  });
+  try {
+    symlinkSync(
+      pathJoin(cwd, "shared/brainstorm"),
+      pathJoin(cwd, ".claude/skills/brainstorm"),
+      "dir",
+    );
+    symlinkSync(pathJoin(cwd, "shared/commit.md"), pathJoin(cwd, ".claude/commands/linked.md"));
+    const commands = discoverSlashCommands(cwd);
+    const byName = new Map(commands.map((command) => [command.name, command]));
+    assert.equal(byName.get("brainstorm")?.description, "Brainstorm ideas");
+    assert.equal(byName.get("brainstorm")?.body, "Think broadly.");
+    assert.equal(byName.get("linked")?.description, "Linked commit");
+    assert.equal(byName.get("local-only")?.description, "Local skill");
+    assert.equal(byName.get("status")?.description, "Show status");
+  } finally {
+    cleanup();
+  }
+});
+
+test("discoverSlashCommands ignores broken symlinks", () => {
+  const { cwd, cleanup } = makeTree({
+    ".claude/skills/real/SKILL.md":
+      "---\nname: real\ndescription: Real skill\n---\nBody.\n",
+    ".claude/commands/real.md": "---\ndescription: Real command\n---\nBody.\n",
+  });
+  try {
+    symlinkSync(pathJoin(cwd, "missing-target"), pathJoin(cwd, ".claude/skills/broken"), "dir");
+    symlinkSync(pathJoin(cwd, "missing.md"), pathJoin(cwd, ".claude/commands/broken.md"));
+    const commands = discoverSlashCommands(cwd);
+    assert.deepEqual(commands.map((command) => command.name), ["real"]);
+  } finally {
+    cleanup();
+  }
 });
