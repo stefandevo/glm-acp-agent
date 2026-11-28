@@ -177,7 +177,9 @@ function parseGoalOptions(text: string, escape: boolean):
     rest = (match[3] ?? "").trim();
   }
   while (!escaped) {
-    const match = /^(.*)\s--([A-Za-z][\w-]*)(?:[=\s]+([\s\S]*))?$/.exec(rest);
+    // `[\s\S]*` so a condition that spans several lines still has its
+    // trailing options read; a bare `.*` would leave them inside the text.
+    const match = /^([\s\S]*)\s--([A-Za-z][\w-]*)(?:[=\s]+([\s\S]*))?$/.exec(rest);
     if (!match) break;
     const rejection = applyOption(match[2]!, match[3]);
     if (rejection) return { error: rejection };

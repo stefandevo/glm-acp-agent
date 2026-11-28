@@ -2615,14 +2615,16 @@ export class GlmAcpAgent implements Agent {
         return { stopReason: result.stopReason, usage };
       }
 
+      // Budget first, and before counting: a continuation that would exceed it
+      // does not run, so the counter only ever counts rounds that started
+      // (maxRounds 20 runs 20 continuations, maxRounds 1 runs one).
+      if (goal.rounds >= goal.maxRounds) {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "budget", undefined, exited());
+      }
       goal.rounds += 1;
       goal.noProgressRounds = toolCallsThisRound === 0 ? goal.noProgressRounds + 1 : 0;
-      const pause: GoalPauseReason | undefined =
-        goal.rounds >= goal.maxRounds ? "budget"
-        : goal.noProgressRounds >= GOAL_NO_PROGRESS_ROUNDS ? "no_progress"
-        : undefined;
-      if (pause) {
-        return this.pauseGoal(sessionId, session, promptConnection, signal, pause, undefined, { stopReason: result.stopReason, usage });
+      if (goal.noProgressRounds >= GOAL_NO_PROGRESS_ROUNDS) {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "no_progress", undefined, exited());
       }
 
       // Another round. A plain user-role message keeps the system prompt

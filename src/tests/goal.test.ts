@@ -405,3 +405,49 @@ test("an interrupted-round pickup restates the condition; resumeGoalState resets
   assert.equal(paused.setAt, "2026-11-28T10:00:00.000Z");
   assert.deepEqual(paused.tokens, { inputTokens: 5, outputTokens: 1, totalTokens: 6 });
 });
+
+test("options are read across line breaks: a multi-line condition never swallows its options", () => {
+  // Trailing options after a condition that spans lines (the Greptile finding:
+  // a `.*` scan left "--turns 500" inside the goal text and used the default).
+  assert.deepEqual(parseGoalCommand("fix the build\nand update docs --turns 500"), { kind: "set", condition: "fix the build\nand update docs", turnLimit: 500 });
+  // Line endings are the user's; only the option is peeled off.
+  assert.deepEqual(parseGoalCommand("fix the build\r\nand docs --judge glm-5.3-flash"), { kind: "set", condition: "fix the build\r\nand docs", judgeModel: "glm-5.3-flash" });
+  assert.deepEqual(parseGoalCommand("a\nb\nc --turns=unlimited --judge glm-5.3"), { kind: "set", condition: "a\nb\nc", judgeModel: "glm-5.3", turnLimit: "unlimited" });
+  // Leading options, then a multi-line condition.
+  assert.deepEqual(parseGoalCommand("--turns 500\nfix the build\nand docs"), { kind: "set", condition: "fix the build\nand docs", turnLimit: 500 });
+  assert.deepEqual(parseGoalCommand("--judge glm-5.3-flash\nfix\n--turns 7"), { kind: "set", condition: "fix", judgeModel: "glm-5.3-flash", turnLimit: 7 });
+  // The escape still wins on a later line, and an unknown option on a later
+  // line is still an error rather than goal text.
+  assert.deepEqual(parseGoalCommand("-- fix\n--this --that"), { kind: "set", condition: "fix\n--this --that" });
+  assert.match(invalidMessage("fix the build\nand docs --rounds 5"), /Unknown \/goal option "--rounds"/);
+  // A trailing multi-word value on a later line is still a (bad) model name
+  // for the agent to reject, never goal text.
+  assert.deepEqual(parseGoalCommand("first line\n--judge Uncle Bob"), { kind: "set", condition: "first line", judgeModel: "Uncle Bob" });
+});
+
+test("invariant: no option survives into a condition unless `-- ` turned parsing off", () => {
+  // Every `--word` in the input is either consumed as an option, reported in
+  // an error, or explicitly escaped. This is the class of bug behind
+  // "--judge Uncle Bob" and the multi-line swallow: an option silently
+  // becoming goal text. Any new sample must keep that true.
+  const samples = [
+    "fix it", "fix it --turns 500", "--turns 500 fix it", "fix it --judge glm-5.3-flash", "fix\nit --turns 500",
+    "--judge glm-5.3-flash fix\nit --turns unlimited", "fix --turns=7 --judge=glm-5.3 it", "resume --turns 500", "status",
+    "fix it --watch", "--watch fix it", "fix\n--judge Uncle Bob", "pause now", "-- fix --this", "--turns 1 -- fix --that",
+    "a\r\nb --turns 2", "x --turns abc", "y --judge", "z --turns", "make the --verbose flag work", "make the --verbose flag\nwork",
+  ];
+  const optionInText = /(^|\s)--[A-Za-z]/;
+  for (const sample of samples) {
+    const parsed = parseGoalCommand(sample);
+    const escaped = /^--(?:\s|$)/.test(sample.trim()) || /(^|\s)--\s/.test(sample);
+    if (parsed.kind === "set") {
+      assert.equal(optionInText.test(parsed.condition), escaped, `${JSON.stringify(sample)}: condition ${JSON.stringify(parsed.condition)}`);
+    } else if (parsed.kind === "resume") {
+      assert.equal(optionInText.test(JSON.stringify(parsed)), false, sample);
+    } else if (parsed.kind === "invalid") {
+      assert.ok(parsed.message.length > 0 && parsed.message.includes("Usage:"), sample);
+    } else {
+      assert.ok(["status", "pause", "clear"].includes(parsed.kind), `${sample}: ${parsed.kind}`);
+    }
+  }
+});

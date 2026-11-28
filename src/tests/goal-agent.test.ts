@@ -209,9 +209,12 @@ test("the goal persists, survives session/load with its counters reset, and resu
     assert.equal(saved?.goal?.status, "paused");
     assert.equal(saved?.goal?.pauseReason, "budget");
     assert.equal(saved?.goal?.rounds, 2);
-    assert.deepEqual(saved?.goal?.tokens, summedUsage(2, 2));
-    // The directive and the one continuation before the budget paused are user turns on disk.
-    assert.equal(saved?.messages.filter(message => message.role === "user").length, 2);
+    // maxRounds 2 runs two continuations: three model calls and three evaluations.
+    assert.equal(first.modelCalls.length, 3);
+    assert.equal(first.judgeCalls.length, 3);
+    assert.deepEqual(saved?.goal?.tokens, summedUsage(3, 3));
+    // The directive and both continuations are user turns on disk.
+    assert.equal(saved?.messages.filter(message => message.role === "user").length, 3);
 
     // A fresh process restores the session from disk.
     const second = setup({ main: [{ toolCall: true }, { text: "fixed" }], judge: [MET("ruff exits 0")] }, {}, store);
@@ -220,7 +223,7 @@ test("the goal persists, survives session/load with its counters reset, and resu
     assert.match(restored, /\*\*Goal: paused \(budget\)\*\*/);
     assert.match(restored, /- Rounds: 0\/2/);
     assert.match(restored, /- Evaluator: glm-5\.4 \(session model\)/);
-    assert.match(restored, /- Tokens: 2\.4k/);
+    assert.match(restored, /- Tokens: 3\.7k/);
     assert.equal(second.modelCalls.length, 0);
 
     const resumed = await second.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
@@ -249,8 +252,8 @@ test("a fork carries the goal with its counters reset", async () => {
     // The parent keeps its own accounting, even after the fork spends more.
     const forkResult = await h.agent.prompt({ sessionId: fork.sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
     assert.equal(forkResult.stopReason, "end_turn");
-    assert.deepEqual(h.store!.load(fork.sessionId)?.goal?.tokens, summedUsage(4, 4));
-    assert.deepEqual(h.store!.load(sessionId)?.goal?.tokens, summedUsage(2, 2));
+    assert.deepEqual(h.store!.load(fork.sessionId)?.goal?.tokens, summedUsage(6, 6));
+    assert.deepEqual(h.store!.load(sessionId)?.goal?.tokens, summedUsage(3, 3));
     assert.match(await h.status(sessionId), /- Rounds: 2\/2/);
   } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -941,5 +944,50 @@ test("every local command — /usage included — leaves a running goal active a
         assert.match(await h.status(sessionId), GOAL_ACHIEVED);
       }
     }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("the round budget runs exactly that many continuations, then pauses on the budget", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    // Every round makes a tool call (so no-progress never fires) and is judged
+    // not met; only the budget stops it. A round is two model calls: the tool
+    // turn and the turn that reads its result.
+    for (const [maxRounds, expectedRounds] of [[1, 2], [3, 4], [20, 21]] as const) {
+      // The script alternates tool turn / text turn for every round.
+      const main = Array.from({ length: 2 * (maxRounds + 1) }, (_, index) =>
+        index % 2 === 0 ? { toolCall: true } : { text: "still working" });
+      const h = setup({ main, judge: [] }, { goalMaxRounds: maxRounds });
+      const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+      const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+      assert.equal(result.stopReason, "end_turn");
+      // The first turn plus exactly maxRounds continuations (Greptile: the old
+      // check counted the continuation it then refused to run, so 20 ran 19).
+      assert.equal(h.judgeCalls.length, expectedRounds, `maxRounds ${maxRounds}: evaluations`);
+      assert.equal(h.modelCalls.length, 2 * expectedRounds, `maxRounds ${maxRounds}: continuations run`);
+      assert.match(h.texts().at(-1) ?? "", new RegExp(`Goal paused — round budget reached \\(${maxRounds}/${maxRounds}\\)`));
+      const status = await h.status(sessionId);
+      assert.match(status, /\*\*Goal: paused \(budget\)\*\*/);
+      assert.match(status, new RegExp(`- Rounds: ${maxRounds}/${maxRounds}`));
+      // The last continuation was numbered maxRounds/maxRounds, never more.
+      assert.match(h.lastUserText(h.modelCalls[h.modelCalls.length - 1]!), new RegExp(`^<goal_continuation round="${maxRounds}/${maxRounds}">`));
+      // No-progress never fired before the budget: text-only rounds would
+      // otherwise stop at three. Budget is checked first, and the streak reset
+      // is irrelevant here; the budget is the only reason to pause.
+      assert.doesNotMatch(status, /no progress/);
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a multi-line condition with trailing options reaches the model intact and the options apply", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ text: "ok" }], judge: [MET("yes")] });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal fix the build\nand update the docs --turns 300" }] });
+    assert.match(h.lastUserText(h.modelCalls[0]!), /<condition>\nfix the build\nand update the docs\n<\/condition>/);
+    assert.doesNotMatch(h.lastUserText(h.modelCalls[0]!), /--turns/);
+    assert.match(await h.status(sessionId), /- Turn limit: 300 per round/);
+    assert.match(await h.status(sessionId), /\*\*Goal: achieved\*\*\n\nfix the build\nand update the docs/);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
