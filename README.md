@@ -237,8 +237,12 @@ The loop pauses itself — keeping the goal, so `/goal resume` continues it — 
 - the round budget is used up (`ACP_GLM_GOAL_MAX_ROUNDS`, default 20 continuation rounds per activation);
 - three rounds in a row end without a single tool call (the model is answering the evaluator instead of working);
 - a round uses up its turn limit, or ends on another stop reason such as `max_tokens`;
+- a round dies on a thrown error — a dropped provider connection, a failed request — so the next ordinary message does not quietly restart autonomous work;
 - the evaluator cannot be reached or does not answer in the verdict format (one retry, then pause);
+- you dismiss an `ask_user_question` form the agent opened mid-round (`paused (question dismissed)`: answer in a message, then `/goal resume`);
 - you cancel the turn. A newer prompt sent while a round is running does not pause the goal: it supersedes the round, its own turn is judged when it ends, and the loop continues from there.
+
+The directive tells the model not to ask you what to do next, but not to avoid questions: when a decision only you can make is blocking the work, it asks with `ask_user_question` (see [Available Tools](#available-tools)). A question you *decline* completes the round — the model may proceed on a stated assumption — but it does not count as progress, so a model that keeps asking instead of working stops after three rounds. Token spend counts every call, including failed evaluator attempts, and the usage reported for a goal prompt covers all of its rounds.
 
 A goal does not change the permission mode. In `default` mode every edit and command of every round still prompts, so run a goal under `accept_edits` or `bypass_permissions` if you want it unattended. Each round is a normal user-role message (the client shows it as `[goal 3/20] Continuing — not met yet: <reason>`), which keeps the system prompt untouched and lets the goal survive context compaction. Goals are persisted with the session and restored by `session/load`, `session/resume`, and `session/fork` with their round counter, no-progress streak, and timer reset; the condition, status, and token spend carry over.
 

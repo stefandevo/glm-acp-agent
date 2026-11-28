@@ -204,6 +204,28 @@ export function foldAskResponse(
   return { action: "answered", answers, annotations };
 }
 
+/**
+ * Whether a completed `ask_user_question` result records that the user
+ * declined to answer every question (the form's Decline, or "None of these"
+ * on the permission buttons) — as opposed to a form accepted with a blank.
+ * Callers that run autonomous loops use it to tell "no input" from progress.
+ */
+export function isDeclinedAskResult(content: string): boolean {
+  let payload: { answers?: unknown; annotations?: unknown };
+  try {
+    payload = JSON.parse(content) as typeof payload;
+  } catch {
+    return false;
+  }
+  if (!payload || typeof payload !== "object") return false;
+  const answers = payload.answers;
+  if (answers && typeof answers === "object" && Object.keys(answers).length > 0) return false;
+  const annotations = payload.annotations;
+  if (!annotations || typeof annotations !== "object") return false;
+  const marks = Object.values(annotations as Record<string, { unanswered?: unknown }>);
+  return marks.length > 0 && marks.every((mark) => mark?.unanswered === "dismissed");
+}
+
 /** A pick is any scalar the client submitted; arrays hold a multi-select's. */
 function picksOf(value: ElicitationContentValue | undefined | null): string[] {
   if (value === undefined || value === null) return [];

@@ -147,6 +147,23 @@ test("evaluateGoal retries once, then raises GoalJudgeUnavailableError", async (
   assert.equal(recovering.calls[0]?.options?.reasoningEffort, "minimal");
 });
 
+test("usage adds up across attempts, including failed ones", async () => {
+  // The first reply is unparseable but was billed; the retry succeeds.
+  let attempt = 0;
+  const recovering = fakeJudge(() => (++attempt === 1 ? "I think it is met!" : '{"verdict":"met","reason":"suite green"}'));
+  const result = await evaluateGoal(recovering, { condition: "c", rounds: 0, maxRounds: 20, messages: transcript, model: "glm-5.4" });
+  assert.deepEqual(result.usage, { inputTokens: 200, outputTokens: 40, totalTokens: 240 });
+
+  // Both attempts fail: the raised error still carries what was spent.
+  const failing = fakeJudge(() => "not a verdict");
+  await assert.rejects(
+    evaluateGoal(failing, { condition: "c", rounds: 0, maxRounds: 20, messages: transcript, model: "glm-5.4" }),
+    (err: unknown) => err instanceof GoalJudgeUnavailableError &&
+      err.message.includes("not a verdict") &&
+      JSON.stringify(err.usage) === JSON.stringify({ inputTokens: 200, outputTokens: 40, totalTokens: 240 })
+  );
+});
+
 test("an abort during the judge call surfaces as the abort, not as an outage", async () => {
   const controller = new AbortController();
   const judge: GoalJudgeClient = {

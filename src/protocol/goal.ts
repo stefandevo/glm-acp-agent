@@ -12,6 +12,7 @@
  *
  * Pure functions only. The agent owns I/O, persistence, and the loop itself.
  */
+import type { Usage } from "@agentclientprotocol/sdk";
 
 export type GoalStatus = "active" | "paused" | "achieved" | "blocked";
 export type GoalVerdict = "met" | "not_met" | "impossible";
@@ -31,6 +32,8 @@ export type GoalPauseReason =
   | "no_progress"
   /** A round used up its turn limit (`max_turn_requests`). */
   | "turn_limit"
+  /** The user dismissed an `ask_user_question` form mid-round. */
+  | "question_dismissed"
   /** A turn ended on another stop reason. */
   | "error"
   /** The evaluator model could not be reached or did not answer in the verdict format. */
@@ -268,7 +271,15 @@ export function createGoal(input: {
  */
 export function restoreGoal(goal: GoalState | undefined, now: string): GoalState | null {
   if (!goal) return null;
-  return { ...goal, rounds: 0, noProgressRounds: 0, setAt: now };
+  // `tokens` is mutated in place by addGoalTokens, so a shallow copy would
+  // make a live fork and its parent share one total.
+  return {
+    ...goal,
+    ...(goal.tokens ? { tokens: { ...goal.tokens } } : {}),
+    rounds: 0,
+    noProgressRounds: 0,
+    setAt: now,
+  };
 }
 
 /** Add a model call's usage to the goal's spend. */
@@ -327,6 +338,7 @@ const VALID_PAUSE_REASONS = new Set<string>([
   "budget",
   "no_progress",
   "turn_limit",
+  "question_dismissed",
   "error",
   "judge_unavailable",
   "blocked",
@@ -353,7 +365,7 @@ export function renderGoalDirective(condition: string): string {
     "<condition>",
     neutralize(condition, "condition", "goal"),
     "</condition>",
-    "Treat the condition itself as your directive and do not pause to ask the user what to do next. Before ending a turn, run the verification the condition names (tests, lint, a build, a file or command check) and show the output: an evaluator judges completion from this transcript, so surface concrete evidence rather than claims. The goal clears itself once the condition is met; do not tell the user to run /goal clear.",
+    "Treat the condition itself as your directive and do not pause to ask the user what to do next. If a decision only the user can make is blocking you, ask it with ask_user_question rather than guessing or stalling. Before ending a turn, run the verification the condition names (tests, lint, a build, a file or command check) and show the output: an evaluator judges completion from this transcript, so surface concrete evidence rather than claims. The goal clears itself once the condition is met; do not tell the user to run /goal clear.",
     "</goal>",
   ].join("\n");
 }
@@ -366,7 +378,7 @@ export function renderGoalContinuation(condition: string, round: number, maxRoun
     "<reason>",
     neutralize(cap(reason, GOAL_REASON_CAP_CHARS), "reason", "goal_continuation"),
     "</reason>",
-    "Continue working toward the condition and address the outstanding work above. Do not ask the user what to do next, and show verification evidence before stopping.",
+    "Continue working toward the condition and address the outstanding work above. Do not ask the user what to do next; if a decision only the user can make is blocking you, use ask_user_question, and if the user declined to answer, proceed with the safest reasonable choice and say what you assumed. Show verification evidence before stopping.",
     "<condition>",
     neutralize(condition, "condition", "goal_continuation"),
     "</condition>",
@@ -378,7 +390,7 @@ export function renderGoalContinuation(condition: string, round: number, maxRoun
 export function renderGoalResume(condition: string, round: number, maxRounds: number): string {
   return [
     `<goal_resumed round="${round}/${maxRounds}">`,
-    "The user resumed this goal. Continue working toward the condition from where the previous round left off. Do not ask the user what to do next, and show verification evidence before stopping.",
+    "The user resumed this goal. Continue working toward the condition from where the previous round left off. Do not ask the user what to do next; if a decision only the user can make is blocking you, use ask_user_question. Show verification evidence before stopping.",
     "<condition>",
     neutralize(condition, "condition", "goal_resumed"),
     "</condition>",
@@ -469,6 +481,9 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
     case "turn_limit":
       line = `the round hit its turn limit (${detail ?? "default"})`;
       break;
+    case "question_dismissed":
+      line = "you dismissed the agent's question";
+      break;
     case "error":
       line = `turn ended with ${detail ?? "an error"}`;
       break;
@@ -480,6 +495,8 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
   }
   const hint = cause === "turn_limit"
     ? "Send /goal resume to continue, /goal --turns <n|unlimited> to set a new goal with a higher limit, or /goal clear to drop the goal."
+    : cause === "question_dismissed"
+    ? "Answer in a message and send /goal resume to continue, or /goal clear to drop the goal."
     : "Send /goal resume to continue, or /goal clear to drop the goal.";
   return `Goal paused — ${line}.\n${hint}`;
 }
@@ -523,4 +540,19 @@ function neutralize(text: string, ...tags: string[]): string {
   let safe = text;
   for (const tag of tags) safe = safe.replaceAll(`</${tag}>`, `<\u200b/${tag}>`);
   return safe;
+}
+
+/** Sum two optional usage snapshots into a new one, keeping optional counters. */
+export function mergeUsage(total: Usage | undefined, usage: Usage | undefined): Usage | undefined {
+  if (!usage) return total;
+  if (!total) return { ...usage };
+  const summed: Usage = { ...total };
+  summed.inputTokens += usage.inputTokens;
+  summed.outputTokens += usage.outputTokens;
+  summed.totalTokens += usage.totalTokens;
+  for (const key of ["cachedReadTokens", "cachedWriteTokens", "thoughtTokens"] as const) {
+    const value = usage[key];
+    if (typeof value === "number") summed[key] = (summed[key] ?? 0) + value;
+  }
+  return summed;
 }

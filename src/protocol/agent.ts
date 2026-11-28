@@ -79,6 +79,7 @@ import {
   formatGoalStatus,
   goalAchievedNotice,
   goalBlockedNotice,
+  mergeUsage,
   goalClearedNotice,
   goalContinuationDisplayText,
   goalPausedNotice,
@@ -96,7 +97,8 @@ import {
   type GoalState,
   type GoalTurnLimit,
 } from "./goal.js";
-import { evaluateGoal } from "./goal-evaluator.js";
+import { GoalJudgeUnavailableError, evaluateGoal } from "./goal-evaluator.js";
+import { isDeclinedAskResult } from "../tools/ask-question.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { QuotaClient, formatQuotaUsage } from "../llm/quota-client.js";
@@ -263,6 +265,17 @@ interface PendingMcpSetup {
 
 /** ACP stop reasons that the prompt loop can produce internally. */
 type InternalStopReason = StopReason;
+
+/**
+ * What the prompt loop reports back to the goal loop: the tool calls the
+ * model issued, and whether the user dismissed an `ask_user_question` form
+ * mid-round, which #154's batch handling turns into a cancelled round without
+ * an abort.
+ */
+interface PromptLoopMetrics {
+  toolCalls: number;
+  questionDismissed: boolean;
+}
 
 /**
  * Optional dependencies for tests.
@@ -1139,7 +1152,7 @@ export class GlmAcpAgent implements Agent {
 
       // Tool-call count for the goal loop's no-progress check; it reads it
       // after each round and resets it before the next.
-      const toolCallCount = { toolCalls: 0 };
+      const toolCallCount: PromptLoopMetrics = { toolCalls: 0, questionDismissed: false };
       let loopResult = await this.runPromptLoop(
         params.sessionId,
         session,
@@ -1217,6 +1230,23 @@ export class GlmAcpAgent implements Agent {
       return response;
     } catch (err) {
       error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
+      // A goal round that died on a thrown error must not stay active, or the
+      // next ordinary message would restart autonomous work without
+      // /goal resume. A superseded round is the successor's to continue and a
+      // closing session is not ours to touch; both are covered by the owner
+      // check. The error itself is reported below as for any prompt.
+      const failedGoal = session.goal?.status === "active" && ownsPrompt() && session.promptPromise === promptPromise
+        ? session.goal
+        : undefined;
+      if (failedGoal) {
+        failedGoal.status = "paused";
+        failedGoal.pauseReason = abortController.signal.aborted ? "cancelled" : "error";
+        session.updatedAt = new Date().toISOString();
+        await this.persistSession(params.sessionId, session);
+      }
+      const goalPausedNote = failedGoal && !abortController.signal.aborted
+        ? "\n\nGoal paused — send /goal resume to continue, or /goal clear to drop the goal."
+        : "";
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
@@ -1266,7 +1296,7 @@ export class GlmAcpAgent implements Agent {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n\n${notice}\n` },
+            content: { type: "text", text: `\n\n${notice}\n${goalPausedNote}` },
           },
         });
         return cancelledResponse();
@@ -1279,7 +1309,7 @@ export class GlmAcpAgent implements Agent {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n\n[error] ${message}` },
+            content: { type: "text", text: `\n\n[error] ${message}${goalPausedNote}` },
           },
         });
       }
@@ -2386,7 +2416,7 @@ export class GlmAcpAgent implements Agent {
     sessionId: string,
     session: SessionState,
     initial: { stopReason: InternalStopReason; usage?: Usage },
-    toolCalls: { toolCalls: number },
+    toolCalls: PromptLoopMetrics,
     signal: AbortSignal,
     promptPromise: Promise<void>,
     promptConnection: AgentSideConnection,
@@ -2403,23 +2433,33 @@ export class GlmAcpAgent implements Agent {
 
     while (true) {
       const toolCallsThisRound = toolCalls.toolCalls;
+      const questionDismissed = toolCalls.questionDismissed;
       toolCalls.toolCalls = 0;
+      toolCalls.questionDismissed = false;
 
+      // Every exit carries the usage accumulated across rounds and evaluations,
+      // not just the last round's.
+      const exited = (): { stopReason: InternalStopReason; usage?: Usage } => ({ stopReason: result.stopReason, usage });
       // A turn that did not end on its own terms pauses the goal. A superseded
       // turn is not a pause: the newer prompt continues the same goal.
       if (result.stopReason !== "end_turn") {
-        if (superseded() || !ownsPrompt()) return result;
+        if (superseded() || !ownsPrompt()) return exited();
+        // The user dismissed the agent's question form: say so, rather than
+        // reporting a bare "cancelled".
+        if (questionDismissed) {
+          return this.pauseGoal(sessionId, session, promptConnection, signal, "question_dismissed", undefined, exited());
+        }
         if (result.stopReason === "max_turn_requests") {
-          return this.pauseGoal(sessionId, session, promptConnection, signal, "turn_limit", formatTurnLimit(maxTurns), result);
+          return this.pauseGoal(sessionId, session, promptConnection, signal, "turn_limit", formatTurnLimit(maxTurns), exited());
         }
         return this.pauseGoal(
           sessionId, session, promptConnection, signal,
           signal.aborted ? "cancelled" : "error",
           signal.aborted ? undefined : `stop reason ${result.stopReason}`,
-          result
+          exited()
         );
       }
-      if (!ownsPrompt()) return result;
+      if (!ownsPrompt()) return exited();
 
       let verdict;
       try {
@@ -2432,12 +2472,16 @@ export class GlmAcpAgent implements Agent {
           signal,
         });
       } catch (err) {
-        if (superseded() || !ownsPrompt()) return result;
+        if (superseded() || !ownsPrompt()) return exited();
+        // Failed attempts were billed too; count what they reported.
+        const spent = err instanceof GoalJudgeUnavailableError ? err.usage : undefined;
+        addGoalTokens(goal, spent);
+        usage = mergeUsage(usage, spent);
         return this.pauseGoal(
           sessionId, session, promptConnection, signal,
           signal.aborted ? "cancelled" : "judge_unavailable",
           signal.aborted ? undefined : err instanceof Error ? err.message : String(err),
-          result
+          exited()
         );
       }
       addGoalTokens(goal, verdict.usage);
@@ -2469,7 +2513,11 @@ export class GlmAcpAgent implements Agent {
 
       // Another round. A plain user-role message keeps the system prompt
       // untouched (prompt-cache friendly) and restates the condition, so
-      // compaction dropping the first directive is harmless.
+      // compaction dropping the first directive is harmless. The finished
+      // round is canonical history now: drop any rollback checkpoint taken
+      // before it, so a cancel in a later round cannot restore a transcript
+      // that lacks it.
+      session.messagesBeforeCompaction = undefined;
       const message: GlmMessage = {
         role: "user",
         content: renderGoalContinuation(goal.condition, goal.rounds, goal.maxRounds, verdict.reason),
@@ -2550,7 +2598,7 @@ export class GlmAcpAgent implements Agent {
     preservesDrainingHistory: () => boolean,
     processSupervisor: ProcessSupervisor,
     /** Receives the number of tool calls the model issued across this loop. */
-    metrics?: { toolCalls: number },
+    metrics?: PromptLoopMetrics,
     /** Turn bound for this loop; a goal round may raise or remove the agent default. */
     maxTurns: number = this.maxTurns
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
@@ -2793,6 +2841,9 @@ export class GlmAcpAgent implements Agent {
       // must not run either; the partial-batch trim below drops them from
       // history alongside the unstarted call.
       let stoppedByUnstartedCall = false;
+      // A question the user declined completed normally but moved nothing
+      // forward; it does not count as progress for the goal's no-progress check.
+      let declinedQuestions = 0;
       const startedCalls: typeof toolCalls = [];
       const toolResults: GlmMessage[] = [];
       let toolFailure: Error | undefined;
@@ -2841,14 +2892,19 @@ export class GlmAcpAgent implements Agent {
         if (result.outcome === "not_started") {
           cancellationObserved = true;
           stoppedByUnstartedCall = true;
+          // The form was dismissed (not a turn abort, which sets signal.aborted
+          // before returning here): the goal loop pauses on this explicitly.
+          if (metrics && tc.name === "ask_user_question" && !signal.aborted) metrics.questionDismissed = true;
           continue;
         }
         const content = result.outcome === "interrupted"
           ? interruptedToolHistory(result.content)
           : result.content;
         keepCall(tc, content);
+        if (metrics && tc.name === "ask_user_question" && isDeclinedAskResult(content)) declinedQuestions += 1;
         if (signal.aborted || !ownsPrompt() || result.outcome === "interrupted") cancellationObserved = true;
       }
+      if (metrics) metrics.toolCalls = Math.max(0, metrics.toolCalls - declinedQuestions);
 
       if (keepHistory()) {
         if (startedCalls.length === 0) {
@@ -3373,20 +3429,6 @@ async function safeSessionUpdate(
   }
 }
 
-/** Sum two optional usage snapshots into a new one, keeping optional counters. */
-function mergeUsage(total: Usage | undefined, usage: Usage | undefined): Usage | undefined {
-  if (!usage) return total;
-  if (!total) return { ...usage };
-  const summed: Usage = { ...total };
-  summed.inputTokens += usage.inputTokens;
-  summed.outputTokens += usage.outputTokens;
-  summed.totalTokens += usage.totalTokens;
-  for (const key of ["cachedReadTokens", "cachedWriteTokens", "thoughtTokens"] as const) {
-    const value = usage[key];
-    if (typeof value === "number") summed[key] = (summed[key] ?? 0) + value;
-  }
-  return summed;
-}
 /** Reject the owner immediately while retaining a handler for a late setup result. */
 function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
   if (signal.aborted) {

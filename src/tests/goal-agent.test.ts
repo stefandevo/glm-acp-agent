@@ -20,6 +20,8 @@ interface ScriptedTurn {
   text?: string;
   /** A read-only tool call keeps the no-progress streak at zero. */
   toolCall?: boolean;
+  /** Calls ask_user_question with one question instead of a text/tool turn. */
+  ask?: boolean;
 }
 
 interface Script {
@@ -29,6 +31,29 @@ interface Script {
   judge: Array<string | Error>;
   /** Awaited before a main-model turn streams, so a test can interleave a prompt. */
   beforeMain?: (index: number) => Promise<void>;
+  /** Thrown by the main model before a turn streams, like a dropped connection. */
+  mainError?: (index: number) => Error | undefined;
+}
+
+const ASK_ARGS = JSON.stringify({
+  questions: [{
+    question: "Which database should the migration target?",
+    header: "Target",
+    multiSelect: false,
+    options: [
+      { label: "Postgres", description: "The staging database." },
+      { label: "SQLite", description: "Local only." },
+    ],
+  }],
+});
+
+/** Client-side ACP surface the fakes need: a dismissed form and a dismissed permission prompt. */
+function clientStub(updates: Update[]) {
+  return {
+    async sessionUpdate(update: Update) { updates.push(update); },
+    async requestPermission() { return { outcome: { outcome: "cancelled" as const } }; },
+    async unstable_createElicitation() { return { action: "cancel" as const }; },
+  };
 }
 
 const NOT_MET = (reason: string) => `{"verdict":"not_met","reason":"${reason}"}`;
@@ -44,6 +69,7 @@ const summedUsage = (mainCalls: number, judgeCalls: number) => ({
 });
 
 function setup(script: Script, options: Partial<GlmAcpAgentOptions> = {}, store: SessionStore | null = null) {
+  // The store is handed back so tests can read what a fork or load persisted.
   const updates: Update[] = [];
   const modelCalls: GlmMessage[][] = [];
   const judgeCalls: GlmMessage[][] = [];
@@ -64,17 +90,22 @@ function setup(script: Script, options: Partial<GlmAcpAgentOptions> = {}, store:
       const index = mainIndex++;
       modelCalls.push(structuredClone(messages));
       await script.beforeMain?.(index);
+      const failure = script.mainError?.(index);
+      if (failure) throw failure;
       signal?.throwIfAborted();
       const turn = script.main[Math.min(index, script.main.length - 1)] ?? { text: "done" };
+      if (turn.ask) {
+        yield { toolCall: { id: `ask_${index}`, name: "ask_user_question", arguments: ASK_ARGS } };
+      }
       if (turn.toolCall) {
         yield { toolCall: { id: `call_${index}`, name: "list_files", arguments: JSON.stringify({ path: "." }) } };
       }
       if (turn.text) yield { text: turn.text };
       yield { usage: { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 } };
-      yield { done: true, stopReason: turn.toolCall ? "tool_calls" : "stop" };
+      yield { done: true, stopReason: turn.toolCall || turn.ask ? "tool_calls" : "stop" };
     },
   };
-  const agent = new GlmAcpAgent({ async sessionUpdate(update: Update) { updates.push(update); } } as never, {
+  const agent = new GlmAcpAgent(clientStub(updates) as never, {
     glm, visionClient: null, sessionStore: store, ...options,
   });
   const texts = (): string[] => updates.map(update => update.update.content?.text ?? "").filter(text => text.length > 0);
@@ -89,7 +120,7 @@ function setup(script: Script, options: Partial<GlmAcpAgentOptions> = {}, store:
     assert.equal(result.stopReason, "end_turn");
     return updates.slice(before).map(update => update.update.content?.text ?? "").join("\n");
   };
-  return { agent, updates, texts, modelCalls, judgeCalls, judgeOptions, lastUserText, status };
+  return { agent, updates, texts, modelCalls, judgeCalls, judgeOptions, lastUserText, status, store };
 }
 
 function tempDir(prefix: string): string {
@@ -210,7 +241,11 @@ test("a fork carries the goal with its counters reset", async () => {
     const forked = await h.status(fork.sessionId);
     assert.match(forked, /\*\*Goal: paused \(budget\)\*\*/);
     assert.match(forked, /- Rounds: 0\/2/);
-    // The parent keeps its own accounting.
+    // The parent keeps its own accounting, even after the fork spends more.
+    const forkResult = await h.agent.prompt({ sessionId: fork.sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.equal(forkResult.stopReason, "end_turn");
+    assert.deepEqual(h.store!.load(fork.sessionId)?.goal?.tokens, summedUsage(4, 4));
+    assert.deepEqual(h.store!.load(sessionId)?.goal?.tokens, summedUsage(2, 2));
     assert.match(await h.status(sessionId), /- Rounds: 2\/2/);
   } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -566,4 +601,118 @@ test("an invalid ACP_GLM_GOAL_JUDGE_MODEL is ignored and the session model judge
       assert.match(await h.status(sessionId), /- Evaluator: glm-5\.4 \(session model\)/);
     } finally { delete process.env["ACP_GLM_GOAL_JUDGE_MODEL"]; }
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a dismissed question form during a goal round pauses the goal by name", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    const h = setup({ main: [{ ask: true }, { text: "unused" }], judge: [MET("yes")] });
+    await h.agent.initialize({ protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal migrate the database" }] });
+    // #154 turns the dismissed form into a cancelled round without an abort;
+    // the goal loop names the cause instead of a bare "stop reason cancelled".
+    assert.equal(result.stopReason, "cancelled");
+    assert.equal(h.modelCalls.length, 1);
+    assert.equal(h.judgeCalls.length, 0);
+    assert.match(h.texts().at(-1) ?? "", /Goal paused — you dismissed the agent's question\.\nAnswer in a message and send \/goal resume to continue/);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(question dismissed\)\*\*/);
+    // Resuming asks the model to continue; the directive sanctions the tool.
+    await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal resume" }] });
+    assert.match(h.lastUserText(h.modelCalls[1]!), /use ask_user_question/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a declined question is not progress: repeated declines stop after three rounds", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    // No elicitation capability: the question renders as permission buttons and
+    // the client's dismissed prompt is a Decline, which completes the call.
+    // Each round: ask once, get the decline, end the turn.
+    const h = setup({
+      main: [{ ask: true }, { text: "still blocked" }, { ask: true }, { text: "still blocked" }, { ask: true }, { text: "still blocked" }],
+      judge: [NOT_MET("still blocked"), NOT_MET("still blocked"), NOT_MET("still blocked")],
+    });
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    const result = await h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal migrate the database" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(h.modelCalls.length, 6);
+    assert.equal(h.judgeCalls.length, 3);
+    assert.match(await h.status(sessionId), /\*\*Goal: paused \(no progress\)\*\*/);
+    assert.match(await h.status(sessionId), /- Rounds: 3\/20/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a round that dies on a thrown error pauses the goal; a plain message does not restart the loop", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  try {
+    // A dropped connection in the first continuation round: prompt() recovers
+    // it as a cancelled turn, and the goal must not be left active.
+    const dropped = setup({
+      main: [{ text: "one" }, { text: "two" }, { text: "three" }],
+      judge: [NOT_MET("keep going"), MET("green")],
+      mainError: index => (index === 1 ? Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) : undefined),
+    });
+    const { sessionId } = await dropped.agent.newSession({ cwd, mcpServers: [] });
+    const result = await dropped.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    assert.equal(result.stopReason, "cancelled");
+    assert.match(dropped.texts().join("\n"), /Connection lost/);
+    assert.match(dropped.texts().join("\n"), /Goal paused — send \/goal resume to continue/);
+    assert.match(await dropped.status(sessionId), /\*\*Goal: paused \(error\)\*\*/);
+    // The next ordinary message runs one turn and is not judged.
+    await dropped.agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+    assert.equal(dropped.modelCalls.length, 3);
+    assert.equal(dropped.judgeCalls.length, 1);
+    assert.match(await dropped.status(sessionId), /\*\*Goal: paused \(error\)\*\*/);
+
+    // A non-recoverable error rejects the prompt and still pauses the goal.
+    const boom = setup({
+      main: [{ text: "one" }, { text: "two" }],
+      judge: [NOT_MET("keep going")],
+      mainError: index => (index === 1 ? new Error("boom") : undefined),
+    });
+    const { sessionId: boomSession } = await boom.agent.newSession({ cwd, mcpServers: [] });
+    await assert.rejects(boom.agent.prompt({ sessionId: boomSession, prompt: [{ type: "text", text: "/goal x" }] }), /boom/);
+    assert.match(boom.texts().join("\n"), /\[error\] boom\n\nGoal paused — send \/goal resume to continue/);
+    assert.match(await boom.status(boomSession), /\*\*Goal: paused \(error\)\*\*/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a cancelled later round keeps the completed rounds before it, even after compaction", async () => {
+  const cwd = tempDir("glm-goal-cwd-");
+  const dir = tempDir("glm-goal-store-");
+  try {
+    const store = new SessionStore(dir);
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const h = setup({
+      main: [{ toolCall: true }, { text: "round one done" }, { text: "interrupted" }],
+      judge: [NOT_MET("keep going")],
+      beforeMain: async index => { if (index === 2) { started(); await new Promise(resolve => setTimeout(resolve, 100)); } },
+    }, {}, store);
+    const { sessionId } = await h.agent.newSession({ cwd, mcpServers: [] });
+    // A long history on a 128K model compacts at the start of the first round,
+    // which installs a rollback checkpoint for that prompt.
+    await h.agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+    const session = (h.agent as unknown as { sessions: Map<string, { messages: GlmMessage[] }> }).sessions.get(sessionId)!;
+    for (let i = 0; i < 40; i++) {
+      session.messages.push({ role: "user", content: "Very long message filler ".repeat(1000) });
+      session.messages.push({ role: "assistant", content: "Intermediate response filler ".repeat(1000) });
+    }
+    const pending = h.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal x" }] });
+    await running;
+    assert.equal(h.modelCalls.length, 3, "round one ran to completion before the gated second round");
+    assert.ok(h.modelCalls[0]!.length < session.messages.length + 40, "the first request was compacted");
+    await h.agent.cancel({ sessionId });
+    const result = await pending;
+    assert.equal(result.stopReason, "cancelled");
+    // Usage from the finished round and its evaluation survives on the response.
+    assert.deepEqual(result.usage, summedUsage(2, 1));
+    // Round one's output is still in the saved history: the checkpoint taken
+    // before it was dropped once the round completed.
+    const saved = store.load(sessionId);
+    assert.ok(saved?.messages.some(message => message.role === "assistant" && message.content === "round one done"), "round one's reply is kept");
+    assert.ok(saved?.messages.some(message => message.role === "tool"), "round one's tool result is kept");
+    assert.equal(saved?.goal?.pauseReason, "cancelled");
+  } finally { rmSync(cwd, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }); }
 });

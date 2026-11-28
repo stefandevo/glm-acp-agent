@@ -17,7 +17,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { GOAL_REASON_CAP_CHARS, type GoalVerdict } from "./goal.js";
+import { GOAL_REASON_CAP_CHARS, mergeUsage, type GoalVerdict } from "./goal.js";
 
 /** Anything with the GLM client's `streamChat` — the real client or a test fake. */
 export interface GoalJudgeClient {
@@ -36,8 +36,18 @@ export interface GoalVerdictResult {
   model?: string;
 }
 
-/** Raised when no attempt produced a parseable verdict. The agent pauses the goal. */
-export class GoalJudgeUnavailableError extends Error {}
+/**
+ * Raised when no attempt produced a parseable verdict. The agent pauses the
+ * goal. `usage` carries what the failed attempts reported, so their spend is
+ * still counted.
+ */
+export class GoalJudgeUnavailableError extends Error {
+  readonly usage: Usage | undefined;
+  constructor(message: string, usage?: Usage) {
+    super(message);
+    this.usage = usage;
+  }
+}
 
 /** How many messages of transcript the evaluator sees, oldest dropped first. */
 const WINDOW_MESSAGES = 8;
@@ -145,28 +155,35 @@ export async function evaluateGoal(
     reasoningEffort: judgeReasoningEffort(input.model),
   };
   let lastFailure: unknown;
+  // Every attempt is billed, so their usage adds up even when a reply is
+  // unparseable or the stream drops after reporting usage.
+  let spent: Usage | undefined;
   for (let attempt = 0; attempt < GOAL_JUDGE_ATTEMPTS; attempt++) {
     input.signal?.throwIfAborted();
     let text = "";
-    let usage: Usage | undefined;
     let servedModel: string | undefined;
+    // A stream can repeat its final usage snapshot; the last one is the call's.
+    let attemptUsage: Usage | undefined;
     try {
       for await (const chunk of client.streamChat(judgeMessages, input.signal, options)) {
         if (chunk.text) text += chunk.text;
-        if (chunk.usage) usage = chunk.usage;
+        if (chunk.usage) attemptUsage = chunk.usage;
         if (chunk.model) servedModel = chunk.model;
       }
     } catch (err) {
+      spent = mergeUsage(spent, attemptUsage);
       input.signal?.throwIfAborted();
       lastFailure = err;
       continue;
     }
+    spent = mergeUsage(spent, attemptUsage);
     const verdict = parseGoalVerdict(text);
-    if (verdict) return { ...verdict, ...(usage ? { usage } : {}), ...(servedModel ? { model: servedModel } : {}) };
+    if (verdict) return { ...verdict, ...(spent ? { usage: spent } : {}), ...(servedModel ? { model: servedModel } : {}) };
     lastFailure = new Error(`reply was not a verdict: ${JSON.stringify(text.slice(0, 200))}`);
   }
   throw new GoalJudgeUnavailableError(
-    lastFailure instanceof Error ? lastFailure.message : String(lastFailure)
+    lastFailure instanceof Error ? lastFailure.message : String(lastFailure),
+    spent
   );
 }
 

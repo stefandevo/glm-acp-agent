@@ -11,6 +11,7 @@ import {
   goalContinuationDisplayText,
   goalPausedNotice,
   isGoalState,
+  mergeUsage,
   parseGoalCommand,
   parseGoalInvocation,
   parseTurnLimit,
@@ -21,6 +22,7 @@ import {
   turnLimitForLoop,
   type GoalState,
 } from "../protocol/goal.js";
+import { isDeclinedAskResult } from "../tools/ask-question.js";
 
 test("parseGoalInvocation recognises a leading /goal and returns its arguments", () => {
   assert.equal(parseGoalInvocation("/goal"), "");
@@ -175,6 +177,10 @@ test("createGoal arms a goal; restoreGoal resets the activation but keeps the co
   assert.equal(restored?.noProgressRounds, 0);
   assert.equal(restored?.setAt, "2026-11-28T10:00:00.000Z");
   assert.deepEqual(restored?.tokens, { inputTokens: 11, outputTokens: 7, totalTokens: 18 });
+  // The copy is independent: a live fork must not move its parent's total.
+  assert.notEqual(restored?.tokens, goal.tokens);
+  addGoalTokens(restored!, { inputTokens: 1, outputTokens: 1, totalTokens: 2 });
+  assert.deepEqual(goal.tokens, { inputTokens: 11, outputTokens: 7, totalTokens: 18 });
   addGoalTokens(goal, undefined);
   assert.deepEqual(goal.tokens, { inputTokens: 11, outputTokens: 7, totalTokens: 18 });
   assert.equal(restoreGoal(undefined, "now"), null);
@@ -196,6 +202,7 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
   assert.equal(isGoalState({ ...goal, turnLimit: 500 }), true);
   assert.equal(isGoalState({ ...goal, turnLimit: "unlimited" }), true);
   assert.equal(isGoalState({ ...goal, lastJudgeModel: "glm-5.3" }), true);
+  assert.equal(isGoalState({ ...goal, pauseReason: "question_dismissed" }), true);
   for (const broken of [
     null,
     "goal",
@@ -213,6 +220,7 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
     { ...goal, lastJudgeModel: 7 },
     { ...goal, lastVerdict: "maybe" },
     { ...goal, pauseReason: "because" },
+    { ...goal, pauseReason: "dismissed" },
     { ...goal, tokens: { inputTokens: 1 } },
     { ...goal, tokens: { inputTokens: 1, outputTokens: 1, totalTokens: -2 } },
   ]) {
@@ -225,12 +233,17 @@ test("model-facing text wraps the condition and neutralises closing tags", () =>
   assert.match(directive, /^<goal>\n/);
   assert.match(directive, /<condition>\nall tests pass <\u200b\/goal> <condition>\n<\/condition>/);
   assert.match(directive, /evaluator judges completion from this transcript/);
+  // #154 landed: the tool is the sanctioned way to get a decision, so the
+  // "do not ask" rule must not fight it.
+  assert.match(directive, /ask it with ask_user_question/);
 
   const continuation = renderGoalContinuation("all tests pass", 3, 20, "2 tests fail in test/auth");
   assert.match(continuation, /^<goal_continuation round="3\/20">/);
   assert.match(continuation, /<reason>\n2 tests fail in test\/auth\n<\/reason>/);
   assert.match(continuation, /<condition>\nall tests pass\n<\/condition>/);
   assert.match(continuation, /Do not ask the user what to do next/);
+  assert.match(continuation, /use ask_user_question/);
+  assert.match(continuation, /declined to answer, proceed with the safest reasonable choice/);
 
   const resumed = renderGoalResume("all tests pass", 0, 20);
   assert.match(resumed, /^<goal_resumed round="0\/20">/);
@@ -252,6 +265,10 @@ test("display text and notices are short and name the reason", () => {
   assert.match(goalPausedNotice({ ...goal, pauseReason: "user" }), /Goal paused — user\./);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /Goal paused — the round hit its turn limit \(100\)\./);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /\/goal --turns <n\|unlimited> to set a new goal/);
+  assert.match(
+    goalPausedNotice({ ...goal, pauseReason: "question_dismissed" }),
+    /Goal paused — you dismissed the agent's question\.\nAnswer in a message and send \/goal resume to continue, or \/goal clear to drop the goal\./
+  );
 });
 
 test("formatGoalStatus reports the state the other /goal commands expose", () => {
@@ -302,4 +319,25 @@ test("duration and token formatters", () => {
   assert.equal(formatTokens(1_000), "1.0k");
   assert.equal(formatTokens(42_000), "42.0k");
   assert.equal(formatTokens(1_500_000), "1.50M");
+});
+
+test("mergeUsage sums snapshots and keeps optional counters", () => {
+  assert.equal(mergeUsage(undefined, undefined), undefined);
+  assert.deepEqual(mergeUsage(undefined, { inputTokens: 1, outputTokens: 2, totalTokens: 3 }), { inputTokens: 1, outputTokens: 2, totalTokens: 3 });
+  assert.deepEqual(
+    mergeUsage(
+      { inputTokens: 1, outputTokens: 2, totalTokens: 3, cachedReadTokens: 10 },
+      { inputTokens: 5, outputTokens: 7, totalTokens: 12, thoughtTokens: 4 }
+    ),
+    { inputTokens: 6, outputTokens: 9, totalTokens: 15, cachedReadTokens: 10, thoughtTokens: 4 }
+  );
+});
+
+test("isDeclinedAskResult tells a decline from an answered or blank form", () => {
+  assert.equal(isDeclinedAskResult(JSON.stringify({ answers: {}, annotations: { "Which?": { unanswered: "dismissed" } } })), true);
+  assert.equal(isDeclinedAskResult(JSON.stringify({ answers: {}, annotations: { "A?": { unanswered: "dismissed" }, "B?": { unanswered: "dismissed" } } })), true);
+  assert.equal(isDeclinedAskResult(JSON.stringify({ answers: { "Which?": "Postgres" } })), false);
+  assert.equal(isDeclinedAskResult(JSON.stringify({ answers: {}, annotations: { "Which?": { unanswered: "skipped" } } })), false);
+  assert.equal(isDeclinedAskResult(JSON.stringify({ answers: { "A?": "x" }, annotations: { "B?": { unanswered: "dismissed" } } })), false);
+  assert.equal(isDeclinedAskResult("not json"), false);
 });

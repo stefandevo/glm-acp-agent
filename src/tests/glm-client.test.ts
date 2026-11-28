@@ -413,7 +413,8 @@ test("streamChat sends reasoning_effort when level is set on glm-5.3", async () 
     return Promise.resolve(stream);
   });
 
-  // Spot-check across the ladder: endpoints, a middle level, and the one  // non-capitalized id ("xhigh") that would break on naive name mangling.
+  // Spot-check across the ladder: endpoints, a middle level, and the one
+  // non-capitalized id ("xhigh") that would break on naive name mangling.
   for (const effort of ["max", "medium", "minimal", "xhigh"] as const) {
     for await (const chunk of c.streamChat([], undefined, { model: "glm-5.3", reasoningEffort: effort })) {
       void chunk;
