@@ -31,7 +31,7 @@ function makeStreamingGlm(captured: {
     async *streamChat(
       messages: GlmMessage[],
       _signal?: AbortSignal,
-      options?: { tools?: Array<{ function: { name: string } }> }
+      options?: { tools?: Array<{ function: { name: string } }> | null }
     ): AsyncGenerator<GlmStreamChunk> {
       captured.messages = messages.map((message) => structuredClone(message));
       captured.tools = options?.tools?.map((tool) => tool.function.name) ?? [];

@@ -51,6 +51,15 @@ export const INTERRUPTED_TOOL_RESULT =
 export type ToolExecutionOutcome = "not_started" | "interrupted" | "completed";
 
 /**
+ * Whether a completed tool result records that the user rejected or dismissed
+ * the permission prompt ("`edit_file rejected by user.`"). Autonomous loops
+ * use it to keep a rejected call from counting as progress.
+ */
+export function isUserRejectedToolResult(content: string): boolean {
+  return / (?:rejected|cancelled) by user\.$/.test(content);
+}
+
+/**
  * Result returned after executing a tool call against the ACP client.
  *
  * `outcome` is optional on internal returns and means `completed` when absent.

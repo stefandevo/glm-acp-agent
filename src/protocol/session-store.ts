@@ -4,13 +4,14 @@ import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
+import { isGoalState, type GoalState } from "./goal.js";
 
 /**
  * Schema version embedded in every persisted session file. Bump whenever the
  * shape of `PersistedSession` changes incompatibly so future loaders can
  * migrate (or reject) old records instead of silently producing garbage.
  */
-export const SESSION_SCHEMA_VERSION = 4 as const;
+export const SESSION_SCHEMA_VERSION = 5 as const;
 
 /**
  * On-disk representation of a session. Only fields that need to survive a
@@ -48,6 +49,12 @@ export interface PersistedSession {
    * correct across the compaction that drops turns from `messages`.
    */
   displayText?: Record<string, string>;
+  /**
+   * The session's `/goal`, when one is set (schema v5). Absent for sessions
+   * that never set a goal or cleared it; restored with its counters reset so
+   * a resumed goal starts with a fresh round budget.
+   */
+  goal?: GoalState;
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
@@ -229,6 +236,8 @@ function parsePersistedSession(value: unknown, expectedSessionId: string): Persi
       if (!/^\d+$/.test(index) || typeof text !== "string") return undefined;
     }
   }
+
+  if (value.goal !== undefined && !isGoalState(value.goal)) return undefined;
 
   const parsed = value as unknown as PersistedSession;
   if (version === 1) {
@@ -443,7 +452,9 @@ export class SessionStore {
       return undefined;
     }
     // Handle schema migrations. Valid v1 records have no mode or thought
-    // level; v2 added mode, v3 added thoughtLevel, and v4 added displayText.
+    // level; v2 added mode, v3 added thoughtLevel, v4 added displayText, and
+    // v5 added goal. Each field is optional on load, so older records pass
+    // through unchanged and simply default where the agent reads them.
     return parsePersistedSession(parsed, sessionId);
   }
 

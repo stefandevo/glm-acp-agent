@@ -53,7 +53,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { ToolExecutor, INTERRUPTED_TOOL_RESULT, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
+import { ToolExecutor, INTERRUPTED_TOOL_RESULT, isUserRejectedToolResult, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { readLocalTextPrefix } from "../tools/file-reader.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
@@ -69,6 +69,39 @@ import {
   type SlashCommand,
 } from "./slash-commands.js";
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
+import {
+  DEFAULT_GOAL_MAX_ROUNDS,
+  GOAL_NO_PROGRESS_ROUNDS,
+  GOAL_USAGE,
+  addGoalTokens,
+  formatTurnLimit,
+  createGoal,
+  formatGoalStatus,
+  goalAchievedNotice,
+  goalBlockedNotice,
+  mergeUsage,
+  goalClearedNotice,
+  goalContinuationDisplayText,
+  goalInterruptedDisplayText,
+  goalPausedNotice,
+  goalPauseNotice,
+  parseGoalCommand,
+  parseGoalInvocation,
+  parseTurnLimit,
+  renderGoalDirective,
+  renderGoalContinuation,
+  renderGoalInterrupted,
+  renderGoalResume,
+  resumeGoalState,
+  restoreGoal,
+  turnLimitForLoop,
+  type GoalCommand,
+  type GoalPauseReason,
+  type GoalState,
+  type GoalTurnLimit,
+} from "./goal.js";
+import { GoalJudgeUnavailableError, evaluateGoal } from "./goal-evaluator.js";
+import { isDeclinedAskResult } from "../tools/ask-question.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { QuotaClient, formatQuotaUsage } from "../llm/quota-client.js";
@@ -193,6 +226,8 @@ interface SessionState {
   thoughtLevel: ThoughtLevel;
   /** Slash commands discovered under this session's cwd, advertised to the client. */
   commands: SlashCommand[];
+  /** The session's `/goal`, or `null` when none is set. */
+  goal: GoalState | null;
   /**
    * Replay text for user messages whose stored content is not what the user
    * typed — a slash command expanded into its body, an image swapped for its
@@ -235,6 +270,51 @@ interface PendingMcpSetup {
 type InternalStopReason = StopReason;
 
 /**
+ * What the prompt loop reports back to the goal loop: the tool calls the
+ * model issued, and whether the user dismissed an `ask_user_question` form
+ * mid-round, which #154's batch handling turns into a cancelled round without
+ * an abort.
+ */
+interface PromptLoopMetrics {
+  toolCalls: number;
+  questionDismissed: boolean;
+}
+
+/**
+ * Slash commands the agent answers itself, with no model call. In ACP every
+ * prompt is a turn, so each of these must deliver its reply through
+ * {@link goalPickupAfterReply}: a round the command interrupted then picks
+ * back up when a goal is active. The list exists so tests can exercise every
+ * local command the same way; add to it when adding a command.
+ */
+const LOCAL_COMMANDS = ["goal", "usage"] as const;
+export type LocalCommand = (typeof LOCAL_COMMANDS)[number];
+
+/** Extract the text after a leading `/usage` in a prompt block, or `undefined`. */
+function parseUsageInvocation(text: string): string | undefined {
+  const match = /^\/usage(?:\s+([\s\S]*))?$/.exec(text.trim());
+  return match ? (match[1] ?? "") : undefined;
+}
+
+/**
+ * After a local command's reply, the pickup that lets an interrupted goal
+ * round continue through the normal prompt flow: a user-role message that
+ * restates the condition, shown to the client as the pickup line. `null`
+ * when no goal is active and the reply was the whole prompt.
+ */
+function goalPickupAfterReply(
+  session: SessionState,
+  interruptedBy: string
+): { blocks: PromptRequest["prompt"]; display: string } | null {
+  const goal = session.goal;
+  if (!goal || goal.status !== "active") return null;
+  return {
+    blocks: [{ type: "text", text: renderGoalInterrupted(goal.condition, interruptedBy) }],
+    display: goalInterruptedDisplayText(interruptedBy),
+  };
+}
+
+/**
  * Optional dependencies for tests.
  */
 export interface GlmAcpAgentOptions {
@@ -254,6 +334,17 @@ export interface GlmAcpAgentOptions {
    * overridable via `$ACP_GLM_MAX_TURNS`.
    */
   maxTurns?: number;
+  /**
+   * Maximum continuation rounds a `/goal` may run before it pauses itself.
+   * Default 20, overridable via `$ACP_GLM_GOAL_MAX_ROUNDS`.
+   */
+  goalMaxRounds?: number;
+  /**
+   * Model/tool turns each `/goal` round may take before it pauses on
+   * `max_turn_requests`. Defaults to the agent's `maxTurns`; overridable via
+   * `$ACP_GLM_GOAL_MAX_TURNS`, and per goal with `--turns`.
+   */
+  goalMaxTurns?: GoalTurnLimit;
   /**
    * Override the session store (used in tests). When undefined the agent
    * uses an on-disk store rooted at `$ACP_GLM_SESSION_DIR` /
@@ -318,6 +409,78 @@ function envMaxTurns(): number | undefined {
 }
 
 /**
+ * Resolve the `/goal` round budget from `$ACP_GLM_GOAL_MAX_ROUNDS`. Returns
+ * `undefined` when unset or invalid, so the constructor can apply the default
+ * and warn on invalid input.
+ */
+function envGoalMaxRounds(): number | undefined {
+  const raw = process.env["ACP_GLM_GOAL_MAX_ROUNDS"];
+  if (raw === undefined || raw === "") return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || Math.floor(parsed) < 1) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring invalid ACP_GLM_GOAL_MAX_ROUNDS="${raw}"\n`
+    );
+    return undefined;
+  }
+  return Math.floor(parsed);
+}
+
+/**
+ * Resolve the per-round turn limit for `/goal` from
+ * `$ACP_GLM_GOAL_MAX_TURNS`: a positive integer or `unlimited`. Returns
+ * `undefined` when unset or invalid, so the constructor can fall back to the
+ * agent's own `maxTurns` and warn on invalid input.
+ */
+function envGoalMaxTurns(): GoalTurnLimit | undefined {
+  const raw = process.env["ACP_GLM_GOAL_MAX_TURNS"]?.trim();
+  if (!raw) return undefined;
+  const parsed = parseTurnLimit(raw);
+  if (parsed === undefined) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring invalid ACP_GLM_GOAL_MAX_TURNS="${raw}" (expected a positive number or "unlimited")\n`
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
+/**
+ * Resolve an evaluator model id against the advertised catalog
+ * (case-insensitive), so `--judge GLM-5.3-Flash` lands on `glm-5.3-flash`.
+ * Returns `undefined` for anything else; the agent never sends an
+ * unrecognised id to the provider for a goal evaluation.
+ */
+function resolveJudgeModel(raw: string): string | undefined {
+  const wanted = raw.trim().toLowerCase();
+  return getAvailableModels().find((model) => model.modelId.toLowerCase() === wanted)?.modelId;
+}
+
+function advertisedJudgeModels(): string {
+  return getAvailableModels().map((model) => model.modelId).join(", ");
+}
+
+/**
+ * Agent-wide default evaluator model for `/goal`, from
+ * `$ACP_GLM_GOAL_JUDGE_MODEL`. `undefined` means the session's own model
+ * judges; a goal's `--judge` flag takes precedence over this. An id that is
+ * not an advertised model is ignored with a stderr warning, like the other
+ * environment settings.
+ */
+function envGoalJudgeModel(): string | undefined {
+  const raw = process.env["ACP_GLM_GOAL_JUDGE_MODEL"]?.trim();
+  if (!raw) return undefined;
+  const resolved = resolveJudgeModel(raw);
+  if (!resolved) {
+    process.stderr.write(
+      `glm-acp-agent: ignoring ACP_GLM_GOAL_JUDGE_MODEL="${raw}": not an advertised model (${advertisedJudgeModels()}).\n`
+    );
+    return undefined;
+  }
+  return resolved;
+}
+
+/**
  * ACP StopReason has no value for a dropped provider connection. These
  * sentences are the user-facing reason. The no-reply sentence is also stored
  * as assistant text when the turn produced nothing, so a later load or fork
@@ -336,6 +499,10 @@ export class GlmAcpAgent implements Agent {
   private sessionTodos: Map<string, TodoItem[]> = new Map();
   private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
   private maxTurns: number;
+  /** Continuation rounds a `/goal` may run before it pauses itself. */
+  private goalMaxRounds: number;
+  /** Model/tool turns each `/goal` round may take; "unlimited" for no cap. */
+  private goalMaxTurns: GoalTurnLimit;
   /** Forward GLM reasoning to the client as agent_thought_chunk. Default on; disable with ACP_GLM_STREAM_THINKING=false. */
   private streamThinking: boolean;
   private clientCapabilities: ClientCapabilities | null = null;
@@ -365,6 +532,13 @@ export class GlmAcpAgent implements Agent {
     const floored = Math.floor(candidateMaxTurns);
     this.maxTurns =
       Number.isFinite(floored) && floored >= 1 ? floored : DEFAULT_MAX_TURNS;
+    const candidateGoalRounds = options.goalMaxRounds ?? envGoalMaxRounds() ?? DEFAULT_GOAL_MAX_ROUNDS;
+    const flooredGoalRounds = Math.floor(candidateGoalRounds);
+    this.goalMaxRounds =
+      Number.isFinite(flooredGoalRounds) && flooredGoalRounds >= 1
+        ? flooredGoalRounds
+        : DEFAULT_GOAL_MAX_ROUNDS;
+    this.goalMaxTurns = options.goalMaxTurns ?? envGoalMaxTurns() ?? this.maxTurns;
     this.sessionStore =
       options.sessionStore === null
         ? null
@@ -544,6 +718,7 @@ export class GlmAcpAgent implements Agent {
       mode: "default",
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
+      goal: null,
       displayText: new WeakMap(),
       lifecycle,
       });
@@ -933,10 +1108,22 @@ export class GlmAcpAgent implements Agent {
         return cancelledResponse();
       }
 
+      // Local commands — answered by the agent with no model call — are
+      // `/usage` and `/goal`. Each replies directly and, when a goal is
+      // active, the round this prompt interrupted picks back up afterwards
+      // (`goalPickupAfterReply`), so a quota or status check never leaves
+      // the goal active but idle.
+      let goalBlocks = params.prompt;
+      /** Client-side text for the model-facing message, when it should differ from what was typed. */
+      let goalDisplay: string | undefined;
+      /** The condition titles a goal thread better than the typed command does. */
+      let goalTitle: string | undefined;
+
       // Reserve /usage before file-backed command expansion and image preprocessing.
       // This informational command never calls the model or changes model history.
       const firstText = params.prompt.find(block => block.type === "text" && block.text.trim());
-      if (firstText?.type === "text" && /^\/usage(?:\s|$)/.test(firstText.text.trim())) {
+      const usageArgs = firstText?.type === "text" ? parseUsageInvocation(firstText.text) : undefined;
+      if (usageArgs !== undefined) {
         const standalone = params.prompt.every(block => block.type === "text") &&
           params.prompt.map(block => block.type === "text" ? block.text : "").join("\n").trim() === "/usage";
         const text = standalone
@@ -948,7 +1135,57 @@ export class GlmAcpAgent implements Agent {
           update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
         });
         if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
-        return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+        const pickup = goalPickupAfterReply(session, "/usage");
+        if (!pickup) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+        goalBlocks = pickup.blocks;
+        goalDisplay = pickup.display;
+      }
+
+      // `/goal` is reserved the same way. Its control words answer directly
+      // with no model call; setting or resuming a goal mutates session state
+      // and replaces the typed text with the directive the model acts on.
+      const goalArgs = usageArgs === undefined && firstText?.type === "text" ? parseGoalInvocation(firstText.text) : undefined;
+      if (goalArgs !== undefined) {
+        const command = parseGoalCommand(goalArgs);
+        const applied = this.applyGoalCommand(session, command);
+        if ("reply" in applied) {
+          if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
+          await promptConnection.sessionUpdate({
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: applied.reply } },
+          });
+          if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
+          if (applied.mutated) {
+            session.updatedAt = new Date().toISOString();
+            await this.persistSession(params.sessionId, session);
+          }
+          // A status check or a mistyped command interrupted a running round
+          // only because ACP makes every prompt a turn; `/usage` above takes
+          // the same path. Mutating commands (pause, clear, resume) never get
+          // here with an active goal.
+          const pickup = goalPickupAfterReply(
+            session,
+            command.kind === "status" ? "/goal status" : "an invalid /goal command"
+          );
+          if (!pickup) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+          goalBlocks = pickup.blocks;
+          goalDisplay = pickup.display;
+        } else {
+          goalBlocks = this.armGoal(params.prompt, session, applied.arm);
+          if (applied.arm.kind === "set") goalTitle = applied.arm.condition;
+        }
+      } else {
+        const paused = session.goal;
+        if (paused?.status === "paused" && paused.pauseReason === "awaiting_input") {
+          // The user is answering the agent's question. Resume and tell the
+          // model so, next to the answer itself; the client shows the typed
+          // reply. Every other pause still needs an explicit /goal resume.
+          resumeGoalState(paused, new Date().toISOString());
+          goalBlocks = [
+            ...params.prompt,
+            { type: "text", text: renderGoalResume(paused.condition, 0, paused.maxRounds, this.hasAskTool()) },
+          ];
+        }
       }
 
       // Convert ACP content blocks into a GLM user message. Most models receive
@@ -963,7 +1200,7 @@ export class GlmAcpAgent implements Agent {
       // Clients invoke an advertised command by sending `/name …` as ordinary
       // prompt text, so expand it here into the instructions its definition
       // holds. Unknown `/foo` is left alone and reaches the model as prose.
-      const promptBlocks = expandPromptCommand(params.prompt, session.commands);
+      const promptBlocks = expandPromptCommand(goalBlocks, session.commands);
       const visionNative = isVisionNativeModel(session.model);
       preprocessed = visionNative
         ? { blocks: promptBlocks, cleanups: [] }
@@ -985,18 +1222,51 @@ export class GlmAcpAgent implements Agent {
       // command expansion and image analysis rewrote them for the model. Kept
       // separately so `session/load` replays the conversation the user had.
       const displayText = renderPromptBlocks(params.prompt).plainText;
-      if (displayText !== stringifyUserMessage(userContent)) {
+      if (goalDisplay !== undefined) session.displayText.set(userMessage, goalDisplay);
+      else if (displayText !== stringifyUserMessage(userContent)) {
         session.displayText.set(userMessage, displayText);
       }
+      // A local command's pickup is a new user-role message the client has not
+      // seen (it shows the command the user typed instead), so announce it.
+      if (goalDisplay !== undefined) {
+        await promptConnection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: goalDisplay } },
+        });
+        if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
+      }
 
-      const { stopReason, usage } = await this.runPromptLoop(
+      // Tool-call count for the goal loop's no-progress check; it reads it
+      // after each round and resets it before the next.
+      const toolCallCount: PromptLoopMetrics = { toolCalls: 0, questionDismissed: false };
+      let loopResult = await this.runPromptLoop(
         params.sessionId,
-      session,
-      abortController.signal,
-      ownsPrompt,
-      preservesDrainingHistory,
-      this.processSupervisor
+        session,
+        abortController.signal,
+        ownsPrompt,
+        preservesDrainingHistory,
+        this.processSupervisor,
+        toolCallCount,
+        session.goal?.status === "active"
+          ? turnLimitForLoop(session.goal.turnLimit, this.goalMaxTurns)
+          : undefined
       );
+      // While a goal is active the turn is judged when the model stops, and
+      // a "not met" verdict starts another round inside this same prompt.
+      if (session.goal?.status === "active") {
+        loopResult = await this.runGoalLoop(
+          params.sessionId,
+          session,
+          loopResult,
+          toolCallCount,
+          abortController.signal,
+          promptPromise,
+          promptConnection,
+          ownsPrompt,
+          preservesDrainingHistory
+        );
+      }
+      const { stopReason, usage } = loopResult;
 
       // A queued prompt aborts this turn. The loop then reports cancellation
       // instead of the connection error, and the following save would replace
@@ -1018,7 +1288,7 @@ export class GlmAcpAgent implements Agent {
       const titleUpdate: { title?: string | null } =
         session.title === null
           ? (() => {
-              const derived = displayText
+              const derived = (goalTitle ?? displayText)
                 .slice(0, 80)
                 .replace(/\s+/g, " ")
                 .trim();
@@ -1046,6 +1316,23 @@ export class GlmAcpAgent implements Agent {
       return response;
     } catch (err) {
       error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
+      // A goal round that died on a thrown error must not stay active, or the
+      // next ordinary message would restart autonomous work without
+      // /goal resume. A superseded round is the successor's to continue and a
+      // closing session is not ours to touch; both are covered by the owner
+      // check. The error itself is reported below as for any prompt.
+      const failedGoal = session.goal?.status === "active" && ownsPrompt() && session.promptPromise === promptPromise
+        ? session.goal
+        : undefined;
+      if (failedGoal) {
+        failedGoal.status = "paused";
+        failedGoal.pauseReason = abortController.signal.aborted ? "cancelled" : "error";
+        session.updatedAt = new Date().toISOString();
+        await this.persistSession(params.sessionId, session);
+      }
+      const goalPausedNote = failedGoal && !abortController.signal.aborted
+        ? "\n\nGoal paused — send /goal resume to continue, or /goal clear to drop the goal."
+        : "";
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
@@ -1095,7 +1382,7 @@ export class GlmAcpAgent implements Agent {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n\n${notice}\n` },
+            content: { type: "text", text: `\n\n${notice}\n${goalPausedNote}` },
           },
         });
         return cancelledResponse();
@@ -1108,7 +1395,7 @@ export class GlmAcpAgent implements Agent {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n\n[error] ${message}` },
+            content: { type: "text", text: `\n\n[error] ${message}${goalPausedNote}` },
           },
         });
       }
@@ -1529,6 +1816,7 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
+      goal: restoreGoal(persisted.goal, new Date().toISOString()),
       // Re-key onto the cloned messages: the parent's map is keyed by the
       // originals, which the fork no longer holds.
       displayText: deserializeRestoredDisplayText(
@@ -1677,6 +1965,7 @@ export class GlmAcpAgent implements Agent {
           mode: restoreSource.mode,
           thoughtLevel: resolveThoughtLevel(restoreSource.model, restoreSource.thoughtLevel ?? "max"),
           commands: discoverSlashCommands(params.cwd),
+          goal: restoreGoal(restoreSource.goal, new Date().toISOString()),
           displayText: deserializeRestoredDisplayText(
             restoreSource.messages,
             restoredMessages,
@@ -2001,6 +2290,7 @@ export class GlmAcpAgent implements Agent {
       // Absent for the common case where nothing diverges, so an ordinary
       // session gains no on-disk weight.
       ...(displayText ? { displayText } : {}),
+      ...(session.goal ? { goal: session.goal } : {}),
     };
   }
 
@@ -2092,6 +2382,322 @@ export class GlmAcpAgent implements Agent {
   }
 
   // ---------------------------------------------------------------------------
+  // Goal (/goal)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Apply a `/goal` command's control side and report what to do: a `reply`
+   * is shown to the user with no model call (`mutated` says whether session
+   * state changed and must be persisted), while an `arm` sets or resumes the
+   * goal and has to reach the model. Nothing here calls the model or touches
+   * model history.
+   */
+  private applyGoalCommand(
+    session: SessionState,
+    command: GoalCommand
+  ): { reply: string; mutated: boolean } | { arm: Extract<GoalCommand, { kind: "set" | "resume" }> } {
+    const goal = session.goal;
+    switch (command.kind) {
+      case "status":
+        return { reply: formatGoalStatus(goal, session.model, Date.now(), this.goalMaxTurns), mutated: false };
+      case "pause":
+        if (!goal) return { reply: `No goal set.\n\n${GOAL_USAGE}`, mutated: false };
+        if (goal.status === "paused") {
+          return {
+            reply: `Goal already paused: ${goal.condition}\nSend /goal resume to continue, or /goal clear to drop the goal.`,
+            mutated: false,
+          };
+        }
+        if (goal.status !== "active") {
+          return { reply: `Goal is ${goal.status}; /goal pause applies to an active goal.`, mutated: false };
+        }
+        goal.status = "paused";
+        goal.pauseReason = "user";
+        return { reply: goalPauseNotice(goal), mutated: true };
+      case "clear":
+        if (!goal) return { reply: "No goal set.", mutated: false };
+        session.goal = null;
+        return { reply: goalClearedNotice(goal.condition), mutated: true };
+      case "resume":
+        if (!goal) return { reply: "No goal set. Start one with /goal <condition>.", mutated: false };
+        if (goal.status === "achieved") {
+          return {
+            reply: `Goal already achieved: ${goal.condition}\nSend /goal <condition> to set a new goal.`,
+            mutated: false,
+          };
+        }
+        // Options on resume update the existing goal; an unknown model is an
+        // error that leaves the goal untouched, exactly as for a new goal.
+        if (command.judgeModel !== undefined) {
+          const resolved = resolveJudgeModel(command.judgeModel);
+          if (!resolved) {
+            return {
+              reply: `Unknown evaluator model "${command.judgeModel}". Advertised models: ${advertisedJudgeModels()} (extend the list with ACP_GLM_AVAILABLE_MODELS).\n${GOAL_USAGE}`,
+              mutated: false,
+            };
+          }
+          return { arm: { ...command, judgeModel: resolved } };
+        }
+        return { arm: command };
+      case "set":
+        if (command.judgeModel !== undefined) {
+          const resolved = resolveJudgeModel(command.judgeModel);
+          if (!resolved) {
+            return {
+              reply: `Unknown evaluator model "${command.judgeModel}". Advertised models: ${advertisedJudgeModels()} (extend the list with ACP_GLM_AVAILABLE_MODELS).\n${GOAL_USAGE}`,
+              mutated: false,
+            };
+          }
+          return { arm: { ...command, judgeModel: resolved } };
+        }
+        return { arm: command };
+      case "invalid":
+        return { reply: command.message, mutated: false };
+    }
+  }
+
+  /**
+   * Install a freshly parsed `/goal <condition>` or `/goal resume` and
+   * replace the typed block with the directive the model acts on. The caller
+   * derives replay text from the original blocks, so the client transcript
+   * still shows what the user typed.
+   */
+  private armGoal(
+    blocks: PromptRequest["prompt"],
+    session: SessionState,
+    command: Extract<GoalCommand, { kind: "set" | "resume" }>
+  ): PromptRequest["prompt"] {
+    const now = new Date().toISOString();
+    const askTool = this.hasAskTool();
+    let text: string;
+    if (command.kind === "set") {
+      // The flag's id was validated in applyGoalCommand; the environment's
+      // is validated by envGoalJudgeModel.
+      const judgeModel = command.judgeModel ?? envGoalJudgeModel();
+      session.goal = createGoal({
+        condition: command.condition,
+        maxRounds: this.goalMaxRounds,
+        judgeModel,
+        turnLimit: command.turnLimit,
+        now,
+      });
+      text = renderGoalDirective(command.condition, askTool);
+    } else {
+      const goal = session.goal;
+      if (!goal) return blocks;
+      if (command.turnLimit !== undefined) goal.turnLimit = command.turnLimit;
+      if (command.judgeModel) goal.judgeModel = command.judgeModel;
+      resumeGoalState(goal, now);
+      text = renderGoalResume(goal.condition, 0, goal.maxRounds, askTool);
+    }
+    const index = blocks.findIndex((block) => block.type === "text" && block.text.trim().length > 0);
+    const typed = blocks[index];
+    if (!typed || typed.type !== "text") return blocks;
+    const expanded = [...blocks];
+    expanded[index] = { ...typed, text };
+    return expanded;
+  }
+
+  /** Whether the session's tool list includes `ask_user_question` (a client-form question). */
+  private hasAskTool(): boolean {
+    return this.availableToolDefinitions().some((tool) => tool.function.name === "ask_user_question");
+  }
+
+  /** Slash commands the agent answers itself (no model call); each keeps a running goal going. */
+  listLocalCommands(): readonly LocalCommand[] {
+    return LOCAL_COMMANDS;
+  }
+
+  /**
+   * Judge each finished turn against the active goal and start another round
+   * while the evaluator says it is not met. Runs inside the `prompt()` call
+   * because ACP gives the agent no way to start a turn on its own; the client
+   * sees one long turn and `session/cancel` is the escape hatch.
+   *
+   * Leaves the goal untouched when a newer prompt superseded this one — the
+   * successor re-enters the loop with the same goal. A user cancel pauses the
+   * goal instead (Kimi Code semantics): a stop button should stop autonomous
+   * work, and `/goal resume` restarts it.
+   */
+  private async runGoalLoop(
+    sessionId: string,
+    session: SessionState,
+    initial: { stopReason: InternalStopReason; usage?: Usage },
+    toolCalls: PromptLoopMetrics,
+    signal: AbortSignal,
+    promptPromise: Promise<void>,
+    promptConnection: AgentSideConnection,
+    ownsPrompt: () => boolean,
+    preservesDrainingHistory: () => boolean
+  ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
+    const goal = session.goal;
+    if (!goal || goal.status !== "active") return initial;
+    const superseded = (): boolean => session.promptPromise !== promptPromise;
+    const maxTurns = turnLimitForLoop(goal.turnLimit, this.goalMaxTurns);
+    let usage = initial.usage;
+    addGoalTokens(goal, initial.usage);
+    let result = initial;
+
+    while (true) {
+      const toolCallsThisRound = toolCalls.toolCalls;
+      const questionDismissed = toolCalls.questionDismissed;
+      toolCalls.toolCalls = 0;
+      toolCalls.questionDismissed = false;
+
+      // Every exit carries the usage accumulated across rounds and evaluations,
+      // not just the last round's.
+      const exited = (): { stopReason: InternalStopReason; usage?: Usage } => ({ stopReason: result.stopReason, usage });
+      // A turn that did not end on its own terms pauses the goal. A superseded
+      // turn is not a pause: the newer prompt continues the same goal.
+      if (result.stopReason !== "end_turn") {
+        if (superseded() || !ownsPrompt()) return exited();
+        // The user dismissed the agent's question form: say so, rather than
+        // reporting a bare "cancelled".
+        if (questionDismissed) {
+          return this.pauseGoal(sessionId, session, promptConnection, signal, "question_dismissed", undefined, exited());
+        }
+        if (result.stopReason === "max_turn_requests") {
+          return this.pauseGoal(sessionId, session, promptConnection, signal, "turn_limit", formatTurnLimit(maxTurns), exited());
+        }
+        return this.pauseGoal(
+          sessionId, session, promptConnection, signal,
+          signal.aborted ? "cancelled" : "error",
+          signal.aborted ? undefined : `stop reason ${result.stopReason}`,
+          exited()
+        );
+      }
+      if (!ownsPrompt()) return exited();
+
+      let verdict;
+      try {
+        verdict = await evaluateGoal(this.glm, {
+          condition: goal.condition,
+          rounds: goal.rounds,
+          maxRounds: goal.maxRounds,
+          messages: session.messages,
+          model: goal.judgeModel ?? session.model,
+          signal,
+        });
+      } catch (err) {
+        if (superseded() || !ownsPrompt()) return exited();
+        // Failed attempts were billed too; count what they reported.
+        const spent = err instanceof GoalJudgeUnavailableError ? err.usage : undefined;
+        addGoalTokens(goal, spent);
+        usage = mergeUsage(usage, spent);
+        return this.pauseGoal(
+          sessionId, session, promptConnection, signal,
+          signal.aborted ? "cancelled" : "judge_unavailable",
+          signal.aborted ? undefined : err instanceof Error ? err.message : String(err),
+          exited()
+        );
+      }
+      addGoalTokens(goal, verdict.usage);
+      usage = mergeUsage(usage, verdict.usage);
+      goal.lastVerdict = verdict.verdict;
+      goal.lastReason = verdict.reason;
+      if (verdict.model) goal.lastJudgeModel = verdict.model;
+
+      // The agent ended its turn on a question: wait for the user instead of
+      // feeding back a "not met" continuation. No round is spent, and the
+      // user's reply resumes the goal (see prompt()).
+      if (verdict.verdict === "needs_input") {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "awaiting_input", verdict.reason, exited());
+      }
+
+      if (verdict.verdict === "met" || verdict.verdict === "impossible") {
+        goal.status = verdict.verdict === "met" ? "achieved" : "blocked";
+        if (verdict.verdict === "met") delete goal.pauseReason;
+        else goal.pauseReason = "blocked";
+        session.updatedAt = new Date().toISOString();
+        await this.persistSession(sessionId, session);
+        await this.announce(promptConnection, sessionId,
+          verdict.verdict === "met" ? goalAchievedNotice(goal, verdict.reason) : goalBlockedNotice(verdict.reason));
+        return { stopReason: result.stopReason, usage };
+      }
+
+      // Budget first, and before counting: a continuation that would exceed it
+      // does not run, so the counter only ever counts rounds that started
+      // (maxRounds 20 runs 20 continuations, maxRounds 1 runs one).
+      if (goal.rounds >= goal.maxRounds) {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "budget", undefined, exited());
+      }
+      goal.rounds += 1;
+      goal.noProgressRounds = toolCallsThisRound === 0 ? goal.noProgressRounds + 1 : 0;
+      if (goal.noProgressRounds >= GOAL_NO_PROGRESS_ROUNDS) {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "no_progress", undefined, exited());
+      }
+
+      // Another round. A plain user-role message keeps the system prompt
+      // untouched (prompt-cache friendly) and restates the condition, so
+      // compaction dropping the first directive is harmless. The finished
+      // round is canonical history now: drop any rollback checkpoint taken
+      // before it, so a cancel in a later round cannot restore a transcript
+      // that lacks it.
+      session.messagesBeforeCompaction = undefined;
+      const message: GlmMessage = {
+        role: "user",
+        content: renderGoalContinuation(goal.condition, goal.rounds, goal.maxRounds, verdict.reason, this.hasAskTool()),
+      };
+      session.messages.push(message);
+      const display = goalContinuationDisplayText(goal.rounds, goal.maxRounds, verdict.reason);
+      session.displayText.set(message, display);
+      session.updatedAt = new Date().toISOString();
+      await this.persistSession(sessionId, session);
+      try {
+        await promptConnection.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: display } },
+        });
+      } catch (err) {
+        if (!signal.aborted && ownsPrompt()) throw err;
+        // Cancelled or superseded while announcing: let the loop top classify.
+        result = { stopReason: "cancelled", usage };
+        continue;
+      }
+
+      result = await this.runPromptLoop(
+        sessionId, session, signal, ownsPrompt, preservesDrainingHistory, this.processSupervisor, toolCalls, maxTurns
+      );
+      addGoalTokens(goal, result.usage);
+      usage = mergeUsage(usage, result.usage);
+    }
+  }
+
+  /**
+   * Pause the goal, persist it, and tell the user why. After a cancel the
+   * owned connection refuses further updates, so the notice then goes through
+   * the raw connection on a best-effort basis.
+   */
+  private async pauseGoal(
+    sessionId: string,
+    session: SessionState,
+    promptConnection: AgentSideConnection,
+    signal: AbortSignal,
+    reason: GoalPauseReason,
+    detail: string | undefined,
+    result: { stopReason: InternalStopReason; usage?: Usage }
+  ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
+    const goal = session.goal;
+    if (goal) {
+      goal.status = "paused";
+      goal.pauseReason = reason;
+    }
+    session.updatedAt = new Date().toISOString();
+    await this.persistSession(sessionId, session);
+    const text = goal ? goalPausedNotice(goal, detail) : "Goal paused.";
+    await this.announce(signal.aborted ? this.connection : promptConnection, sessionId, text);
+    return result;
+  }
+
+  /** Agent message that must not mask the outcome it describes when the transport dropped. */
+  private async announce(connection: AgentSideConnection, sessionId: string, text: string): Promise<void> {
+    await safeSessionUpdate(connection, {
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `\n\n${text}\n` } },
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal prompt loop
   // ---------------------------------------------------------------------------
 
@@ -2106,7 +2712,11 @@ export class GlmAcpAgent implements Agent {
     signal: AbortSignal,
     ownsPrompt: () => boolean,
     preservesDrainingHistory: () => boolean,
-    processSupervisor: ProcessSupervisor
+    processSupervisor: ProcessSupervisor,
+    /** Receives the number of tool calls the model issued across this loop. */
+    metrics?: PromptLoopMetrics,
+    /** Turn bound for this loop; a goal round may raise or remove the agent default. */
+    maxTurns: number = this.maxTurns
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
     const promptConnection = this.ownedPromptConnection(ownsPrompt, signal);
     const executor = new ToolExecutor(
@@ -2144,7 +2754,7 @@ export class GlmAcpAgent implements Agent {
       }
     };
 
-    for (let turn = 0; turn < this.maxTurns; turn++) {
+    for (let turn = 0; turn < maxTurns; turn++) {
       if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
       const compatibility = checkModelTransition(session.messages, session.model);
       if (!compatibility.ok) throw new Error(compatibility.message);
@@ -2336,6 +2946,7 @@ export class GlmAcpAgent implements Agent {
       if (toolCalls.length === 0) {
         return { stopReason: this.mapStopReason(lastStopReason), usage: totalUsage };
       }
+      if (metrics) metrics.toolCalls += toolCalls.length;
 
       // Execute tool calls in declaration order and feed each result back.
       // A user abort keeps only calls that started, in their original order.
@@ -2346,6 +2957,10 @@ export class GlmAcpAgent implements Agent {
       // must not run either; the partial-batch trim below drops them from
       // history alongside the unstarted call.
       let stoppedByUnstartedCall = false;
+      // A question the user declined, or a call the user rejected at the
+      // permission prompt, completed normally but moved nothing forward:
+      // neither counts as progress for the goal's no-progress check.
+      let nonProgressCalls = 0;
       const startedCalls: typeof toolCalls = [];
       const toolResults: GlmMessage[] = [];
       let toolFailure: Error | undefined;
@@ -2394,14 +3009,21 @@ export class GlmAcpAgent implements Agent {
         if (result.outcome === "not_started") {
           cancellationObserved = true;
           stoppedByUnstartedCall = true;
+          // The form was dismissed (not a turn abort, which sets signal.aborted
+          // before returning here): the goal loop pauses on this explicitly.
+          if (metrics && tc.name === "ask_user_question" && !signal.aborted) metrics.questionDismissed = true;
           continue;
         }
         const content = result.outcome === "interrupted"
           ? interruptedToolHistory(result.content)
           : result.content;
         keepCall(tc, content);
+        if (metrics && ((tc.name === "ask_user_question" && isDeclinedAskResult(content)) || isUserRejectedToolResult(content))) {
+          nonProgressCalls += 1;
+        }
         if (signal.aborted || !ownsPrompt() || result.outcome === "interrupted") cancellationObserved = true;
       }
+      if (metrics) metrics.toolCalls = Math.max(0, metrics.toolCalls - nonProgressCalls);
 
       if (keepHistory()) {
         if (startedCalls.length === 0) {
@@ -2447,7 +3069,7 @@ export class GlmAcpAgent implements Agent {
           sessionUpdate: "agent_message_chunk",
           content: {
             type: "text",
-            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue (the last turn's tool results were saved)]`,
+            text: `\n[stopped: reached the ${maxTurns}-turn limit — send a message to continue (the last turn's tool results were saved)]`,
           },
         },
       });
@@ -2836,17 +3458,25 @@ function availableModelsWith(currentModelId: string): ModelInfo[] {
  * leading slash — the client prepends it for display and sends `/name …` back
  * as prompt text. `input` is omitted for commands that declare no
  * `argument-hint`, which is how a client learns the command takes no extra text.
+ *
+ * `usage` and `goal` are built in and reserved: a file-backed command or skill
+ * with either name is shadowed, since the agent answers them before file
+ * expansion runs.
  */
 function availableCommandsState(
   commands: ReadonlyArray<SlashCommand>
 ): AvailableCommand[] {
-  return [...commands.filter(command => command.name !== "usage").map((command) => ({
+  return [...commands.filter(command => command.name !== "usage" && command.name !== "goal").map((command) => ({
     name: command.name,
     description: command.description,
     ...(command.argumentHint !== undefined
       ? { input: { hint: command.argumentHint } }
       : {}),
-  })), { name: "usage", description: "Show GLM Coding Plan quota and reset times (no model call)." }]
+  })), {
+    name: "goal",
+    description: "Keep working toward a condition across turns until an evaluator confirms it is met, judges it impossible, or you pause it.",
+    input: { hint: "<condition | status | pause | resume | clear>" },
+  }, { name: "usage", description: "Show GLM Coding Plan quota and reset times (no model call)." }]
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -2917,6 +3547,7 @@ async function safeSessionUpdate(
     // best-effort
   }
 }
+
 /** Reject the owner immediately while retaining a handler for a late setup result. */
 function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
   if (signal.aborted) {
