@@ -71,12 +71,13 @@ const JUDGE_SYSTEM_PROMPT = `You are a strict goal evaluator for an autonomous c
 
 Verdicts:
 - "met" only when the transcript shows concrete evidence that the whole condition holds: command output (tests, lint, a build), file contents, a diff, or a produced artifact. A claim without evidence is not met. Partial completion is not met.
-- "impossible" only when the condition cannot be satisfied as stated: it is contradictory, outside what this session can do, or needs something the agent cannot obtain (credentials, a decision only the user can make, a missing system).
-- "not_met" otherwise.
+- "impossible" only when the condition cannot be satisfied as stated: it is contradictory, outside what this session can do, or needs something the agent cannot obtain (credentials, a missing system).
+- "needs_input" when the agent's last message asks the user a question, or says it is waiting on information or a decision only the user can provide, so the condition cannot progress until they answer. Put that question in "reason".
+- "not_met" otherwise — including when the agent simply stopped without evidence.
 
-"reason" is one or two sentences. For "not_met", name the outstanding work concretely — it is handed to the agent as its next instruction. For "met" or "impossible", state the evidence or the blocker that decided it.
+"reason" is one or two sentences. For "not_met", name the outstanding work concretely — it is handed to the agent as its next instruction. For "needs_input", quote the agent's question. For "met" or "impossible", state the evidence or the blocker that decided it.
 
-Reply with only a JSON object of this shape: {"verdict":"met"|"not_met"|"impossible","reason":"..."}`;
+Reply with only a JSON object of this shape: {"verdict":"met"|"not_met"|"impossible"|"needs_input","reason":"..."}`;
 
 /** The messages sent to the evaluator: instructions plus a fenced transcript window. */
 export function buildJudgeMessages(input: {
@@ -202,6 +203,13 @@ function normalizeVerdict(value: unknown): GoalVerdict | undefined {
     case "incomplete":
     case "pending":
       return "not_met";
+    case "needsinput":
+    case "wait":
+    case "waiting":
+    case "awaitinginput":
+    case "needsuserinput":
+    case "askuser":
+      return "needs_input";
     case "impossible":
     case "unachievable":
     case "blocked":
@@ -230,10 +238,17 @@ function renderTranscriptWindow(messages: ReadonlyArray<GlmMessage>): string {
   return blocks.reverse().join("\n\n");
 }
 
+/** The agent's own goal directives (`<goal>`, `<goal_continuation>`, …) are instructions, not evidence. */
+const GOAL_DIRECTIVE = /^<(goal[a-z_]*)[\s>]/;
+
 function renderMessage(message: GlmMessage): string | undefined {
   switch (message.role) {
-    case "user":
-      return `[user]\n${cap(renderContent(message.content), TOOL_RESULT_CAP_CHARS)}`;
+    case "user": {
+      const content = renderContent(message.content);
+      const directive = GOAL_DIRECTIVE.exec(content);
+      if (directive) return `[user]\n[${directive[1]} directive]`;
+      return `[user]\n${cap(content, TOOL_RESULT_CAP_CHARS)}`;
+    }
     case "assistant": {
       const parts: string[] = [];
       const text = renderContent(message.content);

@@ -53,7 +53,7 @@ import {
   type StreamChatOptions,
   type ThoughtLevel,
 } from "../llm/glm-client.js";
-import { ToolExecutor, INTERRUPTED_TOOL_RESULT, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
+import { ToolExecutor, INTERRUPTED_TOOL_RESULT, isUserRejectedToolResult, type TodoItem, type ToolExecutionOutcome } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { readLocalTextPrefix } from "../tools/file-reader.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
@@ -82,6 +82,7 @@ import {
   mergeUsage,
   goalClearedNotice,
   goalContinuationDisplayText,
+  goalInterruptedDisplayText,
   goalPausedNotice,
   goalPauseNotice,
   parseGoalCommand,
@@ -89,7 +90,9 @@ import {
   parseTurnLimit,
   renderGoalDirective,
   renderGoalContinuation,
+  renderGoalInterrupted,
   renderGoalResume,
+  resumeGoalState,
   restoreGoal,
   turnLimitForLoop,
   type GoalCommand,
@@ -1093,9 +1096,14 @@ export class GlmAcpAgent implements Agent {
       // with no model call; setting or resuming a goal mutates session state
       // and replaces the typed text with the directive the model acts on.
       let goalBlocks = params.prompt;
+      /** Client-side text for the model-facing message, when it should differ from what was typed. */
+      let goalDisplay: string | undefined;
+      /** The condition titles a goal thread better than the typed command does. */
+      let goalTitle: string | undefined;
       const goalArgs = firstText?.type === "text" ? parseGoalInvocation(firstText.text) : undefined;
       if (goalArgs !== undefined) {
-        const applied = this.applyGoalCommand(session, parseGoalCommand(goalArgs));
+        const command = parseGoalCommand(goalArgs);
+        const applied = this.applyGoalCommand(session, command);
         if ("reply" in applied) {
           if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
           await promptConnection.sessionUpdate({
@@ -1107,9 +1115,32 @@ export class GlmAcpAgent implements Agent {
             session.updatedAt = new Date().toISOString();
             await this.persistSession(params.sessionId, session);
           }
-          return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+          // A status check or a mistyped command interrupted a running round
+          // only because ACP makes every prompt a turn. Rather than leave the
+          // goal active but idle, pick the round back up: nothing is counted
+          // and the turn is judged when it ends. Mutating commands (pause,
+          // clear, resume) never get here with an active goal.
+          const active = session.goal?.status === "active" ? session.goal : undefined;
+          if (!active) return { stopReason: "end_turn", ...(userMessageId ? { userMessageId } : {}) };
+          const interruptedBy = command.kind === "status" ? "/goal status" : "an invalid /goal command";
+          goalBlocks = [{ type: "text", text: renderGoalInterrupted(active.condition, interruptedBy) }];
+          goalDisplay = goalInterruptedDisplayText(interruptedBy);
+        } else {
+          goalBlocks = this.armGoal(params.prompt, session, applied.arm);
+          if (applied.arm.kind === "set") goalTitle = applied.arm.condition;
         }
-        goalBlocks = this.armGoal(params.prompt, session, applied.arm);
+      } else {
+        const paused = session.goal;
+        if (paused?.status === "paused" && paused.pauseReason === "awaiting_input") {
+          // The user is answering the agent's question. Resume and tell the
+          // model so, next to the answer itself; the client shows the typed
+          // reply. Every other pause still needs an explicit /goal resume.
+          resumeGoalState(paused, new Date().toISOString());
+          goalBlocks = [
+            ...params.prompt,
+            { type: "text", text: renderGoalResume(paused.condition, 0, paused.maxRounds, this.hasAskTool()) },
+          ];
+        }
       }
 
       // Convert ACP content blocks into a GLM user message. Most models receive
@@ -1146,7 +1177,8 @@ export class GlmAcpAgent implements Agent {
       // command expansion and image analysis rewrote them for the model. Kept
       // separately so `session/load` replays the conversation the user had.
       const displayText = renderPromptBlocks(params.prompt).plainText;
-      if (displayText !== stringifyUserMessage(userContent)) {
+      if (goalDisplay !== undefined) session.displayText.set(userMessage, goalDisplay);
+      else if (displayText !== stringifyUserMessage(userContent)) {
         session.displayText.set(userMessage, displayText);
       }
 
@@ -1202,7 +1234,7 @@ export class GlmAcpAgent implements Agent {
       const titleUpdate: { title?: string | null } =
         session.title === null
           ? (() => {
-              const derived = displayText
+              const derived = (goalTitle ?? displayText)
                 .slice(0, 80)
                 .replace(/\s+/g, " ")
                 .trim();
@@ -2340,6 +2372,18 @@ export class GlmAcpAgent implements Agent {
             mutated: false,
           };
         }
+        // Options on resume update the existing goal; an unknown model is an
+        // error that leaves the goal untouched, exactly as for a new goal.
+        if (command.judgeModel !== undefined) {
+          const resolved = resolveJudgeModel(command.judgeModel);
+          if (!resolved) {
+            return {
+              reply: `Unknown evaluator model "${command.judgeModel}". Advertised models: ${advertisedJudgeModels()} (extend the list with ACP_GLM_AVAILABLE_MODELS).\n${GOAL_USAGE}`,
+              mutated: false,
+            };
+          }
+          return { arm: { ...command, judgeModel: resolved } };
+        }
         return { arm: command };
       case "set":
         if (command.judgeModel !== undefined) {
@@ -2370,6 +2414,7 @@ export class GlmAcpAgent implements Agent {
     command: Extract<GoalCommand, { kind: "set" | "resume" }>
   ): PromptRequest["prompt"] {
     const now = new Date().toISOString();
+    const askTool = this.hasAskTool();
     let text: string;
     if (command.kind === "set") {
       // The flag's id was validated in applyGoalCommand; the environment's
@@ -2382,16 +2427,14 @@ export class GlmAcpAgent implements Agent {
         turnLimit: command.turnLimit,
         now,
       });
-      text = renderGoalDirective(command.condition);
+      text = renderGoalDirective(command.condition, askTool);
     } else {
       const goal = session.goal;
       if (!goal) return blocks;
-      goal.status = "active";
-      delete goal.pauseReason;
-      goal.rounds = 0;
-      goal.noProgressRounds = 0;
-      goal.setAt = now;
-      text = renderGoalResume(goal.condition, 0, goal.maxRounds);
+      if (command.turnLimit !== undefined) goal.turnLimit = command.turnLimit;
+      if (command.judgeModel) goal.judgeModel = command.judgeModel;
+      resumeGoalState(goal, now);
+      text = renderGoalResume(goal.condition, 0, goal.maxRounds, askTool);
     }
     const index = blocks.findIndex((block) => block.type === "text" && block.text.trim().length > 0);
     const typed = blocks[index];
@@ -2399,6 +2442,11 @@ export class GlmAcpAgent implements Agent {
     const expanded = [...blocks];
     expanded[index] = { ...typed, text };
     return expanded;
+  }
+
+  /** Whether the session's tool list includes `ask_user_question` (a client-form question). */
+  private hasAskTool(): boolean {
+    return this.availableToolDefinitions().some((tool) => tool.function.name === "ask_user_question");
   }
 
   /**
@@ -2490,6 +2538,13 @@ export class GlmAcpAgent implements Agent {
       goal.lastReason = verdict.reason;
       if (verdict.model) goal.lastJudgeModel = verdict.model;
 
+      // The agent ended its turn on a question: wait for the user instead of
+      // feeding back a "not met" continuation. No round is spent, and the
+      // user's reply resumes the goal (see prompt()).
+      if (verdict.verdict === "needs_input") {
+        return this.pauseGoal(sessionId, session, promptConnection, signal, "awaiting_input", verdict.reason, exited());
+      }
+
       if (verdict.verdict === "met" || verdict.verdict === "impossible") {
         goal.status = verdict.verdict === "met" ? "achieved" : "blocked";
         if (verdict.verdict === "met") delete goal.pauseReason;
@@ -2520,7 +2575,7 @@ export class GlmAcpAgent implements Agent {
       session.messagesBeforeCompaction = undefined;
       const message: GlmMessage = {
         role: "user",
-        content: renderGoalContinuation(goal.condition, goal.rounds, goal.maxRounds, verdict.reason),
+        content: renderGoalContinuation(goal.condition, goal.rounds, goal.maxRounds, verdict.reason, this.hasAskTool()),
       };
       session.messages.push(message);
       const display = goalContinuationDisplayText(goal.rounds, goal.maxRounds, verdict.reason);
@@ -2841,9 +2896,10 @@ export class GlmAcpAgent implements Agent {
       // must not run either; the partial-batch trim below drops them from
       // history alongside the unstarted call.
       let stoppedByUnstartedCall = false;
-      // A question the user declined completed normally but moved nothing
-      // forward; it does not count as progress for the goal's no-progress check.
-      let declinedQuestions = 0;
+      // A question the user declined, or a call the user rejected at the
+      // permission prompt, completed normally but moved nothing forward:
+      // neither counts as progress for the goal's no-progress check.
+      let nonProgressCalls = 0;
       const startedCalls: typeof toolCalls = [];
       const toolResults: GlmMessage[] = [];
       let toolFailure: Error | undefined;
@@ -2901,10 +2957,12 @@ export class GlmAcpAgent implements Agent {
           ? interruptedToolHistory(result.content)
           : result.content;
         keepCall(tc, content);
-        if (metrics && tc.name === "ask_user_question" && isDeclinedAskResult(content)) declinedQuestions += 1;
+        if (metrics && ((tc.name === "ask_user_question" && isDeclinedAskResult(content)) || isUserRejectedToolResult(content))) {
+          nonProgressCalls += 1;
+        }
         if (signal.aborted || !ownsPrompt() || result.outcome === "interrupted") cancellationObserved = true;
       }
-      if (metrics) metrics.toolCalls = Math.max(0, metrics.toolCalls - declinedQuestions);
+      if (metrics) metrics.toolCalls = Math.max(0, metrics.toolCalls - nonProgressCalls);
 
       if (keepHistory()) {
         if (startedCalls.length === 0) {

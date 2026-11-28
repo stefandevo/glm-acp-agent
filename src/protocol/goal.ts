@@ -15,7 +15,7 @@
 import type { Usage } from "@agentclientprotocol/sdk";
 
 export type GoalStatus = "active" | "paused" | "achieved" | "blocked";
-export type GoalVerdict = "met" | "not_met" | "impossible";
+export type GoalVerdict = "met" | "not_met" | "impossible" | "needs_input";
 /**
  * Model/tool turns one goal round may take before it stops on
  * `max_turn_requests`. A positive integer, or "unlimited" for no cap.
@@ -34,6 +34,8 @@ export type GoalPauseReason =
   | "turn_limit"
   /** The user dismissed an `ask_user_question` form mid-round. */
   | "question_dismissed"
+  /** The round ended with a question for the user; their reply resumes the goal. */
+  | "awaiting_input"
   /** A turn ended on another stop reason. */
   | "error"
   /** The evaluator model could not be reached or did not answer in the verdict format. */
@@ -90,12 +92,12 @@ export const GOAL_NO_PROGRESS_ROUNDS = 3;
 export const GOAL_REASON_CAP_CHARS = 500;
 
 export const GOAL_USAGE =
-  "Usage: /goal <condition> [--judge <model>] [--turns <n|unlimited>]  |  /goal status  |  /goal pause  |  /goal resume  |  /goal clear";
+  "Usage: /goal <condition> [--judge <model>] [--turns <n|unlimited>]  |  /goal status  |  /goal pause  |  /goal resume [--judge <model>] [--turns <n|unlimited>]  |  /goal clear";
 
 export type GoalCommand =
   | { kind: "status" }
   | { kind: "pause" }
-  | { kind: "resume" }
+  | { kind: "resume"; judgeModel?: string; turnLimit?: GoalTurnLimit }
   | { kind: "clear" }
   | { kind: "set"; condition: string; judgeModel?: string; turnLimit?: GoalTurnLimit }
   | { kind: "invalid"; message: string };
@@ -124,30 +126,19 @@ export function parseGoalInvocation(text: string): string | undefined {
 }
 
 /**
- * Parse the text after `/goal`.
- *
- * A control word counts only when it is the entire argument — the DeepSeek
- * Harness grammar — so `/goal pause after verification` is a goal with that
- * text rather than a pause. `--judge <model>` picks the evaluator model and
- * `--turns <n|unlimited>` the per-round turn limit for this goal alone. Both
- * may come before or after the condition, in any order, so
- * `/goal fix the build --judge glm-5.3-flash` reads the way it is typed.
- * Every `--word` is read as an option — a mistyped one is rejected rather
- * than becoming goal text — and a trailing option's value runs to the end of
- * the input. A `--` (before or after leading options) turns option parsing
- * off for the remainder, for a condition that contains `--word` prose or
- * starts with a control word.
+ * Pull the goal options out of `text`. Leading options take a single-token
+ * value (the condition follows); a trailing option takes everything after it,
+ * so `--judge Uncle Bob` is a rejected model name rather than prose; the
+ * right-most option is peeled first so several can chain. Every `--word` is
+ * an option — a mistyped one is an error, never goal text. With `escape`, a
+ * `--` (before or after leading options) turns parsing off for the remainder.
  */
-export function parseGoalCommand(args: string): GoalCommand {
-  const trimmed = args.trim();
-  if (trimmed.length === 0) return { kind: "status" };
-  const control = CONTROL_WORDS.get(trimmed.toLowerCase());
-  if (control) return { kind: control };
-
-  let rest = trimmed;
+function parseGoalOptions(text: string, escape: boolean):
+  | { rest: string; judgeModel?: string; turnLimit?: GoalTurnLimit }
+  | { error: string } {
+  let rest = text.trim();
   let judgeModel: string | undefined;
   let turnLimit: GoalTurnLimit | undefined;
-  /** Apply one `--name value` pair; returns the rejection text when it is not a known option. */
   const applyOption = (name: string, value: string | undefined): string | undefined => {
     if (name !== "judge" && name !== "turns") {
       return `Unknown /goal option "--${name}". Supported: --judge <model>, --turns <n|unlimited>, or -- before the condition to turn option parsing off.\n${GOAL_USAGE}`;
@@ -166,20 +157,14 @@ export function parseGoalCommand(args: string): GoalCommand {
     return undefined;
   };
 
-  // Every `--word` is an option, wherever it appears, so a mistyped one is
-  // rejected rather than silently becoming goal text. A leading `--` turns
-  // option parsing off for the whole remainder. Leading options take a
-  // single-token value (the condition follows); a trailing option takes
-  // everything after it, so `--judge Uncle Bob` is a rejected model name
-  // rather than prose. The right-most option is peeled first, which lets
-  // several trailing options chain.
   let escaped = false;
-  if (rest === "--" || rest.startsWith("-- ")) {
+  if (escape && (rest === "--" || rest.startsWith("-- "))) {
     rest = rest.slice(2).trim();
     escaped = true;
   }
   while (!escaped && rest.startsWith("--")) {
     if (rest === "--" || rest.startsWith("-- ")) {
+      if (!escape) break;
       rest = rest.slice(2).trim();
       escaped = true;
       break;
@@ -187,7 +172,7 @@ export function parseGoalCommand(args: string): GoalCommand {
     const match = /^--([A-Za-z][\w-]*)(?:[=\s]+(\S+))?(?:\s+([\s\S]*))?$/.exec(rest);
     const rejection = match ? applyOption(match[1]!, match[2]) : undefined;
     if (!match || rejection) {
-      return { kind: "invalid", message: rejection ?? `Unknown /goal option in "${rest}".\n${GOAL_USAGE}` };
+      return { error: rejection ?? `Unknown /goal option in "${rest}".\n${GOAL_USAGE}` };
     }
     rest = (match[3] ?? "").trim();
   }
@@ -195,11 +180,69 @@ export function parseGoalCommand(args: string): GoalCommand {
     const match = /^(.*)\s--([A-Za-z][\w-]*)(?:[=\s]+([\s\S]*))?$/.exec(rest);
     if (!match) break;
     const rejection = applyOption(match[2]!, match[3]);
-    if (rejection) return { kind: "invalid", message: rejection };
+    if (rejection) return { error: rejection };
     rest = match[1]!.trim();
   }
+  return {
+    rest,
+    ...(judgeModel ? { judgeModel } : {}),
+    ...(turnLimit !== undefined ? { turnLimit } : {}),
+  };
+}
 
-  const condition = rest.trim();
+/** `/goal resume [--turns …] [--judge …]`: options only, no condition, no `--` escape. */
+function parseResumeCommand(args: string): GoalCommand {
+  const parsed = parseGoalOptions(args, false);
+  if ("error" in parsed) return { kind: "invalid", message: parsed.error };
+  if (parsed.rest.length > 0) {
+    return {
+      kind: "invalid",
+      message: `/goal resume takes only --turns <n|unlimited> and --judge <model>, not "${parsed.rest}". Use /goal <condition> to set a new goal.\n${GOAL_USAGE}`,
+    };
+  }
+  return {
+    kind: "resume",
+    ...(parsed.judgeModel ? { judgeModel: parsed.judgeModel } : {}),
+    ...(parsed.turnLimit !== undefined ? { turnLimit: parsed.turnLimit } : {}),
+  };
+}
+
+/**
+ * Parse the text after `/goal`.
+ *
+ * A control word counts only when it is the entire argument — the DeepSeek
+ * Harness grammar — so `/goal pause after verification` is a goal with that
+ * text rather than a pause. `resume` is the one control word that takes
+ * arguments: `--judge <model>` and `--turns <n|unlimited>` update the paused
+ * goal before it continues; anything else after it is an error, never a goal
+ * named "resume".
+ *
+ * For a new goal, `--judge <model>` picks the evaluator model and
+ * `--turns <n|unlimited>` the per-round turn limit. Both may come before or
+ * after the condition, in any order. A leading `--` turns option parsing off
+ * for the remainder, for a condition that contains `--word` prose or starts
+ * with a control word.
+ */
+export function parseGoalCommand(args: string): GoalCommand {
+  const trimmed = args.trim();
+  if (trimmed.length === 0) return { kind: "status" };
+  const lowered = trimmed.toLowerCase();
+  const control = CONTROL_WORDS.get(lowered);
+  if (control) return { kind: control };
+
+  const firstWord = lowered.split(/\s+/, 1)[0]!;
+  const controlWithArguments = CONTROL_WORDS.get(firstWord);
+  if (controlWithArguments) {
+    if (controlWithArguments !== "resume") {
+      return { kind: "invalid", message: `/goal ${firstWord} takes no arguments.\n${GOAL_USAGE}` };
+    }
+    return parseResumeCommand(trimmed.slice(firstWord.length));
+  }
+
+  const parsed = parseGoalOptions(trimmed, true);
+  if ("error" in parsed) return { kind: "invalid", message: parsed.error };
+
+  const condition = parsed.rest.trim();
   if (condition.length === 0) {
     return { kind: "invalid", message: `A goal needs a condition.\n${GOAL_USAGE}` };
   }
@@ -212,11 +255,10 @@ export function parseGoalCommand(args: string): GoalCommand {
   return {
     kind: "set",
     condition,
-    ...(judgeModel ? { judgeModel } : {}),
-    ...(turnLimit !== undefined ? { turnLimit } : {}),
+    ...(parsed.judgeModel ? { judgeModel: parsed.judgeModel } : {}),
+    ...(parsed.turnLimit !== undefined ? { turnLimit: parsed.turnLimit } : {}),
   };
 }
-
 /**
  * Parse a per-round turn limit: a positive integer, or "unlimited" / "none"
  * for no cap. `undefined` for anything else.
@@ -261,6 +303,15 @@ export function createGoal(input: {
     maxRounds: input.maxRounds,
     noProgressRounds: 0,
   };
+}
+
+/** Restart a paused or blocked goal: a fresh round budget and timer; the spend is kept. */
+export function resumeGoalState(goal: GoalState, now: string): void {
+  goal.status = "active";
+  delete goal.pauseReason;
+  goal.rounds = 0;
+  goal.noProgressRounds = 0;
+  goal.setAt = now;
 }
 
 /**
@@ -331,7 +382,7 @@ export function isGoalState(value: unknown): value is GoalState {
 }
 
 const VALID_STATUSES = new Set<string>(["active", "paused", "achieved", "blocked"]);
-const VALID_VERDICTS = new Set<string>(["met", "not_met", "impossible"]);
+const VALID_VERDICTS = new Set<string>(["met", "not_met", "impossible", "needs_input"]);
 const VALID_PAUSE_REASONS = new Set<string>([
   "user",
   "cancelled",
@@ -339,6 +390,7 @@ const VALID_PAUSE_REASONS = new Set<string>([
   "no_progress",
   "turn_limit",
   "question_dismissed",
+  "awaiting_input",
   "error",
   "judge_unavailable",
   "blocked",
@@ -358,27 +410,38 @@ function isCount(value: unknown): value is number {
  * start immediately, never ask the user what to do next, and never point the
  * user at `/goal clear` — the goal clears itself when met.
  */
-export function renderGoalDirective(condition: string): string {
+/**
+ * How the model should get a decision only the user can make: through the
+ * question tool when the client offers it, otherwise by ending its turn with
+ * the question — the evaluator then reports `needs_input` and the goal waits.
+ */
+export function askingInstruction(askTool: boolean): string {
+  return askTool
+    ? "If a decision only the user can make is blocking you, ask it with ask_user_question rather than guessing or stalling."
+    : "If a decision only the user can make is blocking you, end your turn with the question and wait: the goal pauses for your answer and continues when the user replies.";
+}
+
+export function renderGoalDirective(condition: string, askTool = true): string {
   return [
     "<goal>",
     "A goal is now active for this session. Briefly acknowledge it, then immediately start working toward it:",
     "<condition>",
     neutralize(condition, "condition", "goal"),
     "</condition>",
-    "Treat the condition itself as your directive and do not pause to ask the user what to do next. If a decision only the user can make is blocking you, ask it with ask_user_question rather than guessing or stalling. Before ending a turn, run the verification the condition names (tests, lint, a build, a file or command check) and show the output: an evaluator judges completion from this transcript, so surface concrete evidence rather than claims. The goal clears itself once the condition is met; do not tell the user to run /goal clear.",
+    `Treat the condition itself as your directive and do not pause to ask the user what to do next. ${askingInstruction(askTool)} Before ending a turn, run the verification the condition names (tests, lint, a build, a file or command check) and show the output: an evaluator judges completion from this transcript, so surface concrete evidence rather than claims. The goal clears itself once the condition is met; do not tell the user to run /goal clear.`,
     "</goal>",
   ].join("\n");
 }
 
 /** The user-role message that starts continuation round `round`. */
-export function renderGoalContinuation(condition: string, round: number, maxRounds: number, reason: string): string {
+export function renderGoalContinuation(condition: string, round: number, maxRounds: number, reason: string, askTool = true): string {
   return [
     `<goal_continuation round="${round}/${maxRounds}">`,
     "The evaluator judged the goal not yet met. Outstanding work:",
     "<reason>",
     neutralize(cap(reason, GOAL_REASON_CAP_CHARS), "reason", "goal_continuation"),
     "</reason>",
-    "Continue working toward the condition and address the outstanding work above. Do not ask the user what to do next; if a decision only the user can make is blocking you, use ask_user_question, and if the user declined to answer, proceed with the safest reasonable choice and say what you assumed. Show verification evidence before stopping.",
+    `Continue working toward the condition and address the outstanding work above. Do not ask the user what to do next; ${askTool ? "use ask_user_question if a decision only the user can make is blocking you, and if the user declined to answer, proceed with the safest reasonable choice and say what you assumed" : "if a decision only the user can make is blocking you, end your turn with the question and wait for the answer"}. Show verification evidence before stopping.`,
     "<condition>",
     neutralize(condition, "condition", "goal_continuation"),
     "</condition>",
@@ -387,15 +450,36 @@ export function renderGoalContinuation(condition: string, round: number, maxRoun
 }
 
 /** The user-role message that restarts a paused goal after `/goal resume`. */
-export function renderGoalResume(condition: string, round: number, maxRounds: number): string {
+export function renderGoalResume(condition: string, round: number, maxRounds: number, askTool = true): string {
   return [
     `<goal_resumed round="${round}/${maxRounds}">`,
-    "The user resumed this goal. Continue working toward the condition from where the previous round left off. Do not ask the user what to do next; if a decision only the user can make is blocking you, use ask_user_question. Show verification evidence before stopping.",
+    `The user resumed this goal. Continue working toward the condition from where the previous round left off. Do not ask the user what to do next; ${askingInstruction(askTool)} Show verification evidence before stopping.`,
     "<condition>",
     neutralize(condition, "condition", "goal_resumed"),
     "</condition>",
     "</goal_resumed>",
   ].join("\n");
+}
+
+/**
+ * The user-role message that picks a round back up after a `/goal` command
+ * interrupted it (status or a mistyped command). Not a continuation round:
+ * nothing is counted and the evaluator only sees the turn once it ends.
+ */
+export function renderGoalInterrupted(condition: string, interruptedBy: string): string {
+  return [
+    "<goal_interrupted>",
+    `The previous round was interrupted by ${interruptedBy}. Continue working toward the condition from where it left off; do not redo finished work. Show verification evidence before stopping.`,
+    "<condition>",
+    neutralize(condition, "condition", "goal_interrupted"),
+    "</condition>",
+    "</goal_interrupted>",
+  ].join("\n");
+}
+
+/** What the client transcript shows for an interrupted-round pickup. */
+export function goalInterruptedDisplayText(interruptedBy: string): string {
+  return `[goal] Continuing after ${interruptedBy} — picking up the interrupted round`;
 }
 
 /** What the client transcript shows for an injected continuation; replayed on `session/load`. */
@@ -484,6 +568,9 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
     case "question_dismissed":
       line = "you dismissed the agent's question";
       break;
+    case "awaiting_input":
+      line = `the agent needs your answer${detail ? ` — ${detail}` : ""}`;
+      break;
     case "error":
       line = `turn ended with ${detail ?? "an error"}`;
       break;
@@ -497,8 +584,10 @@ export function goalPausedNotice(goal: GoalState, detail?: string): string {
     ? "Send /goal resume to continue, /goal --turns <n|unlimited> to set a new goal with a higher limit, or /goal clear to drop the goal."
     : cause === "question_dismissed"
     ? "Answer in a message and send /goal resume to continue, or /goal clear to drop the goal."
+    : cause === "awaiting_input"
+    ? "Reply to continue, or /goal clear to drop the goal."
     : "Send /goal resume to continue, or /goal clear to drop the goal.";
-  return `Goal paused — ${line}.\n${hint}`;
+  return `Goal paused — ${line}${/[.!?]$/.test(line) ? "" : "."}\n${hint}`;
 }
 
 export function formatVerdict(verdict: GoalVerdict): string {
@@ -507,6 +596,8 @@ export function formatVerdict(verdict: GoalVerdict): string {
       return "not met";
     case "impossible":
       return "impossible";
+    case "needs_input":
+      return "waiting for input";
     default:
       return verdict;
   }

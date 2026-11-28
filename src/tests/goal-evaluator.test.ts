@@ -42,6 +42,8 @@ test("buildJudgeMessages carries the condition, round count, and a bounded trans
   assert.equal(messages[0]?.role, "system");
   assert.match(String(messages[0]?.content), /strict goal evaluator/);
   assert.match(String(messages[0]?.content), /Reply with only a JSON object/);
+  assert.match(String(messages[0]?.content), /"needs_input"/);
+  assert.match(String(messages[0]?.content), /asks the user a question/);
   const user = String(messages[1]?.content);
   assert.match(user, /<rounds>\n1\/20\n<\/rounds>/);
   assert.match(user, /<condition>\nall tests in test\/auth pass\n<\/condition>/);
@@ -50,6 +52,27 @@ test("buildJudgeMessages carries the condition, round count, and a bounded trans
   assert.match(user, /\[tool call\] run_command/);
   assert.match(user, /\[tool result\]\n1 failing/);
   assert.match(user, /\[assistant\]\nTwo of three fixed/);
+});
+
+test("the window replaces the agent's own goal directives with a marker", () => {
+  const user = String(buildJudgeMessages({
+    condition: "c",
+    rounds: 1,
+    maxRounds: 20,
+    messages: [
+      { role: "user", content: "<goal>\n<condition>\nc\n</condition>\nTreat the condition as your directive</goal>" },
+      { role: "assistant", content: "On it." },
+      { role: "user", content: '<goal_continuation round="1/20">\n<reason>keep going</reason>\n</goal_continuation>' },
+      { role: "assistant", content: "Tests pass: 3/3." },
+      { role: "user", content: "please also run lint" },
+    ],
+  })[1]?.content);
+  assert.match(user, /\[user\]\n\[goal directive\]/);
+  assert.match(user, /\[user\]\n\[goal_continuation directive\]/);
+  assert.doesNotMatch(user, /Treat the condition as your directive/);
+  assert.doesNotMatch(user, /keep going/);
+  // An ordinary user message is untouched.
+  assert.match(user, /\[user\]\nplease also run lint/);
 });
 
 test("the transcript window keeps the last messages, caps long tool results, and cannot close its wrapper", () => {
@@ -84,6 +107,9 @@ test("parseGoalVerdict accepts the documented shape and common variants", () => 
   assert.deepEqual(parseGoalVerdict('Verdict: {"verdict":"impossible","reason":"needs credentials"}'), { verdict: "impossible", reason: "needs credentials" });
   assert.deepEqual(parseGoalVerdict('{"verdict":"not yet met","reason":"x"}'), { verdict: "not_met", reason: "x" });
   assert.deepEqual(parseGoalVerdict('{"verdict":"done"}'), { verdict: "met", reason: "" });
+  assert.deepEqual(parseGoalVerdict('{"verdict":"wait","reason":"Which DB?"}'), { verdict: "needs_input", reason: "Which DB?" });
+  assert.deepEqual(parseGoalVerdict('{"verdict":"needs user input","reason":"Pick one"}'), { verdict: "needs_input", reason: "Pick one" });
+  assert.deepEqual(parseGoalVerdict('{"verdict":"waiting","reason":"x"}'), { verdict: "needs_input", reason: "x" });
   assert.deepEqual(parseGoalVerdict('{"verdict":"blocked","reason":"out of scope"}'), { verdict: "impossible", reason: "out of scope" });
   assert.equal(parseGoalVerdict(""), undefined);
   for (const text of ["not json", "[]", '{"verdict":"maybe"}', '{"reason":"no verdict"}', '{"verdict":1}', '{broken']) {

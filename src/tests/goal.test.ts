@@ -6,6 +6,7 @@ import {
   createGoal,
   formatGoalStatus,
   formatTurnLimit,
+  formatVerdict,
   formatDuration,
   formatTokens,
   goalContinuationDisplayText,
@@ -17,8 +18,11 @@ import {
   parseTurnLimit,
   renderGoalContinuation,
   renderGoalDirective,
+  renderGoalInterrupted,
   renderGoalResume,
+  goalInterruptedDisplayText,
   restoreGoal,
+  resumeGoalState,
   turnLimitForLoop,
   type GoalState,
 } from "../protocol/goal.js";
@@ -33,7 +37,7 @@ test("parseGoalInvocation recognises a leading /goal and returns its arguments",
   assert.equal(parseGoalInvocation(""), undefined);
 });
 
-test("control words count only as the whole argument", () => {
+test("control words are recognised case-insensitively, with aliases; followed by words they are an error", () => {
   assert.deepEqual(parseGoalCommand(""), { kind: "status" });
   assert.deepEqual(parseGoalCommand("  status "), { kind: "status" });
   assert.deepEqual(parseGoalCommand("PAUSE"), { kind: "pause" });
@@ -41,8 +45,9 @@ test("control words count only as the whole argument", () => {
     assert.deepEqual(parseGoalCommand(alias), { kind: "clear" }, alias);
   }
   assert.deepEqual(parseGoalCommand("resume"), { kind: "resume" });
-  assert.deepEqual(parseGoalCommand("pause after verification"), { kind: "set", condition: "pause after verification" });
-  assert.deepEqual(parseGoalCommand("status of the migration"), { kind: "set", condition: "status of the migration" });
+  assert.match(invalidMessage("pause after verification"), /\/goal pause takes no arguments/);
+  assert.match(invalidMessage("status of the migration"), /\/goal status takes no arguments/);
+  assert.match(invalidMessage("clear the debt"), /\/goal clear takes no arguments/);
 });
 
 test("--judge picks the evaluator model for one goal; -- escapes the grammar", () => {
@@ -90,6 +95,28 @@ test("--turns sets the per-round turn limit; it composes with --judge in either 
   assert.match(invalidMessage("--judge"), /--judge needs a value/);
   assert.match(invalidMessage("--turns"), /--turns needs a value/);
   assert.match(invalidMessage("--rounds 5 x"), /--turns <n\|unlimited>/);
+});
+
+test("resume takes --turns and --judge; other control words take nothing; nothing becomes a goal named 'resume'", () => {
+  assert.deepEqual(parseGoalCommand("resume"), { kind: "resume" });
+  assert.deepEqual(parseGoalCommand("resume --turns 500"), { kind: "resume", turnLimit: 500 });
+  assert.deepEqual(parseGoalCommand("RESUME --judge=glm-5.3-flash"), { kind: "resume", judgeModel: "glm-5.3-flash" });
+  assert.deepEqual(parseGoalCommand("resume --judge glm-5.3-flash --turns=unlimited"), { kind: "resume", judgeModel: "glm-5.3-flash", turnLimit: "unlimited" });
+  assert.deepEqual(parseGoalCommand("resume --turns unlimited --judge glm-5.3"), { kind: "resume", judgeModel: "glm-5.3", turnLimit: "unlimited" });
+  // Invalid values are errors that name the option, never a new goal.
+  assert.match(invalidMessage("resume --turns abc"), /--turns needs a positive number or "unlimited", not "abc"/);
+  assert.match(invalidMessage("resume --turns 0"), /--turns needs a positive number/);
+  assert.match(invalidMessage("resume --judge"), /--judge needs a value/);
+  assert.match(invalidMessage("resume --turns"), /--turns needs a value/);
+  assert.match(invalidMessage("resume --rounds 5"), /Unknown \/goal option "--rounds"/);
+  assert.match(invalidMessage("resume fix it"), /\/goal resume takes only --turns <n\|unlimited> and --judge <model>, not "fix it"\. Use \/goal <condition> to set a new goal/);
+  assert.match(invalidMessage("resume -- x"), /takes only --turns/);
+  // Other control words take no arguments at all, and still parse alone.
+  for (const word of ["pause", "status", "show", "clear", "stop", "off", "reset", "cancel", "none"]) {
+    assert.match(invalidMessage(`${word} now`), new RegExp(`\\/goal ${word} takes no arguments`));
+    assert.notEqual(parseGoalCommand(word).kind, "invalid");
+    assert.notEqual(parseGoalCommand(word).kind, "set");
+  }
 });
 
 test("options may follow the condition; -- turns option parsing off for the remainder", () => {
@@ -203,6 +230,7 @@ test("isGoalState accepts what the agent writes and rejects corrupted records", 
   assert.equal(isGoalState({ ...goal, turnLimit: "unlimited" }), true);
   assert.equal(isGoalState({ ...goal, lastJudgeModel: "glm-5.3" }), true);
   assert.equal(isGoalState({ ...goal, pauseReason: "question_dismissed" }), true);
+  assert.equal(isGoalState({ ...goal, pauseReason: "awaiting_input", lastVerdict: "needs_input" }), true);
   for (const broken of [
     null,
     "goal",
@@ -236,6 +264,14 @@ test("model-facing text wraps the condition and neutralises closing tags", () =>
   // #154 landed: the tool is the sanctioned way to get a decision, so the
   // "do not ask" rule must not fight it.
   assert.match(directive, /ask it with ask_user_question/);
+  // Without the tool the model asks by ending its turn; the goal then waits.
+  const noTool = renderGoalDirective("fix the build", false);
+  assert.doesNotMatch(noTool, /ask_user_question/);
+  assert.match(noTool, /end your turn with the question and wait/);
+  const continuationNoTool = renderGoalContinuation("c", 1, 20, "r", false);
+  assert.match(continuationNoTool, /end your turn with the question and wait for the answer/);
+  assert.doesNotMatch(continuationNoTool, /ask_user_question/);
+  assert.match(renderGoalResume("c", 0, 20, false), /end your turn with the question and wait/);
 
   const continuation = renderGoalContinuation("all tests pass", 3, 20, "2 tests fail in test/auth");
   assert.match(continuation, /^<goal_continuation round="3\/20">/);
@@ -265,6 +301,8 @@ test("display text and notices are short and name the reason", () => {
   assert.match(goalPausedNotice({ ...goal, pauseReason: "user" }), /Goal paused — user\./);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /Goal paused — the round hit its turn limit \(100\)\./);
   assert.match(goalPausedNotice({ ...goal, pauseReason: "turn_limit" }, "100"), /\/goal --turns <n\|unlimited> to set a new goal/);
+  assert.match(goalPausedNotice({ ...goal, pauseReason: "awaiting_input" }, "Which DB?"), /Goal paused — the agent needs your answer — Which DB\?\nReply to continue, or \/goal clear to drop the goal\./);
+  assert.equal(formatVerdict("needs_input"), "waiting for input");
   assert.match(
     goalPausedNotice({ ...goal, pauseReason: "question_dismissed" }),
     /Goal paused — you dismissed the agent's question\.\nAnswer in a message and send \/goal resume to continue, or \/goal clear to drop the goal\./
@@ -298,6 +336,7 @@ test("formatGoalStatus reports the state the other /goal commands expose", () =>
   assert.match(text, /- Last check: not met — 2 tests fail/);
   assert.match(text, /\/goal pause/);
   assert.match(formatGoalStatus({ ...active, judgeModel: "glm-5.3-flash" }, "glm-5.4", now), /- Evaluator: glm-5\.3-flash\n/);
+  assert.match(formatGoalStatus({ ...active, lastVerdict: "needs_input", lastReason: "Which DB?" }, "glm-5.4", now), /- Last check: waiting for input — Which DB\?/);
   assert.match(
     formatGoalStatus({ ...active, judgeModel: "glm-5.2", lastJudgeModel: "glm-5.3" }, "glm-5.4", now),
     /- Evaluator: glm-5\.2 \(last verdict answered by glm-5\.3\)\n/
@@ -340,4 +379,29 @@ test("isDeclinedAskResult tells a decline from an answered or blank form", () =>
   assert.equal(isDeclinedAskResult(JSON.stringify({ answers: {}, annotations: { "Which?": { unanswered: "skipped" } } })), false);
   assert.equal(isDeclinedAskResult(JSON.stringify({ answers: { "A?": "x" }, annotations: { "B?": { unanswered: "dismissed" } } })), false);
   assert.equal(isDeclinedAskResult("not json"), false);
+});
+
+test("an interrupted-round pickup restates the condition; resumeGoalState resets counters and keeps spend", () => {
+  const pickup = renderGoalInterrupted("fix the build", "/goal status");
+  assert.match(pickup, /^<goal_interrupted>\n/);
+  assert.match(pickup, /interrupted by \/goal status\. Continue working toward the condition from where it left off; do not redo finished work/);
+  assert.match(pickup, /<condition>\nfix the build\n<\/condition>/);
+  assert.equal(goalInterruptedDisplayText("/goal status"), "[goal] Continuing after /goal status — picking up the interrupted round");
+  const paused: GoalState = {
+    condition: "c",
+    status: "paused",
+    pauseReason: "budget",
+    setAt: "2026-11-27T10:00:00.000Z",
+    rounds: 7,
+    maxRounds: 20,
+    noProgressRounds: 2,
+    tokens: { inputTokens: 5, outputTokens: 1, totalTokens: 6 },
+  };
+  resumeGoalState(paused, "2026-11-28T10:00:00.000Z");
+  assert.equal(paused.status, "active");
+  assert.equal(paused.pauseReason, undefined);
+  assert.equal(paused.rounds, 0);
+  assert.equal(paused.noProgressRounds, 0);
+  assert.equal(paused.setAt, "2026-11-28T10:00:00.000Z");
+  assert.deepEqual(paused.tokens, { inputTokens: 5, outputTokens: 1, totalTokens: 6 });
 });
